@@ -4,6 +4,7 @@ const postgres = require('postgres');
 const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
 const databaseUrl = process.env.DATABASE_URL;
 const emailUser = process.env.EMAIL_USER;
@@ -30,6 +31,13 @@ const transporter = nodemailer.createTransport({
 
 function generateVerificationCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function getGravatarUrl(email) {
+  const normalizedEmail = (email || '').trim().toLowerCase();
+  if (!normalizedEmail) return null;
+  const hash = crypto.createHash('md5').update(normalizedEmail).digest('hex');
+  return `https://www.gravatar.com/avatar/${hash}?d=identicon&s=200`;
 }
 
 async function sendVerificationEmail(toEmail, verificationCode) {
@@ -76,7 +84,7 @@ function verifyToken(req, res, next) {
       if (users.length === 0) {
         return res.status(401).json({ message: 'Token de sessão inválido ou expirado.' });
       }
-      req.userId = users[0].id_us; // id_us é um INTEGER aqui, conforme seu schema de usuarios
+      req.userId = users[0].id_us;
       next();
     })
     .catch(error => {
@@ -87,7 +95,6 @@ function verifyToken(req, res, next) {
 
 // ------------------- REGISTRO DE USUÁRIO --------------------- //
 
-// ROTA DE REGISTRO
 app.post('/register', async (req, res) => {
   console.log('Rota /register atingida');
   console.log('Dados recebidos do frontend (req.body):', req.body);
@@ -174,7 +181,6 @@ app.post('/register', async (req, res) => {
 
 // --------------------- AUTENTICAÇÃO DE USUÁRIO --------------------- //
 
-// ROTA DE LOGIN
 app.post('/login', async (req, res) => {
   console.log('Rota /login atingida');
   const { email, senha, sessionId: providedSessionId } = req.body;
@@ -223,10 +229,9 @@ app.post('/login', async (req, res) => {
 
 // --------------------- VERIFICAÇÃO DE USUÁRIO --------------------- //
 
-// ROTA DE ENVIO DE CÓDIGO PARA VERIFICAÇÃO DE CONTA
 app.post('/user/send-verification', verifyToken, async (req, res) => {
   console.log('Rota /user/send-verification atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
 
   try {
     const [user] = await sql`SELECT email, email_verified FROM usuarios WHERE id_us = ${userId}`;
@@ -262,9 +267,8 @@ app.post('/user/send-verification', verifyToken, async (req, res) => {
   }
 });
 
-// ROTA DE VERIFICAÇÃO DE CONTA
 app.post('/user/verify', verifyToken, async (req, res) => {
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
   const { code } = req.body;
 
   if (!code) {
@@ -307,10 +311,9 @@ app.post('/user/verify', verifyToken, async (req, res) => {
   }
 });
 
-// ROTA PARA OBTER STATUS DA SESSÃO DO USUÁRIO
 app.get('/user/session-status', verifyToken, async (req, res) => {
   console.log('Rota /user/session-status atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
 
   try {
     const [user] = await sql`
@@ -342,27 +345,34 @@ app.get('/user/session-status', verifyToken, async (req, res) => {
 
 // -------------------------------- DIETAS ---------------------------- //
 
-// ROTA PARA CRIAÇÃO DE DIETAS
 app.post('/api/dietas', verifyToken, async (req, res) => {
   console.log('Rota POST /api/dietas atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
   const {
     nome,
-    descricao,
     imageurl,
+    categoria,
     calorias,
     tempo_preparo,
     gordura,
     proteina,
-    carboidratos,
-    categoria
+    carboidratos
   } = req.body;
+  const descricao = req.body.descricao ?? req.body.descripcion ?? null;
 
-  if (!nome) {
-    return res.status(400).json({ error: 'Nome da dieta é obrigatório.' });
+  if (!nome || !descricao || !imageurl || !categoria) {
+    return res.status(400).json({ error: 'Nome, descrição, imagem e categoria são obrigatórios.' });
   }
 
   try {
+    const [author] = await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
+    if (!author) {
+      return res.status(404).json({ error: 'Usuário autor não encontrado.' });
+    }
+
+    const authorName = author.nome || author.username || null;
+    const authorAvatarUrl = getGravatarUrl(author.email);
+
     const [newDieta] = await sql`
       INSERT INTO dietas (
         id_us, nome, descricao, imageurl, calorias, tempo_preparo,
@@ -370,10 +380,10 @@ app.post('/api/dietas', verifyToken, async (req, res) => {
         createdat, updatedat, categoria
       )
       VALUES (
-        ${userId}, ${nome}, ${descricao || null}, ${imageurl || null}, ${calorias || null},
+        ${userId}, ${nome}, ${descricao}, ${imageurl}, ${calorias || null},
         ${tempo_preparo || null}, ${gordura || null}, ${proteina || null},
-        ${carboidratos || null}, ${nome_autor || null}, ${avatar_autor_url || null},
-        ${new Date()}, ${new Date()}, ${categoria || null}
+        ${carboidratos || null}, ${authorName || null}, ${authorAvatarUrl || null},
+        ${new Date()}, ${new Date()}, ${categoria}
       )
       RETURNING *;
     `;
@@ -384,11 +394,10 @@ app.post('/api/dietas', verifyToken, async (req, res) => {
   }
 });
 
-// ROTA PARA LISTAR DIETAS
 app.get('/api/dietas', verifyToken, async (req, res) => {
   console.log('Rota GET /api/dietas atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
-  const { categoria } = req.query; // Pega o parâmetro categoria da query
+  const userId = req.userId;
+  const { categoria } = req.query;
 
   try {
     let query = sql`SELECT id_us, nome, descricao, imageurl, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url, createdat, updatedat, categoria, id_dieta FROM dietas WHERE id_us = ${userId}`;
@@ -407,28 +416,31 @@ app.get('/api/dietas', verifyToken, async (req, res) => {
   }
 });
 
-// ROTA PARA EDITAR DIETAS
 app.put('/api/dietas/:id_dieta', verifyToken, async (req, res) => {
   console.log('Rota PUT /api/dietas/:id_dieta atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
   const { id_dieta } = req.params;
-  const updateFields = req.body;
+  const { nome, descricao, imageurl, categoria, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url } = req.body;
+
+  if (!nome || !descricao || !imageurl || !categoria) {
+    return res.status(400).json({ error: 'Nome, descrição, imagem e categoria são obrigatórios.' });
+  }
 
   try {
     const [updatedDieta] = await sql`
       UPDATE dietas
       SET
-        nome = COALESCE(${updateFields.nome || null}, nome),
-        descricao = COALESCE(${updateFields.descricao || null}, descricao),
-        imageurl = COALESCE(${updateFields.imageurl || null}, imageurl),
-        calorias = COALESCE(${updateFields.calorias || null}, calorias),
-        tempo_preparo = COALESCE(${updateFields.tempo_preparo || null}, tempo_preparo),
-        gordura = COALESCE(${updateFields.gordura || null}, gordura),
-        proteina = COALESCE(${updateFields.proteina || null}, proteina),
-        carboidratos = COALESCE(${updateFields.carboidratos || null}, carboidratos),
-        nome_autor = COALESCE(${updateFields.nome_autor || null}, nome_autor),
-        avatar_autor_url = COALESCE(${updateFields.avatar_autor_url || null}, avatar_autor_url),
-        categoria = COALESCE(${updateFields.categoria || null}, categoria),
+        nome = ${nome},
+        descricao = ${descricao},
+        imageurl = ${imageurl},
+        calorias = COALESCE(${calorias || null}, calorias),
+        tempo_preparo = COALESCE(${tempo_preparo || null}, tempo_preparo),
+        gordura = COALESCE(${gordura || null}, gordura),
+        proteina = COALESCE(${proteina || null}, proteina),
+        carboidratos = COALESCE(${carboidratos || null}, carboidratos),
+        nome_autor = COALESCE(${nome_autor || null}, nome_autor),
+        avatar_autor_url = COALESCE(${avatar_autor_url || null}, avatar_autor_url),
+        categoria = ${categoria},
         updatedat = ${new Date()}
       WHERE id_dieta = ${id_dieta} AND id_us = ${userId}
       RETURNING *;
@@ -444,10 +456,9 @@ app.put('/api/dietas/:id_dieta', verifyToken, async (req, res) => {
   }
 });
 
-// ROTA PARA EXCLUIR DIETAS
 app.delete('/api/dietas/:id_dieta', verifyToken, async (req, res) => {
   console.log('Rota DELETE /api/dietas/:id_dieta atingida');
-  const userId = req.userId; // userId é um INTEGER aqui
+  const userId = req.userId;
   const { id_dieta } = req.params;
 
   try {
@@ -467,9 +478,6 @@ app.delete('/api/dietas/:id_dieta', verifyToken, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------- //
-
-// Rota: Listar todas as refeições do catálogo (mantida, pois pode ser um catálogo geral)
 app.get('/api/meals', verifyToken, async (req, res) => {
   console.log('Rota GET /api/meals atingida');
   try {
@@ -483,7 +491,7 @@ app.get('/api/meals', verifyToken, async (req, res) => {
   }
 });
 
-
-app.listen(port, () => {
+app.listen(port, '0.0.0.0', () => {
   console.log(`Servidor rodando em http://localhost:${port}`);
+  console.log(`Servidor também acessível via IP da rede local`);
 });
