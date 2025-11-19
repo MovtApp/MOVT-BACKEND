@@ -36,7 +36,22 @@ No dashboard da Vercel, adicione as seguintes variáveis:
 | `DATABASE_URL` | URL do PostgreSQL | `postgresql://user:pass@host:5432/db` |
 | `EMAIL_USER` | Email para envio | `seuemail@gmail.com` |
 | `EMAIL_PASS` | Senha do email | `suasenha` |
+| `SUPABASE_URL` | URL do projeto Supabase | `https://[projeto-id].supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service Role Key do Supabase | `eyJhbGci...` (key longa) |
+| `SUPABASE_AVATAR_BUCKET` | Nome do bucket de avatares | `avatars` |
 | `NODE_ENV` | Ambiente | `production` |
+
+### 📸 Como obter as credenciais do Supabase Storage:
+
+1. **Acesse o Dashboard**: https://supabase.com/dashboard
+2. **Selecione seu projeto**
+3. **Settings → API**:
+   - Copie a **Project URL** → use como `SUPABASE_URL`
+   - Copie a **service_role** key (não a anon key) → use como `SUPABASE_SERVICE_ROLE_KEY`
+4. **Storage → New Bucket**:
+   - Nome: `avatars`
+   - Marque como **Public**
+   - Crie o bucket
 
 ### Como adicionar:
 1. Acesse: https://vercel.com/[seu-time]/[seu-projeto]/settings/environment-variables

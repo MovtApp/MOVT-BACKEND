@@ -16,6 +16,9 @@
   "env": {
     "DATABASE_URL": "@database_url",
     "EMAIL_USER": "@email_user",
-    "EMAIL_PASS": "@email_pass"
+    "EMAIL_PASS": "@email_pass",
+    "SUPABASE_URL": "@supabase_url",
+    "SUPABASE_SERVICE_ROLE_KEY": "@supabase_service_role_key",
+    "SUPABASE_AVATAR_BUCKET": "@supabase_avatar_bucket"
   }
 }

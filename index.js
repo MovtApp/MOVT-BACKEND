@@ -5,10 +5,28 @@ const bcrypt = require("bcrypt");
 const { v4: uuidv4 } = require("uuid");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+const multer = require("multer");
+const sharp = require("sharp");
+const { createClient } = require("@supabase/supabase-js");
 
 const databaseUrl = process.env.DATABASE_URL;
 const emailUser = process.env.EMAIL_USER;
 const emailPass = process.env.EMAIL_PASS;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Inicializar cliente Supabase para Storage
+const supabase = supabaseUrl && supabaseServiceKey
+  ? createClient(supabaseUrl, supabaseServiceKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    })
+  : null;
+
+// Bucket de avatares no Supabase Storage
+const AVATAR_BUCKET = process.env.SUPABASE_AVATAR_BUCKET || "avatars";
 
 const sql = postgres(databaseUrl, {
   ssl: "require",
@@ -103,6 +121,130 @@ function verifyToken(req, res, next) {
         details: error.message,
       });
     });
+}
+
+// ==================== CONFIGURAÇÃO DE UPLOAD DE AVATAR ==================== //
+
+// Configuração do Multer
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const validTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!validTypes.includes(file.mimetype)) {
+      return cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "avatar"));
+    }
+    cb(null, true);
+  },
+});
+
+// Função principal para processar um upload de avatar usando Supabase Storage
+async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
+  // Verifica se Supabase está configurado
+  if (!supabase) {
+    throw { code: 500, message: "Supabase Storage não configurado. Verifique as variáveis de ambiente." };
+  }
+
+  // Validação extra: tipos válidos
+  const validMimeTypes = ["image/jpeg", "image/png", "image/webp"];
+  if (!validMimeTypes.includes(mimetype)) {
+    throw { code: 422, message: "Formato de imagem não suportado." };
+  }
+
+  // Checa dimensões máximas (2k x 2k)
+  let image;
+  try {
+    image = sharp(fileBuffer);
+    const metadata = await image.metadata();
+    if (
+      metadata.width > 2000 ||
+      metadata.height > 2000
+    ) {
+      throw { code: 422, message: "A imagem deve ter no máximo 2000x2000 px." };
+    }
+  } catch (err) {
+    if (err.code) throw err;
+    throw { code: 400, message: "Arquivo de imagem inválido." };
+  }
+
+  // Paths/nomes no Supabase Storage
+  const uuid = uuidv4();
+  const base = `avatar_${userId}_${uuid}`;
+  const ext = mimetype === "image/png" ? "png" : mimetype === "image/webp" ? "webp" : "jpg";
+
+  // Processa as versões redimensionadas
+  const [originalBuffer, thumb96Buffer, thumb192Buffer, thumb512Buffer] = await Promise.all([
+    sharp(fileBuffer).toFormat(ext, { quality: 95 }).toBuffer(),
+    sharp(fileBuffer).resize(96, 96).toFormat(ext, { quality: 80 }).toBuffer(),
+    sharp(fileBuffer).resize(192, 192).toFormat(ext, { quality: 80 }).toBuffer(),
+    sharp(fileBuffer).resize(512, 512).toFormat(ext, { quality: 90 }).toBuffer(),
+  ]);
+
+  // Define os caminhos no bucket
+  const originalPath = `${userId}/${base}_original.${ext}`;
+  const thumb96Path = `${userId}/${base}_96x96.${ext}`;
+  const thumb192Path = `${userId}/${base}_192x192.${ext}`;
+  const thumb512Path = `${userId}/${base}_512x512.${ext}`;
+
+  // Faz upload de todas as versões para o Supabase Storage
+  const [originalUpload, thumb96Upload, thumb192Upload, thumb512Upload] = await Promise.all([
+    supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(originalPath, originalBuffer, {
+        contentType: mimetype,
+        upsert: true,
+      }),
+    supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(thumb96Path, thumb96Buffer, {
+        contentType: mimetype,
+        upsert: true,
+      }),
+    supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(thumb192Path, thumb192Buffer, {
+        contentType: mimetype,
+        upsert: true,
+      }),
+    supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(thumb512Path, thumb512Buffer, {
+        contentType: mimetype,
+        upsert: true,
+      }),
+  ]);
+
+  // Verifica erros no upload
+  if (originalUpload.error) throw { code: 500, message: `Erro ao fazer upload: ${originalUpload.error.message}` };
+  if (thumb96Upload.error) throw { code: 500, message: `Erro ao fazer upload: ${thumb96Upload.error.message}` };
+  if (thumb192Upload.error) throw { code: 500, message: `Erro ao fazer upload: ${thumb192Upload.error.message}` };
+  if (thumb512Upload.error) throw { code: 500, message: `Erro ao fazer upload: ${thumb512Upload.error.message}` };
+
+  // Obtém URLs públicas dos arquivos
+  const { data: originalUrlData } = supabase.storage
+    .from(AVATAR_BUCKET)
+    .getPublicUrl(originalPath);
+  
+  const { data: thumb96UrlData } = supabase.storage
+    .from(AVATAR_BUCKET)
+    .getPublicUrl(thumb96Path);
+  
+  const { data: thumb192UrlData } = supabase.storage
+    .from(AVATAR_BUCKET)
+    .getPublicUrl(thumb192Path);
+  
+  const { data: thumb512UrlData } = supabase.storage
+    .from(AVATAR_BUCKET)
+    .getPublicUrl(thumb512Path);
+
+  return {
+    original: originalUrlData.publicUrl,
+    thumb96: thumb96UrlData.publicUrl,
+    thumb192: thumb192UrlData.publicUrl,
+    thumb512: thumb512UrlData.publicUrl,
+    ext,
+  };
 }
 
 // Função auxiliar para gerar dados mockados
@@ -488,7 +630,82 @@ app.get("/user/session-status", verifyToken, async (req, res) => {
   }
 });
 
+// -------------------------------- UPLOAD DE AVATAR ---------------------------- //
 
+app.put(
+  "/api/user/avatar",
+  verifyToken,
+  upload.single("avatar"),
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: "Arquivo de avatar não enviado." });
+    }
+    if (req.file.size > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: "Arquivo excede 5MB." });
+    }
+
+    const userId = req.userId;
+
+    try {
+      // Processar & armazenar as imagens
+      const urls = await processAndSaveAvatar(
+        userId,
+        req.file.buffer,
+        req.file.mimetype,
+      );
+
+      // Atualizar no banco
+      const now = new Date();
+      await sql`
+        UPDATE usuarios
+        SET avatar_url = ${urls.original},
+            avatar_thumbnail = ${urls.thumb96},
+            avatar_medium = ${urls.thumb192},
+            avatar_large = ${urls.thumb512},
+            updatedat = ${now}
+        WHERE id_us = ${userId}
+      `;
+
+      // Recupera perfil resumido para resposta
+      const [user] = await sql`
+        SELECT id_us, avatar_url, avatar_thumbnail, avatar_medium, avatar_large, updatedat
+        FROM usuarios
+        WHERE id_us = ${userId}
+      `;
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          id: user.id_us,
+          photo: user.avatar_url,
+          photo_thumbnail: user.avatar_thumbnail,
+          photo_medium: user.avatar_medium,
+          photo_large: user.avatar_large,
+          updatedAt: user.updatedat,
+        },
+      });
+    } catch (err) {
+      if (err && (err.code === 422 || err.code === 400)) {
+        return res.status(err.code).json({ error: err.message });
+      }
+      if (err instanceof multer.MulterError) {
+        // Limite de tamanho ou tipo inválido
+        if (err.code === "LIMIT_FILE_SIZE")
+          return res.status(413).json({ error: "Arquivo excede 5MB." });
+        if (err.code === "LIMIT_UNEXPECTED_FILE")
+          return res
+            .status(422)
+            .json({ error: "Formato de imagem não suportado." });
+        return res.status(400).json({ error: err.message });
+      }
+      console.error("Erro upload avatar:", err);
+      return res.status(500).json({
+        error: "Erro interno ao processar avatar.",
+        details: err && err.message ? err.message : err,
+      });
+    }
+  },
+);
 
 // -------------------------------- DIETAS ---------------------------- //
 
