@@ -247,7 +247,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   };
 }
 
-// Função auxiliar para gerar dados mockados
+// Função auxiliar para gerar dados mockados 
 function generateMockCaloriesData(timeframe) {
   const now = new Date();
   let data = [];
@@ -632,6 +632,7 @@ app.get("/user/session-status", verifyToken, async (req, res) => {
 
 // -------------------------------- UPLOAD DE AVATAR ---------------------------- //
 
+
 app.put(
   "/api/user/avatar",
   verifyToken,
@@ -706,6 +707,644 @@ app.put(
     }
   },
 );
+
+// ROTA GENÉRICA: Atualizar um único campo do perfil (username ou email)
+app.put("/api/user/update-field", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { field, value } = req.body;
+
+  if (!field || !value) {
+    return res.status(400).json({ error: "Informe 'field' e 'value' no corpo da requisição." });
+  }
+
+  // Permitir apenas campos controlados
+  const allowed = ["username", "email"];
+  if (!allowed.includes(field)) {
+    return res.status(400).json({ error: "Campo inválido. Apenas 'username' ou 'email' são permitidos." });
+  }
+
+  try {
+    const [current] = await sql`SELECT username, email FROM usuarios WHERE id_us = ${userId}`;
+    if (!current) return res.status(404).json({ error: "Usuário não encontrado." });
+
+    const now = new Date();
+
+    // Se não houver alteração no campo solicitado, retorna sem mudanças
+    if (current[field] === value) {
+      return res.status(200).json({ success: true, message: "Nenhuma alteração necessária.", data: { [field]: value } });
+    }
+
+    // Verificações de unicidade + atualização (somente do campo solicitado)
+    if (field === "username") {
+      const existing = await sql`SELECT id_us FROM usuarios WHERE username = ${value} AND id_us != ${userId}`;
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Username já está em uso por outro usuário." });
+      }
+
+      // Atualiza somente o username; NÃO altera/zera a coluna email
+      await sql`
+        UPDATE usuarios
+        SET username = ${value}, updatedat = ${now}
+        WHERE id_us = ${userId}
+      `;
+    }
+
+    if (field === "email") {
+      const existing = await sql`SELECT id_us FROM usuarios WHERE email = ${value} AND id_us != ${userId}`;
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "E-mail já está em uso por outro usuário." });
+      }
+
+      const verificationCode = generateVerificationCode();
+      const verificationExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+      // Atualiza somente o email; NÃO altera/zera a coluna username
+      await sql`
+        UPDATE usuarios
+        SET email = ${value}, email_verified = FALSE, verification_code = ${verificationCode}, verification_code_expires_at = ${verificationExpiresAt}, updatedat = ${now}
+        WHERE id_us = ${userId}
+      `;
+
+      // Tenta enviar e-mail (não bloqueante)
+      try {
+        await sendVerificationEmail(value, verificationCode);
+      } catch (err) {
+        console.warn("Falha ao enviar e-mail de verificação após alteração de e-mail (update-field):", err);
+      }
+    }
+
+    const [updated] = await sql`SELECT id_us, username, email, email_verified FROM usuarios WHERE id_us = ${userId}`;
+
+    return res.status(200).json({ success: true, data: {
+      id: updated.id_us,
+      username: updated.username,
+      email: updated.email,
+      isVerified: updated.email_verified,
+    }});
+  } catch (error) {
+    console.error("Erro na rota update-field:", error);
+    return res.status(500).json({ error: "Erro interno ao atualizar campo.", details: error.message });
+  }
+});
+
+// ------------------- ROTAS DE TRAINERS / BUSCAS / UPLOADS ------------------ //
+
+// Lista de trainers (basic, defensivo - retorna usuários como trainers quando aplicável) ✅
+app.get("/api/trainers", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+    const q = req.query.q && req.query.q.trim();
+
+    // Detecta se a coluna `role` existe (para usar filtro direto e indexado)
+    const [colCheck] = await sql`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'usuarios' AND column_name = 'role'
+    `;
+    const hasRoleCol = !!colCheck;
+
+    // Se houver token, tentamos obter o role do requester (permitir personalizações)
+    let requesterRole = null;
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const sessionId = authHeader.split(' ')[1];
+      const [r] = await sql`SELECT id_us, role FROM usuarios WHERE session_id = ${sessionId}`;
+      if (r) requesterRole = r.role || null;
+    }
+
+    if (hasRoleCol) {
+      // Usar a coluna role (mais performático quando indexado)
+      if (q) {
+        const pattern = `%${q}%`;
+        const data = await sql`
+          SELECT id_us AS id, nome AS name, username, avatar_url, role
+          FROM usuarios
+          WHERE role = 'trainer' AND (username ILIKE ${pattern} OR nome ILIKE ${pattern})
+          ORDER BY nome
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+        const [{ count } = { count: null }] = await sql`
+          SELECT count(*) FROM usuarios WHERE role = 'trainer' AND (username ILIKE ${pattern} OR nome ILIKE ${pattern})
+        `;
+        return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+      }
+
+      const data = await sql`
+        SELECT id_us AS id, nome AS name, username, avatar_url, role
+        FROM usuarios
+        WHERE role = 'trainer'
+        ORDER BY nome
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      const [{ count } = { count: null }] = await sql`SELECT count(*) FROM usuarios WHERE role = 'trainer'`;
+      return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+    }
+
+    // Fallback: inferir trainers pelo tipo_documento = 'CNPJ' ou por presença em trainer_posts
+    if (q) {
+      const pattern = `%${q}%`;
+      const data = await sql`
+        SELECT DISTINCT u.id_us AS id, u.nome AS name, u.username, u.avatar_url,
+          CASE WHEN tp.trainer_id IS NOT NULL OR u.tipo_documento = 'CNPJ' THEN 'trainer' ELSE
+            CASE WHEN u.tipo_documento = 'CNPJ' THEN 'trainer' ELSE 'client_pf' END
+          END AS role
+        FROM usuarios u
+        LEFT JOIN trainer_posts tp ON tp.trainer_id = u.id_us
+        WHERE (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
+        ORDER BY u.nome
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      return res.status(200).json({ data, meta: { total: data.length, limit, offset } });
+    }
+
+    const data = await sql`
+      SELECT DISTINCT u.id_us AS id, u.nome AS name, u.username, u.avatar_url,
+        CASE WHEN tp.trainer_id IS NOT NULL OR u.tipo_documento = 'CNPJ' THEN 'trainer' ELSE
+          CASE WHEN u.tipo_documento = 'CNPJ' THEN 'trainer' ELSE 'client_pf' END
+        END AS role
+      FROM usuarios u
+      LEFT JOIN trainer_posts tp ON tp.trainer_id = u.id_us
+      ORDER BY u.nome
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    return res.status(200).json({ data, meta: { total: data.length, limit, offset } });
+  } catch (err) {
+    console.error("Erro em GET /api/trainers:", err);
+    return res.status(500).json({ error: "Erro interno ao listar trainers." });
+  }
+});
+
+// Detalhe de um trainer (busca por id) ✅
+app.get("/api/trainers/:id", async (req, res) => {
+  const id = req.params.id;
+  try {
+    const [row] = await sql`
+      SELECT id_us AS id, nome AS name, username, avatar_url, updatedat
+      FROM usuarios
+      WHERE id_us = ${id}
+      LIMIT 1
+    `;
+    if (!row) return res.status(404).json({ error: "Trainer não encontrado." });
+    return res.status(200).json({ data: row });
+  } catch (err) {
+    console.error("Erro em GET /api/trainers/:id", err);
+    return res.status(500).json({ error: "Erro interno ao obter trainer." });
+  }
+});
+
+// Lista de posts do trainer (se existir tabela trainer_posts) ✅
+app.get("/api/trainers/:id/posts", async (req, res) => {
+  const trainerId = req.params.id;
+  const limit = parseInt(req.query.limit) || 10;
+  const offset = parseInt(req.query.offset) || 0;
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.trainer_posts') IS NOT NULL AS exists`;
+    if (!exists) return res.status(200).json({ data: [], meta: { total: 0, limit, offset } });
+
+    const data = await sql`
+      SELECT id, trainer_id AS trainerId, image_url AS imageUrl, alt, created_at
+      FROM trainer_posts
+      WHERE trainer_id = ${trainerId}
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    const [{ count } = { count: null }] = await sql`SELECT count(*) FROM trainer_posts WHERE trainer_id = ${trainerId}`;
+    return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+  } catch (err) {
+    console.error("Erro em GET /api/trainers/:id/posts", err);
+    return res.status(500).json({ error: "Erro interno ao listar posts do trainer." });
+  }
+});
+
+// GET: List personals with complete profile data (usuarios + personal_profiles) ✅
+app.get("/api/personals", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+    const q = req.query.q && req.query.q.trim();
+
+    // Check if personal_profiles table exists
+    const [{ exists }] = await sql`SELECT to_regclass('public.personal_profiles') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(200).json({ data: [], meta: { total: 0, limit, offset } });
+    }
+
+    if (q) {
+      const pattern = `%${q}%`;
+      const data = await sql`
+        SELECT
+          u.id_us AS id,
+          u.nome AS name,
+          u.username,
+          u.avatar_url AS "avatarUrl",
+          u.email,
+          u.telefone,
+          pp.descricao AS description,
+          pp.experiencia_anos AS "experienceYears",
+          pp.especialidades,
+          pp.rating,
+          pp.total_avaliacoes AS "totalRatings",
+          pp.createdat,
+          pp.updatedat
+        FROM usuarios u
+        LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+        WHERE u.role = 'personal' AND (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
+        ORDER BY u.nome
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+      const [{ count } = { count: null }] = await sql`
+        SELECT count(*) FROM usuarios WHERE role = 'personal' AND (username ILIKE ${pattern} OR nome ILIKE ${pattern})
+      `;
+      return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+    }
+
+    const data = await sql`
+      SELECT
+        u.id_us AS id,
+        u.nome AS name,
+        u.username,
+        u.avatar_url AS "avatarUrl",
+        u.email,
+        u.telefone,
+        pp.descricao AS description,
+        pp.experiencia_anos AS "experienceYears",
+        pp.especialidades,
+        pp.rating,
+        pp.total_avaliacoes AS "totalRatings",
+        pp.createdat,
+        pp.updatedat
+      FROM usuarios u
+      LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+      WHERE u.role = 'personal'
+      ORDER BY u.nome
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    const [{ count } = { count: null }] = await sql`SELECT count(*) FROM usuarios WHERE role = 'personal'`;
+    return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+  } catch (err) {
+    console.error("Erro em GET /api/personals:", err);
+    return res.status(500).json({ error: "Erro interno ao listar personals." });
+  }
+});
+
+// Upload de cover/avatar para um trainer (processa e retorna URLs; NÃO grava em colunas desconhecidas)
+app.put("/api/trainers/:id/cover", verifyToken, upload.single("cover"), async (req, res) => {
+  const trainerId = req.params.id;
+  // Permissão: apenas o próprio trainer ou admin pode atualizar
+  if (String(req.userId) !== String(trainerId)) {
+    // se tiver roles/admin, aqui deveria verificar; por enquanto bloqueia
+    return res.status(403).json({ error: "Acesso negado. Apenas o dono pode atualizar a cover." });
+  }
+
+  if (!req.file) return res.status(400).json({ error: "Arquivo cover não enviado." });
+
+  try {
+    // Reutiliza processamento genérico (poderia ter função própria para cover)
+    const urls = await processAndSaveAvatar(trainerId, req.file.buffer, req.file.mimetype);
+    // Retorna URLs geradas; a gravação em DB fica a critério do backend (schema)
+    return res.status(200).json({ success: true, data: { coverUrl: urls.original, coverThumb: urls.thumb192, coverLarge: urls.thumb512 } });
+  } catch (err) {
+    console.error("Erro em PUT /api/trainers/:id/cover", err);
+    return res.status(500).json({ error: "Erro ao processar cover." });
+  }
+});
+
+app.put("/api/trainers/:id/avatar", verifyToken, upload.single("avatar"), async (req, res) => {
+  const trainerId = req.params.id;
+  if (String(req.userId) !== String(trainerId)) {
+    return res.status(403).json({ error: "Acesso negado. Apenas o dono pode atualizar o avatar." });
+  }
+  if (!req.file) return res.status(400).json({ error: "Arquivo avatar não enviado." });
+  try {
+    const urls = await processAndSaveAvatar(trainerId, req.file.buffer, req.file.mimetype);
+    return res.status(200).json({ success: true, data: { avatarUrl: urls.original, avatarThumb: urls.thumb96, avatarMedium: urls.thumb192, avatarLarge: urls.thumb512 } });
+  } catch (err) {
+    console.error("Erro em PUT /api/trainers/:id/avatar", err);
+    return res.status(500).json({ error: "Erro ao processar avatar do trainer." });
+  }
+});
+
+// Follow / Unfollow (só se tabela 'follows' existir)
+app.post("/api/trainers/:id/follow", verifyToken, async (req, res) => {
+  const trainerId = req.params.id;
+  const userId = req.userId;
+  try {
+    // Validação de entrada
+    if (!trainerId || isNaN(parseInt(trainerId, 10))) {
+      return res.status(400).json({ error: "ID do trainer inválido." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+
+    // Verificar se o trainer existe antes de criar o follow
+    const trainerExists = await sql`SELECT id_us FROM usuarios WHERE id_us = ${parseInt(trainerId, 10)} AND (role = 'trainer' OR role = 'personal')`;
+    if (!trainerExists || trainerExists.length === 0) {
+      return res.status(404).json({ error: "Trainer não encontrado." });
+    }
+
+    // Verificar se o usuário não está tentando seguir a si mesmo
+    if (parseInt(trainerId, 10) === userId) {
+      return res.status(400).json({ error: "Você não pode seguir a si mesmo." });
+    }
+
+    // Insere ou ignora (supondo constraint unique)
+    await sql`
+      INSERT INTO follows (follower_user_id, trainer_id, created_at)
+      VALUES (${userId}, ${parseInt(trainerId, 10)}, CURRENT_TIMESTAMP)
+      ON CONFLICT (follower_user_id, trainer_id) DO NOTHING
+    `;
+    return res.status(200).json({ success: true, following: true });
+  } catch (err) {
+    console.error("Erro em POST /api/trainers/:id/follow", err);
+    return res.status(500).json({ error: "Erro interno ao seguir trainer." });
+  }
+});
+
+app.delete("/api/trainers/:id/follow", verifyToken, async (req, res) => {
+  const trainerId = req.params.id;
+  const userId = req.userId;
+  try {
+    // Validação de entrada
+    if (!trainerId || isNaN(parseInt(trainerId, 10))) {
+      return res.status(400).json({ error: "ID do trainer inválido." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+
+    await sql`DELETE FROM follows WHERE follower_user_id = ${userId} AND trainer_id = ${parseInt(trainerId, 10)}`;
+    return res.status(200).json({ success: true, following: false });
+  } catch (err) {
+    console.error("Erro em DELETE /api/trainers/:id/follow", err);
+    return res.status(500).json({ error: "Erro interno ao deixar de seguir trainer." });
+  }
+});
+
+// Follow múltiplos trainers de uma vez
+app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { trainerIds } = req.body;
+
+  try {
+    // Validação de entrada
+    if (!Array.isArray(trainerIds) || trainerIds.length === 0) {
+      return res.status(400).json({ error: "trainerIds deve ser um array não vazio." });
+    }
+
+    if (trainerIds.length > 100) {
+      return res.status(400).json({ error: "Máximo de 100 trainers por vez." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+
+    // Filtra IDs válidos (números)
+    const validIds = trainerIds.filter(id => !isNaN(parseInt(id, 10)));
+
+    if (validIds.length === 0) {
+      return res.status(400).json({ error: "Nenhum ID de trainer válido fornecido." });
+    }
+
+    // Insere múltiplos follows (ignorando conflitos)
+    for (const trainerId of validIds) {
+      await sql`
+        INSERT INTO follows (follower_user_id, trainer_id, created_at)
+        VALUES (${userId}, ${trainerId}, CURRENT_TIMESTAMP)
+        ON CONFLICT (follower_user_id, trainer_id) DO NOTHING
+      `;
+    }
+
+    return res.status(200).json({ 
+      success: true, 
+      message: `${validIds.length} trainer(s) adicionado(s) com sucesso.`,
+      followedCount: validIds.length 
+    });
+  } catch (err) {
+    console.error("Erro em POST /api/trainers/follow-multiple", err);
+    return res.status(500).json({ error: "Erro interno ao seguir múltiplos trainers." });
+  }
+});
+
+// Unfollow múltiplos trainers de uma vez
+app.post("/api/trainers/unfollow-multiple", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { trainerIds } = req.body;
+
+  try {
+    // Validação de entrada
+    if (!Array.isArray(trainerIds) || trainerIds.length === 0) {
+      return res.status(400).json({ error: "trainerIds deve ser um array não vazio." });
+    }
+
+    if (trainerIds.length > 100) {
+      return res.status(400).json({ error: "Máximo de 100 trainers por vez." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+
+    // Filtra IDs válidos (números)
+    const validIds = trainerIds.filter(id => !isNaN(parseInt(id, 10)));
+
+    if (validIds.length === 0) {
+      return res.status(400).json({ error: "Nenhum ID de trainer válido fornecido." });
+    }
+
+    // Deleta múltiplos follows
+    await sql`
+      DELETE FROM follows 
+      WHERE follower_user_id = ${userId} AND trainer_id = ANY(${validIds})
+    `;
+
+    return res.status(200).json({ 
+      success: true, 
+      message: `${validIds.length} trainer(s) removido(s) com sucesso.`,
+      unfollowedCount: validIds.length 
+    });
+  } catch (err) {
+    console.error("Erro em POST /api/trainers/unfollow-multiple", err);
+    return res.status(500).json({ error: "Erro interno ao deixar de seguir múltiplos trainers." });
+  }
+});
+
+// -------------------- GRAFO / REDE DE SEGUIDORES -------------------- //
+
+// Retorna um subgrafo (nodes + links) para um usuário, com profundidade configurável.
+// Query params:
+//  - userId (opcional): id do usuário raiz; se ausente, usa o usuário autenticado
+//  - depth (opcional): profundidade de busca (padrão 2, máximo 5)
+//  - maxNodes (opcional): limite de nós retornados (padrão 500, máximo 2000)
+//  - direction (opcional): 'out' (seguindo), 'in' (seguidores) ou 'both' (padrão)
+app.get("/api/graph/network", verifyToken, async (req, res) => {
+  try {
+    const startId = req.query.userId ? parseInt(req.query.userId, 10) : req.userId;
+    if (!startId) return res.status(400).json({ error: "userId não informado e sessão não encontrada." });
+
+    let depth = parseInt(req.query.depth || "2", 10);
+    depth = Number.isNaN(depth) ? 2 : Math.min(Math.max(depth, 1), 5);
+
+    let maxNodes = parseInt(req.query.maxNodes || "500", 10);
+    maxNodes = Number.isNaN(maxNodes) ? 500 : Math.min(Math.max(maxNodes, 50), 2000);
+
+    const direction = (req.query.direction || "both").toLowerCase();
+
+    // Verifica se tabela 'follows' existe
+    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada. Execute as migrations para habilitar a rede de seguidores." });
+
+    // Monta CTE recursivo dependendo da direção solicitada
+    let idRows;
+    if (direction === "out") {
+      idRows = await sql`
+        WITH RECURSIVE walk AS (
+          SELECT ${startId} AS id, 0 AS depth
+          UNION ALL
+          SELECT f.trainer_id AS id, walk.depth + 1
+          FROM follows f
+          JOIN walk ON f.follower_user_id = walk.id
+          WHERE walk.depth < ${depth}
+        )
+        SELECT DISTINCT id FROM walk LIMIT ${maxNodes};
+      `;
+    } else if (direction === "in") {
+      idRows = await sql`
+        WITH RECURSIVE walk AS (
+          SELECT ${startId} AS id, 0 AS depth
+          UNION ALL
+          SELECT f.follower_user_id AS id, walk.depth + 1
+          FROM follows f
+          JOIN walk ON f.trainer_id = walk.id
+          WHERE walk.depth < ${depth}
+        )
+        SELECT DISTINCT id FROM walk LIMIT ${maxNodes};
+      `;
+    } else {
+      idRows = await sql`
+        WITH RECURSIVE walk_out AS (
+          SELECT ${startId} AS id, 0 AS depth
+          UNION ALL
+          SELECT f.trainer_id AS id, walk_out.depth + 1
+          FROM follows f
+          JOIN walk_out ON f.follower_user_id = walk_out.id
+          WHERE walk_out.depth < ${depth}
+        ), walk_in AS (
+          SELECT ${startId} AS id, 0 AS depth
+          UNION ALL
+          SELECT f.follower_user_id AS id, walk_in.depth + 1
+          FROM follows f
+          JOIN walk_in ON f.trainer_id = walk_in.id
+          WHERE walk_in.depth < ${depth}
+        )
+        SELECT DISTINCT id FROM (
+          SELECT id FROM walk_out
+          UNION
+          SELECT id FROM walk_in
+        ) t LIMIT ${maxNodes};
+      `;
+    }
+
+    const ids = idRows.map((r) => r.id).filter(Boolean);
+
+    // Se só tiver o nó raiz, retornamos apenas ele
+    if (ids.length === 0) {
+      return res.status(200).json({ nodes: [], links: [] });
+    }
+
+    // Busca dados dos usuários (nós)
+    const users = await sql`
+      SELECT id_us AS id, nome AS name, username, avatar_url, role
+      FROM usuarios
+      WHERE id_us = ANY(${ids})
+      LIMIT ${maxNodes}
+    `;
+
+    // Busca arestas (relacionamentos) entre os nós retornados
+    const edges = await sql`
+      SELECT follower_user_id AS source, trainer_id AS target, created_at
+      FROM follows
+      WHERE follower_user_id = ANY(${ids}) AND trainer_id = ANY(${ids})
+    `;
+
+    const nodes = users.map((u) => ({ id: u.id, name: u.name, username: u.username, avatar: u.avatar_url, role: u.role }));
+    const links = edges.map((e) => ({ source: e.source, target: e.target, createdAt: e.created_at }));
+
+    return res.status(200).json({ nodes, links, meta: { requestedFor: startId, depth, countNodes: nodes.length, countEdges: links.length } });
+  } catch (err) {
+    console.error("Erro em GET /api/graph/network:", err);
+    return res.status(500).json({ error: "Erro interno ao gerar subgrafo.", details: err.message });
+  }
+});
+
+// Search global simples
+app.get("/api/search", async (req, res) => {
+  const q = (req.query.q || "").trim();
+  const limit = parseInt(req.query.limit) || 10;
+  const offset = parseInt(req.query.offset) || 0;
+  if (!q) return res.status(400).json({ error: "Query 'q' é obrigatória." });
+  try {
+    const pattern = `%${q}%`;
+    const trainers = await sql`
+      SELECT id_us AS id, nome AS title, username AS subtitle
+      FROM usuarios
+      WHERE nome ILIKE ${pattern} OR username ILIKE ${pattern}
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    // Retornar tipo para frontend decidir a tela target
+    const results = trainers.map((t) => ({ id: t.id, title: t.title, subtitle: t.subtitle, type: "trainer", target: "TrainerProfile" }));
+    return res.status(200).json({ data: results, meta: { total: results.length, limit, offset } });
+  } catch (err) {
+    console.error("Erro em GET /api/search", err);
+    return res.status(500).json({ error: "Erro interno na busca." });
+  }
+});
+
+// Notifications (consulta básica se tabela existir)
+app.get("/api/notifications", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.notifications') IS NOT NULL AS exists`;
+    if (!exists) return res.status(200).json({ data: [] });
+
+    const data = await sql`
+      SELECT id, title, message, type, read, timestamp
+      FROM notifications
+      WHERE user_id = ${userId}
+      ORDER BY timestamp DESC
+      LIMIT 100
+    `;
+    return res.status(200).json({ data });
+  } catch (err) {
+    console.error("Erro em GET /api/notifications", err);
+    return res.status(500).json({ error: "Erro interno ao buscar notificações." });
+  }
+});
+
+app.put("/api/notifications/:id/read", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const id = req.params.id;
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.notifications') IS NOT NULL AS exists`;
+    if (!exists) return res.status(501).json({ error: "Tabela 'notifications' não instalada." });
+    await sql`UPDATE notifications SET read = true WHERE id = ${id} AND user_id = ${userId}`;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro em PUT /api/notifications/:id/read", err);
+    return res.status(500).json({ error: "Erro interno ao marcar notificacao." });
+  }
+});
+
+// Endpoint para gerar signed upload (placeholder quando não houver S3 direto)
+app.post("/api/uploads/sign", verifyToken, async (req, res) => {
+  // Este endpoint pode ser implementado para S3/GCS, aqui oferecemos comportamento mínimo
+  const { filename, contentType, purpose } = req.body || {};
+  if (!filename || !contentType) return res.status(400).json({ error: "Informe filename e contentType." });
+  if (!supabase) return res.status(501).json({ error: "Signed uploads não configurados neste ambiente. Use multipart ou configure storage." });
+  // Como fallback retornamos um suggested public path e instruções
+  const suggestedKey = `${purpose || 'uploads'}/${uuidv4()}_${filename}`;
+  return res.status(200).json({ uploadUrl: null, publicUrl: `supabase://${AVATAR_BUCKET}/${suggestedKey}`, message: "Presigned upload não implementado no servidor; faça upload via backend ou configure S3." });
+});
 
 // -------------------------------- DIETAS ---------------------------- //
 
@@ -2214,6 +2853,414 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
     res.status(500).json({
       error: "Erro interno do servidor ao remover dispositivo.",
       details: error.message
+    });
+  }
+});
+
+// -------------------------------- AGENDAMENTOS (BOOKINGS/APPOINTMENTS) -------------------------------- //
+
+// GET: Buscar disponibilidade do trainer
+app.get("/api/appointments/availability/:trainerId", async (req, res) => {
+  const trainerId = req.params.trainerId;
+  const { date } = req.query; // YYYY-MM-DD
+  
+  try {
+    if (!trainerId || isNaN(parseInt(trainerId, 10))) {
+      return res.status(400).json({ error: "ID do trainer inválido." });
+    }
+
+    console.log(`[/api/appointments/availability/${trainerId}] Buscando disponibilidade para date=${date}`);
+
+    // Verificar se a tabela disponibilidade_trainer existe
+    const [{ exists: dispExists }] = await sql`SELECT to_regclass('public.disponibilidade_trainer') IS NOT NULL AS exists`;
+    if (!dispExists) {
+      console.warn("[GET /appointments/availability] Tabela disponibilidade_trainer não existe");
+      return res.status(200).json({
+        availableSlots: [],
+        bookedSlots: [],
+        available: false,
+        message: "Disponibilidades não configuradas para este trainer"
+      });
+    }
+
+    // Buscar disponibilidade do trainer (horários configurados)
+    const availability = await sql`
+      SELECT 
+        id,
+        id_trainer,
+        dia_semana,
+        hora_inicio,
+        hora_fim,
+        ativo,
+        createdat,
+        updatedat
+      FROM disponibilidade_trainer
+      WHERE id_trainer = ${parseInt(trainerId, 10)} AND ativo = TRUE
+      ORDER BY dia_semana ASC, hora_inicio ASC
+    `;
+
+    console.log(`[/api/appointments/availability/${trainerId}] Encontrados ${availability.length} registros de disponibilidade`);
+
+    if (!date) {
+      // Retorna disponibilidade semanal padrão
+      return res.status(200).json({
+        availability: availability,
+        message: "Disponibilidade semanal do trainer"
+      });
+    }
+
+    // Se uma data específica foi informada, retorna horários disponíveis nesse dia
+    const searchDate = new Date(date);
+    const dayOfWeek = searchDate.getDay();
+
+    console.log(`[/api/appointments/availability/${trainerId}] Procurando para dia da semana: ${dayOfWeek}`);
+
+    const dayAvailability = availability.filter(a => a.dia_semana === dayOfWeek);
+
+    if (dayAvailability.length === 0) {
+      return res.status(200).json({
+        date: date,
+        available: false,
+        availableSlots: [],
+        bookedSlots: [],
+        message: "Trainer não tem disponibilidade neste dia"
+      });
+    }
+
+    // Buscar agendamentos já feitos nesta data
+    let bookedSlots = [];
+    try {
+      bookedSlots = await sql`
+        SELECT hora_inicio, hora_fim FROM agendamentos
+        WHERE id_trainer = ${parseInt(trainerId, 10)}
+          AND data_agendamento = ${date}
+          AND status IN ('pendente', 'confirmado')
+      `;
+    } catch (bookErr) {
+      console.warn(`[/api/appointments/availability/${trainerId}] Erro ao buscar agendamentos:`, bookErr.message);
+    }
+
+    // Calcular slots livres
+    const availableSlots = [];
+    dayAvailability.forEach(slot => {
+      try {
+        const slotStart = slot.hora_inicio;
+        const slotEnd = slot.hora_fim;
+        
+        console.log(`[/api/appointments/availability/${trainerId}] Processando slot: ${slotStart} - ${slotEnd}`);
+        
+        // Gerar horários em intervalos de 1 hora
+        let current = new Date(`2000-01-01 ${slotStart}`);
+        const end = new Date(`2000-01-01 ${slotEnd}`);
+        
+        while (current < end) {
+          const currentTime = current.toTimeString().substring(0, 5);
+          const nextHour = new Date(current.getTime() + 60 * 60 * 1000);
+          const nextTime = nextHour.toTimeString().substring(0, 5);
+
+          // Verificar se este horário não conflita com reservas
+          const conflict = bookedSlots.some(book => {
+            return currentTime >= book.hora_inicio && currentTime < book.hora_fim;
+          });
+
+          if (!conflict) {
+            availableSlots.push({
+              startTime: currentTime,
+              endTime: nextTime,
+              available: true
+            });
+          }
+
+          current = nextHour;
+        }
+      } catch (slotErr) {
+        console.error(`[/api/appointments/availability/${trainerId}] Erro ao processar slot:`, slotErr.message);
+      }
+    });
+
+    console.log(`[/api/appointments/availability/${trainerId}] Retornando ${availableSlots.length} slots disponíveis`);
+
+    return res.status(200).json({
+      date: date,
+      available: availableSlots.length > 0,
+      availableSlots: availableSlots,
+      bookedSlots: bookedSlots
+    });
+  } catch (err) {
+    console.error(`[/api/appointments/availability/${trainerId}] Erro geral:`, err.message);
+    return res.status(500).json({ error: "Erro ao buscar disponibilidade.", details: err.message });
+  }
+});
+
+// POST: Criar agendamento
+app.post("/api/appointments", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { trainerId, date, startTime, endTime, notes } = req.body;
+
+  try {
+    if (!trainerId || !date || !startTime || !endTime) {
+      return res.status(400).json({ error: "Trainer ID, data, hora de início e fim são obrigatórios." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+    }
+
+    // Verificar se o trainer existe
+    const trainerExists = await sql`
+      SELECT id_us FROM usuarios WHERE id_us = ${parseInt(trainerId, 10)} 
+      AND (role = 'trainer' OR role = 'personal')
+    `;
+    if (!trainerExists || trainerExists.length === 0) {
+      return res.status(404).json({ error: "Trainer não encontrado." });
+    }
+
+    // Verificar disponibilidade usando a função PL/pgsql
+    const [availCheck] = await sql`
+      SELECT * FROM verificar_disponibilidade(
+        ${parseInt(trainerId, 10)},
+        ${date}::DATE,
+        ${startTime}::TIME,
+        ${endTime}::TIME
+      )
+    `;
+
+    if (!availCheck.disponivel) {
+      return res.status(409).json({ 
+        error: availCheck.motivo || "Horário não disponível" 
+      });
+    }
+
+    // Criar o agendamento
+    const [appointment] = await sql`
+      INSERT INTO agendamentos (
+        id_trainer, id_usuario, data_agendamento, hora_inicio, 
+        hora_fim, status, notas, created_at, updated_at
+      )
+      VALUES (
+        ${parseInt(trainerId, 10)}, ${userId}, ${date}, 
+        ${startTime}, ${endTime}, 'pendente', ${notes || null},
+        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      )
+      RETURNING *
+    `;
+
+    return res.status(201).json({
+      success: true,
+      message: "Agendamento criado com sucesso!",
+      appointment: appointment
+    });
+  } catch (err) {
+    console.error("Erro em POST /api/appointments", err);
+    if (err.code === '23505') {
+      return res.status(409).json({ error: "Já existe um agendamento neste horário." });
+    }
+    return res.status(500).json({ error: "Erro ao criar agendamento." });
+  }
+});
+
+// GET: Listar agendamentos do usuário (como cliente ou trainer)
+app.get("/api/appointments", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { role = "client" } = req.query; // 'client' ou 'trainer'
+
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+    }
+
+    let appointments;
+    if (role === "trainer") {
+      // Agendamentos como trainer
+      appointments = await sql`
+        SELECT 
+          a.id_agendamento, a.id_trainer, a.id_usuario, 
+          a.data_agendamento, a.hora_inicio, a.hora_fim, 
+          a.status, a.notas, a.created_at,
+          u.nome as user_name, u.email as user_email, u.avatar_url as user_avatar
+        FROM agendamentos a
+        JOIN usuarios u ON a.id_usuario = u.id_us
+        WHERE a.id_trainer = ${userId}
+        ORDER BY a.data_agendamento DESC, a.hora_inicio DESC
+        LIMIT 50
+      `;
+    } else {
+      // Agendamentos como cliente
+      appointments = await sql`
+        SELECT 
+          a.id_agendamento, a.id_trainer, a.id_usuario, 
+          a.data_agendamento, a.hora_inicio, a.hora_fim, 
+          a.status, a.notas, a.created_at,
+          u.nome as trainer_name, u.email as trainer_email, u.avatar_url as trainer_avatar
+        FROM agendamentos a
+        JOIN usuarios u ON a.id_trainer = u.id_us
+        WHERE a.id_usuario = ${userId}
+        ORDER BY a.data_agendamento DESC, a.hora_inicio DESC
+        LIMIT 50
+      `;
+    }
+
+    return res.status(200).json({
+      data: appointments,
+      count: appointments.length
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/appointments", err);
+    return res.status(500).json({ error: "Erro ao listar agendamentos." });
+  }
+});
+
+// GET: Buscar agendamentos de um trainer em uma data específica
+app.get("/api/appointments/trainer/:trainerId", async (req, res) => {
+  const trainerId = req.params.trainerId;
+  const { date } = req.query; // YYYY-MM-DD
+
+  try {
+    if (!trainerId || isNaN(parseInt(trainerId, 10))) {
+      return res.status(400).json({ error: "ID do trainer inválido." });
+    }
+
+    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+    }
+
+    let query = sql`
+      SELECT id_agendamento, id_usuario, data_agendamento, 
+             hora_inicio, hora_fim, status, notas, created_at,
+             (SELECT nome FROM usuarios WHERE id_us = a.id_usuario) as user_name
+      FROM agendamentos a
+      WHERE id_trainer = ${parseInt(trainerId, 10)}
+    `;
+
+    if (date) {
+      query = sql`${query} AND data_agendamento = ${date}`;
+    }
+
+    query = sql`${query} ORDER BY data_agendamento DESC, hora_inicio ASC`;
+
+    const appointments = await query;
+
+    return res.status(200).json({
+      data: appointments,
+      count: appointments.length
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/appointments/trainer/:trainerId", err);
+    return res.status(500).json({ error: "Erro ao listar agendamentos do trainer." });
+  }
+});
+
+// PUT: Atualizar agendamento (status, notas, etc)
+app.put("/api/appointments/:appointmentId", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const appointmentId = req.params.appointmentId;
+  const { status, notas } = req.body;
+
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+    }
+
+    // Buscar o agendamento
+    const [appointment] = await sql`
+      SELECT * FROM agendamentos WHERE id_agendamento = ${appointmentId}
+    `;
+
+    if (!appointment) {
+      return res.status(404).json({ error: "Agendamento não encontrado." });
+    }
+
+    // Verificar permissão (trainer ou cliente do agendamento)
+    if (appointment.id_trainer !== userId && appointment.id_usuario !== userId) {
+      return res.status(403).json({ error: "Sem permissão para atualizar este agendamento." });
+    }
+
+    const [updated] = await sql`
+      UPDATE agendamentos
+      SET status = COALESCE(${status || null}, status),
+          notas = COALESCE(${notas || null}, notas),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id_agendamento = ${appointmentId}
+      RETURNING *
+    `;
+
+    return res.status(200).json({
+      success: true,
+      message: "Agendamento atualizado!",
+      appointment: updated
+    });
+  } catch (err) {
+    console.error("Erro em PUT /api/appointments/:appointmentId", err);
+    return res.status(500).json({ error: "Erro ao atualizar agendamento." });
+  }
+});
+
+// DELETE: Cancelar agendamento
+app.delete("/api/appointments/:appointmentId", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const appointmentId = req.params.appointmentId;
+
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
+    if (!exists) {
+      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+    }
+
+    const [appointment] = await sql`
+      SELECT * FROM agendamentos WHERE id_agendamento = ${appointmentId}
+    `;
+
+    if (!appointment) {
+      return res.status(404).json({ error: "Agendamento não encontrado." });
+    }
+
+    // Verificar permissão
+    if (appointment.id_trainer !== userId && appointment.id_usuario !== userId) {
+      return res.status(403).json({ error: "Sem permissão para cancelar este agendamento." });
+    }
+
+    await sql`
+      DELETE FROM agendamentos WHERE id_agendamento = ${appointmentId}
+    `;
+
+    return res.status(200).json({
+      success: true,
+      message: "Agendamento cancelado com sucesso!"
+    });
+  } catch (err) {
+    console.error("Erro em DELETE /api/appointments/:appointmentId", err);
+    return res.status(500).json({ error: "Erro ao cancelar agendamento." });
+  }
+});
+
+// Endpoint de inicialização - criar tabelas de agendamentos se não existirem
+app.post("/api/init/agendamentos", async (req, res) => {
+  try {
+    console.log("[POST /init/agendamentos] Inicializando tabelas de agendamentos...");
+    const fs = require("fs");
+    const schema = fs.readFileSync("./agendamentos-schema.sql", "utf-8");
+    const statements = schema.split(";").filter(s => s.trim());
+    
+    for (const statement of statements) {
+      if (statement.trim()) {
+        await sql.unsafe(statement);
+      }
+    }
+    
+    console.log("[POST /init/agendamentos] Tabelas criadas com sucesso");
+    return res.status(200).json({ 
+      success: true,
+      message: "Tabelas de agendamentos inicializadas com sucesso" 
+    });
+  } catch (err) {
+    console.error("[POST /init/agendamentos] Erro:", err);
+    return res.status(500).json({ 
+      error: "Erro ao inicializar tabelas", 
+      details: err.message 
     });
   }
 });
