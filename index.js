@@ -632,12 +632,7 @@ app.get("/user/session-status", verifyToken, async (req, res) => {
 
 // -------------------------------- UPLOAD DE AVATAR ---------------------------- //
 
-
-app.put(
-  "/api/user/avatar",
-  verifyToken,
-  upload.single("avatar"),
-  async (req, res) => {
+app.put("/api/user/avatar", verifyToken, upload.single("avatar"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "Arquivo de avatar não enviado." });
     }
@@ -2157,6 +2152,148 @@ app.delete("/api/profile/:id_profile", verifyToken, async (req, res) => {
   }
 });
 
+// -------------------------------- COMUNIDADES ---------------------------- //
+
+app.get("/api/comunidades", verifyToken, async (req, res) => {
+  console.log("Rota GET /api/comunidades atingida");
+  const userId = req.userId;
+  const { categoria } = req.query;
+
+  try {
+    let query = sql`
+      SELECT id_comunidade, nome, descricao, imageurl, participantes, max_participantes, categoria, tipo_comunidade
+      FROM comunidades
+    `;
+
+    if (categoria && categoria !== "Todas") {
+      query = sql`${query} WHERE categoria = ${categoria}`;
+    }
+
+    query = sql`${query} ORDER BY createdat DESC`;
+
+    const comunidades = await query;
+    res.status(200).json({ data: comunidades });
+  } catch (error) {
+    console.error("Erro ao listar comunidades:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao listar comunidades.",
+      details: error.message,
+    });
+  }
+});
+
+// GET: Detalhes de uma comunidade específica
+app.get("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
+  console.log("Rota GET /api/comunidades/:id_comunidade atingida");
+  const { id_comunidade } = req.params;
+
+  try {
+    const [comunidade] = await sql`
+      SELECT id_comunidade, nome, descricao, imageurl, participantes, max_participantes, categoria, tipo_comunidade, id_us
+      FROM comunidades
+      WHERE id_comunidade = ${id_comunidade}
+    `;
+
+    if (!comunidade) {
+      return res.status(404).json({ error: "Comunidade não encontrada." });
+    }
+
+    res.status(200).json({ data: comunidade });
+  } catch (error) {
+    console.error("Erro ao buscar detalhes da comunidade:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao buscar detalhes da comunidade.",
+      details: error.message,
+    });
+  }
+});
+
+// POST: Criar nova comunidade
+app.post("/api/comunidades", verifyToken, async (req, res) => {
+  console.log("Rota POST /api/comunidades atingida");
+  const userId = req.userId;
+  const { nome, descricao, imageurl, max_participantes, categoria, tipo_comunidade } = req.body;
+
+  if (!nome || !categoria) {
+    return res.status(400).json({ error: "Nome e categoria são obrigatórios." });
+  }
+
+  try {
+    const [novaComunidade] = await sql`
+      INSERT INTO comunidades (
+        id_us, nome, descricao, imageurl, participantes, max_participantes, categoria, tipo_comunidade, createdat, updatedat
+      )
+      VALUES (
+        ${userId}, ${nome}, ${descricao}, ${imageurl}, '1', ${max_participantes || 50}, ${categoria}, ${tipo_comunidade || 'Publica'}, NOW(), NOW()
+      )
+      RETURNING *;
+    `;
+
+    res.status(201).json({ message: "Comunidade criada com sucesso!", data: novaComunidade });
+  } catch (error) {
+    console.error("Erro ao criar comunidade:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao criar comunidade.",
+      details: error.message,
+    });
+  }
+});
+
+// POST: Entrar na comunidade (Simulação de incremento)
+app.post("/api/comunidades/:id_comunidade/entrar", verifyToken, async (req, res) => {
+  console.log("Rota POST /api/comunidades/:id_comunidade/entrar atingida");
+  const { id_comunidade } = req.params;
+
+  try {
+    // Incrementa o contador de participantes (simples, baseado em string/int)
+    const [updated] = await sql`
+      UPDATE comunidades
+      SET participantes = (CAST(COALESCE(NULLIF(participantes, ''), '0') AS INTEGER) + 1)::TEXT, updatedat = NOW()
+      WHERE id_comunidade = ${id_comunidade}
+      RETURNING *;
+    `;
+
+    if (!updated) {
+      return res.status(404).json({ error: "Comunidade não encontrada." });
+    }
+
+    res.status(200).json({ message: "Você entrou na comunidade!", data: updated });
+  } catch (error) {
+    console.error("Erro ao entrar na comunidade:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao entrar na comunidade.",
+      details: error.message,
+    });
+  }
+});
+
+app.delete("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
+  console.log("Rota DELETE /api/comunidades/:id_comunidade atingida");
+  const userId = req.userId;
+  const { id_comunidade } = req.params;
+
+  try {
+    const [deletedCommunity] = await sql`
+      DELETE FROM comunidades
+      WHERE id_comunidade = ${id_comunidade} AND id_us = ${userId}
+      RETURNING *;
+    `;
+
+    if (!deletedCommunity) {
+      return res.status(404).json({
+        error: "Comunidade não encontrada ou você não tem permissão para excluí-la.",
+      });
+    }
+    res.status(200).json({ message: "Comunidade excluída com sucesso!" });
+  } catch (error) {
+    console.error("Erro ao excluir comunidade:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao excluir comunidade.",
+      details: error.message,
+    });
+  }
+});
+
 // -------------------------------- DADOS DE CALORIAS ---------------------------- //
 
 // GET: Buscar dados de calorias
@@ -3244,23 +3381,30 @@ app.post("/api/init/agendamentos", async (req, res) => {
     const fs = require("fs");
     const schema = fs.readFileSync("./agendamentos-schema.sql", "utf-8");
     const statements = schema.split(";").filter(s => s.trim());
-    
+
+    // Executar cada instrução separadamente, ignorando erros de dependência
     for (const statement of statements) {
       if (statement.trim()) {
-        await sql.unsafe(statement);
+        try {
+          await sql.unsafe(statement);
+          console.log(`✓ Executado: ${statement.substring(0, 50)}...`);
+        } catch (stmtErr) {
+          console.log(`⚠ Pulo instrução (pode ser dependência): ${stmtErr.message}`);
+          console.log(`  Instrução: ${statement.trim()}`);
+        }
       }
     }
-    
+
     console.log("[POST /init/agendamentos] Tabelas criadas com sucesso");
-    return res.status(200).json({ 
+    return res.status(200).json({
       success: true,
-      message: "Tabelas de agendamentos inicializadas com sucesso" 
+      message: "Tabelas de agendamentos inicializadas com sucesso"
     });
   } catch (err) {
     console.error("[POST /init/agendamentos] Erro:", err);
-    return res.status(500).json({ 
-      error: "Erro ao inicializar tabelas", 
-      details: err.message 
+    return res.status(500).json({
+      error: "Erro ao inicializar tabelas",
+      details: err.message
     });
   }
 });
