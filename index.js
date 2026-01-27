@@ -1,4 +1,4 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 const express = require("express");
 const postgres = require("postgres");
 const bcrypt = require("bcrypt");
@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const multer = require("multer");
 const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const databaseUrl = process.env.DATABASE_URL;
 const emailUser = process.env.EMAIL_USER;
@@ -15,26 +16,70 @@ const emailPass = process.env.EMAIL_PASS;
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Inicializar cliente Supabase para Storage
+// Inicializar cliente Supabase para Storage e Admin API
 const supabase = supabaseUrl && supabaseServiceKey
   ? createClient(supabaseUrl, supabaseServiceKey, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    })
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  })
   : null;
 
 // Bucket de avatares no Supabase Storage
 const AVATAR_BUCKET = process.env.SUPABASE_AVATAR_BUCKET || "avatars";
 
 const sql = postgres(databaseUrl, {
-  ssl: "require",
+  ssl: {
+    rejectUnauthorized: false
+  },
   max: 10,
   idle_timeout: 20,
   connect_timeout: 10,
   prepare: false,
+  onnotice: () => { },
+  onclose: () => {
+    // Silencioso por padrão
+  }
 });
+
+// Inicializaçáo do Banco - Garantir colunas necessárias
+async function initDb() {
+  try {
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'São Paulo'`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS job_title TEXT DEFAULT 'Entusiasta Fitness'`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
+
+    // Garantir tabela de follows e migrar se necessário
+    await sql`CREATE TABLE IF NOT EXISTS follows (
+      id SERIAL PRIMARY KEY,
+      follower_user_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      followed_user_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(follower_user_id, followed_user_id)
+    )`;
+
+    // Se a tabela ja existia com trainer_id, renomear para followed_user_id
+    try {
+      await sql`
+        DO $$ 
+        BEGIN 
+          IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='follows' AND column_name='trainer_id') THEN
+            ALTER TABLE follows RENAME COLUMN trainer_id TO followed_user_id;
+          END IF;
+        END $$;
+      `;
+    } catch (migrateErr) {
+      console.log("Aviso: Falha ao renomear coluna ou coluna ja renomeada.");
+    }
+
+    console.log("✅ Banco de dados sincronizado.");
+  } catch (err) {
+    console.error("❌ Erro ao sincronizar banco de dados:", err);
+  }
+}
+initDb();
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
@@ -48,6 +93,156 @@ const transporter = nodemailer.createTransport({
     rejectUnauthorized: false,
   },
 });
+
+// Funçáo auxiliar para obter o UUID do Supabase Auth a partir do ID do seu banco
+async function getUserAuthId(userId) {
+  // Esta funçáo deve buscar o mapeamento entre o ID do seu banco e o UUID do Supabase Auth
+  // Primeiro tenta buscar na tabela de mapeamento real
+  const { data, error } = await supabase
+    .from('user_id_mapping')
+    .select('auth_user_id')
+    .eq('id_us', userId)
+    .single();
+
+  if (!error && data) {
+    return data;
+  }
+
+  // Se ná£o encontrar na tabela de mapeamento, vamos buscar o email do usuá¡rio no banco principal
+  try {
+    const [user] = await sql`
+      SELECT id_us, email, nome FROM usuarios WHERE id_us = ${userId}
+    `;
+
+    if (user && user.email) {
+      // Tenta encontrar ou criar o usuá¡rio no Supabase Auth
+      return await ensureUserInSupabaseAuth(user);
+    }
+  } catch (dbError) {
+    console.error("Erro ao buscar dados do usuário no banco principal:", dbError);
+  }
+
+  return null;
+}
+
+// Funçáo para garantir que o usuá¡rio existe no Supabase Auth e retornar seu UUID
+async function ensureUserInSupabaseAuth(user) {
+  const { data: existingUser, error: searchError } = await supabase
+    .from('user_id_mapping')
+    .select('auth_user_id')
+    .eq('id_us', user.id_us)
+    .single();
+
+  if (!searchError && existingUser) {
+    // Usuá¡rio já¡ está¡ mapeado
+    return existingUser;
+  }
+
+  // Tenta encontrar o usuá¡rio no Supabase Auth pelo email
+  const { data: supabaseUsers, error: authError } = await supabase
+    .from('auth.users')
+    .select('id')
+    .eq('email', user.email)
+    .limit(1);
+
+  if (!authError && supabaseUsers && supabaseUsers.length > 0) {
+    // Usuá¡rio encontrado no Supabase Auth, criar mapeamento
+    const authUserId = supabaseUsers[0].id;
+
+    const { error: insertError } = await supabase
+      .from('user_id_mapping')
+      .insert({
+        id_us: user.id_us,
+        auth_user_id: authUserId
+      });
+
+    if (insertError) {
+      console.error("Erro ao inserir mapeamento de usuá¡rio:", insertError);
+    } else {
+      console.log(`Mapeamento criado para usuá¡rio ${user.id_us} -> ${authUserId}`);
+    }
+
+    return { auth_user_id: authUserId };
+  }
+
+  // Se o usuá¡rio ná£o existe no Supabase Auth, precisamos criá¡-lo
+  // Vamos usar o Admin API do Supabase para criar o usuá¡rio
+  console.log(`Usuá¡rio com email ${user.email} ná£o encontrado no Supabase Auth. Criando usuá¡rio...`);
+
+  try {
+    // Criar o usuá¡rio no Supabase Auth usando o Admin API
+    const { data: newUser, error: createUserError } = await supabase.auth.admin.createUser({
+      email: user.email,
+      email_confirm: true, // Confirmar o email automaticamente
+      password: null, // Ná£o definir senha, pois o usuá¡rio já¡ existe no seu sistema
+    });
+
+    if (createUserError) {
+      console.error("Erro ao criar usuá¡rio no Supabase Auth:", createUserError);
+      // Se ná£o conseguir criar via Admin API, vamos gerar um UUID temporá¡rio
+      const generatedUuid = generateUuidForUser(user.id_us, user.email);
+
+      const { error: insertError } = await supabase
+        .from('user_id_mapping')
+        .insert({
+          id_us: user.id_us,
+          auth_user_id: generatedUuid
+        });
+
+      if (insertError) {
+        console.error("Erro ao inserir mapeamento de usuá¡rio:", insertError);
+        return null;
+      }
+
+      console.log(`Mapeamento temporá¡rio criado para usuá¡rio ${user.id_us} -> ${generatedUuid}`);
+      return { auth_user_id: generatedUuid };
+    }
+
+    // Usuá¡rio criado com sucesso, criar o mapeamento
+    const { error: insertError } = await supabase
+      .from('user_id_mapping')
+      .insert({
+        id_us: user.id_us,
+        auth_user_id: data.user.id
+      });
+
+    if (insertError) {
+      console.error("Erro ao inserir mapeamento de usuá¡rio:", insertError);
+      return null;
+    }
+
+    console.log(`Usuá¡rio criado e mapeamento realizado para ${user.id_us} -> ${data.user.id}`);
+    return { auth_user_id: data.user.id };
+  } catch (adminError) {
+    console.error("Erro ao usar Admin API para criar usuá¡rio:", adminError);
+    // Em caso de erro, gerar UUID temporá¡rio como fallback
+    const generatedUuid = generateUuidForUser(user.id_us, user.email);
+
+    const { error: insertError } = await supabase
+      .from('user_id_mapping')
+      .insert({
+        id_us: user.id_us,
+        auth_user_id: generatedUuid
+      });
+
+    if (insertError) {
+      console.error("Erro ao inserir mapeamento de usuá¡rio:", insertError);
+      return null;
+    }
+
+    console.log(`Mapeamento temporá¡rio criado para usuá¡rio ${user.id_us} -> ${generatedUuid}`);
+    return { auth_user_id: generatedUuid };
+  }
+}
+
+// Funçáo auxiliar para gerar UUID baseado no ID do usuá¡rio e email
+function generateUuidForUser(userId, email) {
+  // Esta á© uma implementaçáo simplificada
+  // Em produçáo, vocáª deve usar uma biblioteca adequada para gerar UUIDs
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(`${userId}-${email}`).digest('hex');
+  return `${hash.substring(0, 8)}-${hash.substring(8, 12)}-${hash.substring(12, 16)}-${hash.substring(16, 20)}-${hash.substring(20, 32)}`;
+}
 
 function generateVerificationCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -64,27 +259,67 @@ async function sendVerificationEmail(toEmail, verificationCode) {
   const mailOptions = {
     from: emailUser,
     to: toEmail,
-    subject: "Verificação de E-mail para MOVT App",
+    subject: "Verificaçáo de E-mail para MOVT App",
     html: `
-      <p>Olá,</p>
+      <p>Olá¡,</p>
       <p>Obrigado por se registrar no MOVT App!</p>
-      <p>Seu código de verificação é:</p>
+      <p>Seu cá³digo de verificaçáo á©:</p>
       <h3>${verificationCode}</h3>
-      <p>Este código expira em 15 minutos.</p>
-      <p>Se você não solicitou esta verificação, por favor, ignore este e-mail.</p>
+      <p>Este cá³digo expira em 15 minutos.</p>
+      <p>Se vocáª ná£o solicitou esta verificaçáo, por favor, ignore este e-mail.</p>
     `,
   };
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`E-mail de verificação enviado para ${toEmail}`);
+    console.log(`E-mail de verificaçáo enviado para ${toEmail}`);
     return true;
   } catch (error) {
     console.error(
-      `Erro ao enviar e-mail de verificação para ${toEmail}:`,
+      `Erro ao enviar e-mail de verificaçáo para ${toEmail}:`,
       error,
     );
     return false;
+  }
+}
+
+// Encryption/Decryption functions for message content
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
+const IV_LENGTH = 16; // For AES-256-CBC, this is always 16
+
+function encryptMessage(text) {
+  if (!text) return text;
+
+  try {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+  } catch (error) {
+    console.error('Encryption error:', error);
+    return text; // Return original text if encryption fails
+  }
+}
+
+function decryptMessage(encryptedText) {
+  if (!encryptedText) return encryptedText;
+
+  try {
+    const parts = encryptedText.split(':');
+    if (parts.length !== 2) {
+      return encryptedText; // Return as is if not properly formatted
+    }
+
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = parts[1];
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (error) {
+    console.error('Decryption error:', error);
+    return encryptedText; // Return original if decryption fails
   }
 }
 
@@ -93,7 +328,7 @@ const port = 3000;
 
 app.use(express.json());
 
-// Middleware de verificação de sessão
+// Middleware de verificaçáo de sessá£o
 function verifyToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -104,28 +339,48 @@ function verifyToken(req, res, next) {
 
   const sessionId = authHeader.split(" ")[1];
 
-  sql`SELECT id_us FROM usuarios WHERE session_id = ${sessionId}`
+  // Testar conexá£o com o banco de dados antes de tentar a consulta
+  sql`SELECT 1`
+    .then(() => {
+      return sql`SELECT id_us FROM usuarios WHERE session_id = ${sessionId}`;
+    })
     .then((users) => {
       if (users.length === 0) {
         return res
           .status(401)
           .json({ message: "Token de sessão inválido ou expirado." });
       }
+
+      // Armazenar o ID do usuá¡rio do banco principal
       req.userId = users[0].id_us;
+
+      // Para operaá§áµes de chat, precisamos do UUID do Supabase Auth
+      // Vamos tentar encontrar o UUID correspondente
+      // Por enquanto, vamos usar um UUID fixo para testes, mas idealmente
+      // vocáª precisaria ter uma tabela de mapeamento ou usar o Supabase Auth diretamente
       next();
     })
     .catch((error) => {
       console.error("Erro na verificação do token de sessão:", error);
+
+      // Verificar se á© um erro de conexá£o com o banco de dados
+      if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+        return res.status(503).json({
+          error: "Erro de conexão com o banco de dados. Serviço temporariamente indisponível.",
+          details: "O sistema de autenticação está temporariamente indisponível. Tente novamente mais tarde."
+        });
+      }
+
       res.status(500).json({
-        error: "Erro interno do servidor na verificação do token.",
+        error: "Erro interno do servidor na verificaçáo do token.",
         details: error.message,
       });
     });
 }
 
-// ==================== CONFIGURAÇÃO DE UPLOAD DE AVATAR ==================== //
+// ==================== CONFIGURAá‡áƒO DE UPLOAD DE AVATAR ==================== //
 
-// Configuração do Multer
+// Configuraçáo do Multer
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
@@ -139,20 +394,20 @@ const upload = multer({
   },
 });
 
-// Função principal para processar um upload de avatar usando Supabase Storage
+// Funçáo principal para processar um upload de avatar usando Supabase Storage
 async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
-  // Verifica se Supabase está configurado
+  // Verifica se Supabase está¡ configurado
   if (!supabase) {
-    throw { code: 500, message: "Supabase Storage não configurado. Verifique as variáveis de ambiente." };
+    throw { code: 500, message: "Supabase Storage ná£o configurado. Verifique as variá¡veis de ambiente." };
   }
 
-  // Validação extra: tipos válidos
+  // Validaçáo extra: tipos vá¡lidos
   const validMimeTypes = ["image/jpeg", "image/png", "image/webp"];
   if (!validMimeTypes.includes(mimetype)) {
-    throw { code: 422, message: "Formato de imagem não suportado." };
+    throw { code: 422, message: "Formato de imagem ná£o suportado." };
   }
 
-  // Checa dimensões máximas (2k x 2k)
+  // Checa dimensáµes má¡ximas (2k x 2k)
   let image;
   try {
     image = sharp(fileBuffer);
@@ -161,11 +416,11 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
       metadata.width > 2000 ||
       metadata.height > 2000
     ) {
-      throw { code: 422, message: "A imagem deve ter no máximo 2000x2000 px." };
+      throw { code: 422, message: "A imagem deve ter no má¡ximo 2000x2000 px." };
     }
   } catch (err) {
     if (err.code) throw err;
-    throw { code: 400, message: "Arquivo de imagem inválido." };
+    throw { code: 400, message: "Arquivo de imagem invá¡lido." };
   }
 
   // Paths/nomes no Supabase Storage
@@ -173,7 +428,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   const base = `avatar_${userId}_${uuid}`;
   const ext = mimetype === "image/png" ? "png" : mimetype === "image/webp" ? "webp" : "jpg";
 
-  // Processa as versões redimensionadas
+  // Processa as versáµes redimensionadas
   const [originalBuffer, thumb96Buffer, thumb192Buffer, thumb512Buffer] = await Promise.all([
     sharp(fileBuffer).toFormat(ext, { quality: 95 }).toBuffer(),
     sharp(fileBuffer).resize(96, 96).toFormat(ext, { quality: 80 }).toBuffer(),
@@ -187,7 +442,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   const thumb192Path = `${userId}/${base}_192x192.${ext}`;
   const thumb512Path = `${userId}/${base}_512x512.${ext}`;
 
-  // Faz upload de todas as versões para o Supabase Storage
+  // Faz upload de todas as versáµes para o Supabase Storage
   const [originalUpload, thumb96Upload, thumb192Upload, thumb512Upload] = await Promise.all([
     supabase.storage
       .from(AVATAR_BUCKET)
@@ -221,19 +476,19 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   if (thumb192Upload.error) throw { code: 500, message: `Erro ao fazer upload: ${thumb192Upload.error.message}` };
   if (thumb512Upload.error) throw { code: 500, message: `Erro ao fazer upload: ${thumb512Upload.error.message}` };
 
-  // Obtém URLs públicas dos arquivos
+  // Obtá©m URLs páºblicas dos arquivos
   const { data: originalUrlData } = supabase.storage
     .from(AVATAR_BUCKET)
     .getPublicUrl(originalPath);
-  
+
   const { data: thumb96UrlData } = supabase.storage
     .from(AVATAR_BUCKET)
     .getPublicUrl(thumb96Path);
-  
+
   const { data: thumb192UrlData } = supabase.storage
     .from(AVATAR_BUCKET)
     .getPublicUrl(thumb192Path);
-  
+
   const { data: thumb512UrlData } = supabase.storage
     .from(AVATAR_BUCKET)
     .getPublicUrl(thumb512Path);
@@ -247,7 +502,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   };
 }
 
-// Função auxiliar para gerar dados mockados 
+// Funçáo auxiliar para gerar dados mockados 
 function generateMockCaloriesData(timeframe) {
   const now = new Date();
   let data = [];
@@ -317,17 +572,28 @@ function generateMockCaloriesData(timeframe) {
   return data;
 }
 
-// ------------------- AUTENTICAÇÃO DE USUÁRIO --------------------- //
+// ------------------- AUTENTICAá‡áƒO DE USUáRIO --------------------- //
 
-app.post("/login", async (req, res) => {
-  console.log("Rota /login atingida");
+app.post("/api/login", async (req, res) => {
+
   const { email, senha, sessionId: providedSessionId } = req.body;
 
   if (!email || !senha) {
-    return res.status(400).json({ error: "Email e senha são obrigatórios." });
+    return res.status(400).json({ error: "Email e senha sá£o obrigatá³rios." });
   }
 
   try {
+    // Testar conexá£o com o banco de dados antes de tentar a consulta
+    try {
+      await sql`SELECT 1`;
+    } catch (dbError) {
+      console.error("Erro na conexá£o com o banco de dados:", dbError);
+      return res.status(503).json({
+        error: "Serviá§o de banco de dados temporariamente indisponá­vel.",
+        details: dbError.message
+      });
+    }
+
     const [user] = await sql`
       SELECT id_us, email, senha, username, nome, session_id, email_verified
       FROM usuarios
@@ -337,7 +603,7 @@ app.post("/login", async (req, res) => {
     if (!user) {
       return res
         .status(401)
-        .json({ error: "Endereço de e-mail incorreto, tente novamente!" });
+        .json({ error: "Endereá§o de e-mail incorreto, tente novamente!" });
     }
 
     const isPasswordValid = await bcrypt.compare(senha, user.senha);
@@ -345,15 +611,20 @@ app.post("/login", async (req, res) => {
     if (!isPasswordValid) {
       return res
         .status(401)
-        .json({ error: "Senha inválida, tente novamente!" });
+        .json({ error: "Senha invá¡lida, tente novamente!" });
     }
 
     if (providedSessionId && providedSessionId !== user.session_id) {
       return res
         .status(401)
-        .json({ error: "Token de sessão inconsistente ou inválido." });
+        .json({ error: "Token de sessá£o inconsistente ou invá¡lido." });
     }
 
+    // Obter o UUID do Supabase Auth para o usuá¡rio
+    const userMapping = await getUserAuthId(user.id_us);
+    const supabase_uid = userMapping ? userMapping.auth_user_id : null;
+
+    console.log(`✅ Login realizado: ${email}`);
     res.status(200).json({
       message: "Login bem-sucedido!",
       user: {
@@ -362,21 +633,30 @@ app.post("/login", async (req, res) => {
         username: user.username,
         email: user.email,
         isVerified: user.email_verified,
+        supabase_uid: supabase_uid,
       },
       sessionId: user.session_id,
     });
   } catch (error) {
-    console.error("Erro ao autenticar usuário:", error);
+    console.error("Erro ao autenticar usuá¡rio:", error);
+
+    // Verificar se á© um erro de conexá£o com o banco de dados
+    if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+      return res.status(503).json({
+        error: "Erro de conexá£o com o banco de dados. Serviá§o temporariamente indisponá­vel.",
+        details: "O sistema de autenticaçáo está¡ temporariamente indisponá­vel. Tente novamente mais tarde."
+      });
+    }
+
     res.status(500).json({
-      error: "Erro interno do servidor ao autenticar usuário.",
+      error: "Erro interno do servidor ao autenticar usuá¡rio.",
       details: error.message,
     });
   }
 });
 
-app.post("/register", async (req, res) => {
-  console.log("Rota /register atingida");
-  console.log("Dados recebidos do frontend (req.body):", req.body);
+app.post("/api/register", async (req, res) => {
+
   const {
     nome,
     email,
@@ -388,10 +668,21 @@ app.post("/register", async (req, res) => {
   } = req.body;
 
   if (!nome || !email || !senha || !cpf_cnpj || !data_nascimento || !telefone) {
-    return res.status(400).json({ error: "Todos os campos são obrigatórios." });
+    return res.status(400).json({ error: "Todos os campos sá£o obrigatá³rios." });
   }
 
   try {
+    // Testar conexá£o com o banco de dados antes de tentar a consulta
+    try {
+      await sql`SELECT 1`;
+    } catch (dbError) {
+      console.error("Erro na conexá£o com o banco de dados:", dbError);
+      return res.status(503).json({
+        error: "Serviá§o de banco de dados temporariamente indisponá­vel.",
+        details: dbError.message
+      });
+    }
+
     let userCpf = null;
     let userCnpj = null;
 
@@ -429,11 +720,11 @@ app.post("/register", async (req, res) => {
       if (existingUser[0].email === email) {
         return res
           .status(409)
-          .json({ error: "Este e-mail já está cadastrado." });
+          .json({ error: "Este e-mail já¡ está¡ cadastrado." });
       } else if (existingUser[0].cpf === userCpf && userCpf !== null) {
-        return res.status(409).json({ error: "Este CPF já está cadastrado." });
+        return res.status(409).json({ error: "Este CPF já¡ está¡ cadastrado." });
       } else if (existingUser[0].cnpj === userCnpj && userCnpj !== null) {
-        return res.status(409).json({ error: "Este CNPJ já está cadastrado." });
+        return res.status(409).json({ error: "Este CNPJ já¡ está¡ cadastrado." });
       } else {
         return res
           .status(409)
@@ -461,17 +752,27 @@ app.post("/register", async (req, res) => {
     );
     if (!emailSent) {
       console.warn(
-        "Falha ao enviar e-mail de verificação para o novo usuário.",
+        "Falha ao enviar e-mail de verificaçáo para o novo usuá¡rio.",
       );
     }
 
+    console.log(`✅ Registro realizado: ${email}`);
     res.status(201).json({
       message: "Usuário registrado com sucesso! Verifique seu e-mail.",
       user: newUser,
       sessionId: newSessionId,
     });
   } catch (error) {
-    console.error("Erro ao registrar usuário:", error);
+    console.error("Erro ao registrar usuá¡rio:", error);
+
+    // Verificar se á© um erro de conexá£o com o banco de dados
+    if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+      return res.status(503).json({
+        error: "Erro de conexá£o com o banco de dados. Serviá§o temporariamente indisponá­vel.",
+        details: "O sistema de registro está¡ temporariamente indisponá­vel. Tente novamente mais tarde."
+      });
+    }
+
     if (error.code === "23505") {
       return res.status(409).json({
         error:
@@ -479,16 +780,80 @@ app.post("/register", async (req, res) => {
       });
     }
     res.status(500).json({
-      error: "Erro interno do servidor ao registrar usuário.",
+      error: "Erro interno do servidor ao registrar usuá¡rio.",
       details: error.message,
     });
   }
 });
 
-// --------------------- VERIFICAÇÃO DE USUÁRIO --------------------- //
+// --------------------- PLANOS E ASSINATURAS (STRIPE) --------------------- //
 
-app.post("/user/send-verification", verifyToken, async (req, res) => {
-  console.log("Rota /user/send-verification atingida");
+app.get("/api/plans", async (req, res) => {
+  try {
+    const products = await stripe.products.list({
+      active: true,
+      expand: ["data.default_price"],
+    });
+
+    const plans = products.data.map(product => {
+      const price = product.default_price;
+      return {
+        id: product.id,
+        stripe_product_id: product.id,
+        stripe_price_id: price ? price.id : null,
+        name: product.name,
+        description: product.description,
+        price: price ? (price.unit_amount ? price.unit_amount / 100 : 0) : 0,
+        currency: price ? price.currency : "brl",
+        interval: price && price.recurring ? price.recurring.interval : "limitado",
+        billing_scheme: price ? price.billing_scheme : 'per_unit',
+        metadata: product.metadata || {}
+      };
+    });
+
+    plans.sort((a, b) => a.price - b.price);
+    res.json(plans);
+  } catch (error) {
+    console.error("Erro ao buscar planos na Stripe:", error);
+    res.status(500).json({ error: "Falha ao buscar planos de assinatura.", details: error.message });
+  }
+});
+
+app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
+  const { priceId, quantity } = req.body;
+  const userId = req.userId;
+
+  try {
+    const [user] = await sql`SELECT email FROM usuarios WHERE id_us = ${userId}`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: priceId,
+          quantity: quantity || 1,
+        },
+      ],
+      customer_email: user.email,
+      success_url: 'https://movt.app/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://movt.app/cancel',
+      metadata: {
+        userId: String(userId)
+      }
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Erro ao criar sessão de checkout:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --------------------- VERIFICAá‡áƒO DE USUáRIO --------------------- //
+
+app.post("/api/user/send-verification", verifyToken, async (req, res) => {
+
   const userId = req.userId;
 
   try {
@@ -496,12 +861,12 @@ app.post("/user/send-verification", verifyToken, async (req, res) => {
       await sql`SELECT email, email_verified FROM usuarios WHERE id_us = ${userId}`;
 
     if (!user) {
-      return res.status(404).json({ error: "Usuário não encontrado." });
+      return res.status(404).json({ error: "Usuá¡rio ná£o encontrado." });
     }
     if (user.email_verified) {
       return res
         .status(400)
-        .json({ message: "Seu e-mail já está verificado." });
+        .json({ message: "Seu e-mail já¡ está¡ verificado." });
     }
 
     const newVerificationCode = generateVerificationCode();
@@ -521,31 +886,32 @@ app.post("/user/send-verification", verifyToken, async (req, res) => {
     );
 
     if (emailSent) {
+      console.log(`âœ… Cá³digo de verificaçáo enviado: ${user.email}`);
       res.status(200).json({
-        message: "Novo código de verificação enviado para seu e-mail.",
+        message: "Novo cá³digo de verificaçáo enviado para seu e-mail.",
       });
     } else {
       res
         .status(500)
-        .json({ error: "Falha ao enviar o e-mail de verificação." });
+        .json({ error: "Falha ao enviar o e-mail de verificaçáo." });
     }
   } catch (error) {
-    console.error("Erro ao reenviar código de verificação:", error);
+    console.error("Erro ao reenviar cá³digo de verificaçáo:", error);
     res.status(500).json({
-      error: "Erro interno do servidor ao reenviar código.",
+      error: "Erro interno do servidor ao reenviar cá³digo.",
       details: error.message,
     });
   }
 });
 
-app.post("/user/verify", verifyToken, async (req, res) => {
+app.post("/api/user/verify", verifyToken, async (req, res) => {
   const userId = req.userId;
   const { code } = req.body;
 
   if (!code) {
     return res
       .status(400)
-      .json({ error: "Código de verificação é obrigatório." });
+      .json({ error: "Cá³digo de verificaçáo á© obrigatá³rio." });
   }
 
   try {
@@ -556,15 +922,15 @@ app.post("/user/verify", verifyToken, async (req, res) => {
     `;
 
     if (!user) {
-      return res.status(404).json({ error: "Usuário não encontrado." });
+      return res.status(404).json({ error: "Usuá¡rio ná£o encontrado." });
     }
     if (user.email_verified) {
       return res
         .status(400)
-        .json({ message: "Seu e-mail já está verificado." });
+        .json({ message: "Seu e-mail já¡ está¡ verificado." });
     }
     if (!user.verification_code || user.verification_code !== code) {
-      return res.status(400).json({ error: "Código de verificação inválido." });
+      return res.status(400).json({ error: "Cá³digo de verificaçáo invá¡lido." });
     }
     if (
       user.verification_code_expires_at &&
@@ -572,7 +938,7 @@ app.post("/user/verify", verifyToken, async (req, res) => {
     ) {
       return res
         .status(400)
-        .json({ error: "Código de verificação expirado. Solicite um novo." });
+        .json({ error: "Cá³digo de verificaçáo expirado. Solicite um novo." });
     }
 
     await sql`
@@ -594,11 +960,22 @@ app.post("/user/verify", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/user/session-status", verifyToken, async (req, res) => {
-  console.log("Rota /user/session-status atingida");
+app.get("/api/user/session-status", verifyToken, async (req, res) => {
+
   const userId = req.userId;
 
   try {
+    // Testar conexá£o com o banco de dados antes de tentar a consulta
+    try {
+      await sql`SELECT 1`;
+    } catch (dbError) {
+      console.error("Erro na conexá£o com o banco de dados:", dbError);
+      return res.status(503).json({
+        error: "Serviá§o de banco de dados temporariamente indisponá­vel.",
+        details: dbError.message
+      });
+    }
+
     const [user] = await sql`
       SELECT id_us, email, username, nome, email_verified
       FROM usuarios
@@ -608,23 +985,37 @@ app.get("/user/session-status", verifyToken, async (req, res) => {
     if (!user) {
       return res
         .status(404)
-        .json({ error: "Usuário não encontrado para a sessão ativa." });
+        .json({ error: "Usuá¡rio ná£o encontrado para a sessá£o ativa." });
     }
 
+    // Obter o UUID do Supabase Auth para o usuá¡rio
+    const userMapping = await getUserAuthId(user.id_us);
+    const supabase_uid = userMapping ? userMapping.auth_user_id : null;
+
     res.status(200).json({
-      message: "Sessão ativa.",
+      message: "Sessá£o ativa.",
       user: {
         id: user.id_us,
         nome: user.nome,
         username: user.username,
         email: user.email,
         isVerified: user.email_verified,
+        supabase_uid: supabase_uid,
       },
     });
   } catch (error) {
-    console.error("Erro ao obter status da sessão:", error);
+    console.error("Erro ao obter status da sessá£o:", error);
+
+    // Verificar se á© um erro de conexá£o com o banco de dados
+    if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+      return res.status(503).json({
+        error: "Erro de conexá£o com o banco de dados. Serviá§o temporariamente indisponá­vel.",
+        details: "O sistema está¡ temporariamente indisponá­vel. Tente novamente mais tarde."
+      });
+    }
+
     res.status(500).json({
-      error: "Erro interno do servidor ao obter status da sessão.",
+      error: "Erro interno do servidor ao obter status da sessá£o.",
       details: error.message,
     });
   }
@@ -633,26 +1024,26 @@ app.get("/user/session-status", verifyToken, async (req, res) => {
 // -------------------------------- UPLOAD DE AVATAR ---------------------------- //
 
 app.put("/api/user/avatar", verifyToken, upload.single("avatar"), async (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ error: "Arquivo de avatar não enviado." });
-    }
-    if (req.file.size > 5 * 1024 * 1024) {
-      return res.status(413).json({ error: "Arquivo excede 5MB." });
-    }
+  if (!req.file) {
+    return res.status(400).json({ error: "Arquivo de avatar ná£o enviado." });
+  }
+  if (req.file.size > 5 * 1024 * 1024) {
+    return res.status(413).json({ error: "Arquivo excede 5MB." });
+  }
 
-    const userId = req.userId;
+  const userId = req.userId;
 
-    try {
-      // Processar & armazenar as imagens
-      const urls = await processAndSaveAvatar(
-        userId,
-        req.file.buffer,
-        req.file.mimetype,
-      );
+  try {
+    // Processar & armazenar as imagens
+    const urls = await processAndSaveAvatar(
+      userId,
+      req.file.buffer,
+      req.file.mimetype,
+    );
 
-      // Atualizar no banco
-      const now = new Date();
-      await sql`
+    // Atualizar no banco
+    const now = new Date();
+    await sql`
         UPDATE usuarios
         SET avatar_url = ${urls.original},
             avatar_thumbnail = ${urls.thumb96},
@@ -662,84 +1053,134 @@ app.put("/api/user/avatar", verifyToken, upload.single("avatar"), async (req, re
         WHERE id_us = ${userId}
       `;
 
-      // Recupera perfil resumido para resposta
-      const [user] = await sql`
+    // Recupera perfil resumido para resposta
+    const [user] = await sql`
         SELECT id_us, avatar_url, avatar_thumbnail, avatar_medium, avatar_large, updatedat
         FROM usuarios
         WHERE id_us = ${userId}
       `;
 
-      return res.status(200).json({
-        success: true,
-        data: {
-          id: user.id_us,
-          photo: user.avatar_url,
-          photo_thumbnail: user.avatar_thumbnail,
-          photo_medium: user.avatar_medium,
-          photo_large: user.avatar_large,
-          updatedAt: user.updatedat,
-        },
-      });
-    } catch (err) {
-      if (err && (err.code === 422 || err.code === 400)) {
-        return res.status(err.code).json({ error: err.message });
-      }
-      if (err instanceof multer.MulterError) {
-        // Limite de tamanho ou tipo inválido
-        if (err.code === "LIMIT_FILE_SIZE")
-          return res.status(413).json({ error: "Arquivo excede 5MB." });
-        if (err.code === "LIMIT_UNEXPECTED_FILE")
-          return res
-            .status(422)
-            .json({ error: "Formato de imagem não suportado." });
-        return res.status(400).json({ error: err.message });
-      }
-      console.error("Erro upload avatar:", err);
-      return res.status(500).json({
-        error: "Erro interno ao processar avatar.",
-        details: err && err.message ? err.message : err,
-      });
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: user.id_us,
+        photo: user.avatar_url,
+        photo_thumbnail: user.avatar_thumbnail,
+        photo_medium: user.avatar_medium,
+        photo_large: user.avatar_large,
+        updatedAt: user.updatedat,
+      },
+    });
+  } catch (err) {
+    if (err && (err.code === 422 || err.code === 400)) {
+      return res.status(err.code).json({ error: err.message });
     }
-  },
+    if (err instanceof multer.MulterError) {
+      // Limite de tamanho ou tipo invá¡lido
+      if (err.code === "LIMIT_FILE_SIZE")
+        return res.status(413).json({ error: "Arquivo excede 5MB." });
+      if (err.code === "LIMIT_UNEXPECTED_FILE")
+        return res
+          .status(422)
+          .json({ error: "Formato de imagem ná£o suportado." });
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("Erro upload avatar:", err);
+    return res.status(500).json({
+      error: "Erro interno ao processar avatar.",
+      details: err && err.message ? err.message : err,
+    });
+  }
+},
 );
 
-// ROTA GENÉRICA: Atualizar um único campo do perfil (username ou email)
+// ROTA PARA UPLOAD DE BANNER
+app.put("/api/user/banner", verifyToken, upload.single("banner"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "Arquivo de banner ná£o enviado." });
+  }
+
+  const userId = req.userId;
+
+  try {
+    // Processar & armazenar as imagens (reutilizando a lá³gica de avatar, mas em outro campo)
+    const urls = await processAndSaveAvatar(
+      userId,
+      req.file.buffer,
+      req.file.mimetype,
+    );
+
+    // Atualizar no banco
+    const now = new Date();
+    await sql`
+        UPDATE usuarios
+        SET banner_url = ${urls.original},
+            updated_at = ${now}
+        WHERE id_us = ${userId}
+      `;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: userId,
+        banner: urls.original,
+        updatedAt: now,
+      },
+    });
+  } catch (err) {
+    console.error("Erro upload banner:", err);
+    return res.status(500).json({
+      error: "Erro interno ao processar banner.",
+      details: err && err.message ? err.message : err,
+    });
+  }
+});
+
+// ROTA GENá‰RICA: Atualizar um áºnico campo do perfil (username ou email)
 app.put("/api/user/update-field", verifyToken, async (req, res) => {
   const userId = req.userId;
   const { field, value } = req.body;
 
   if (!field || !value) {
-    return res.status(400).json({ error: "Informe 'field' e 'value' no corpo da requisição." });
+    return res.status(400).json({ error: "Informe 'field' e 'value' no corpo da requisiçáo." });
   }
 
   // Permitir apenas campos controlados
-  const allowed = ["username", "email"];
+  const allowed = ["username", "email", "nome", "banner_url"];
   if (!allowed.includes(field)) {
-    return res.status(400).json({ error: "Campo inválido. Apenas 'username' ou 'email' são permitidos." });
+    return res.status(400).json({ error: "Campo invá¡lido. Apenas 'username', 'email', 'nome' ou 'banner_url' sá£o permitidos." });
   }
 
   try {
     const [current] = await sql`SELECT username, email FROM usuarios WHERE id_us = ${userId}`;
-    if (!current) return res.status(404).json({ error: "Usuário não encontrado." });
+    if (!current) return res.status(404).json({ error: "Usuá¡rio ná£o encontrado." });
 
     const now = new Date();
 
-    // Se não houver alteração no campo solicitado, retorna sem mudanças
+    // Se ná£o houver alteraçáo no campo solicitado, retorna sem mudaná§as
     if (current[field] === value) {
-      return res.status(200).json({ success: true, message: "Nenhuma alteração necessária.", data: { [field]: value } });
+      return res.status(200).json({ success: true, message: "Nenhuma alteraçáo necessá¡ria.", data: { [field]: value } });
     }
 
-    // Verificações de unicidade + atualização (somente do campo solicitado)
+    // Verificaá§áµes de unicidade + atualizaçáo (somente do campo solicitado)
     if (field === "username") {
       const existing = await sql`SELECT id_us FROM usuarios WHERE username = ${value} AND id_us != ${userId}`;
       if (existing.length > 0) {
-        return res.status(409).json({ error: "Username já está em uso por outro usuário." });
+        return res.status(409).json({ error: "Username já¡ está¡ em uso por outro usuá¡rio." });
       }
 
-      // Atualiza somente o username; NÃO altera/zera a coluna email
+      // Atualiza somente o username; NáƒO altera/zera a coluna email
       await sql`
         UPDATE usuarios
-        SET username = ${value}, updatedat = ${now}
+        SET username = ${value}, updated_at = ${now}
+        WHERE id_us = ${userId}
+      `;
+    }
+
+    if (field === "nome") {
+      await sql`
+        UPDATE usuarios
+        SET nome = ${value}, updated_at = ${now}
         WHERE id_us = ${userId}
       `;
     }
@@ -747,35 +1188,37 @@ app.put("/api/user/update-field", verifyToken, async (req, res) => {
     if (field === "email") {
       const existing = await sql`SELECT id_us FROM usuarios WHERE email = ${value} AND id_us != ${userId}`;
       if (existing.length > 0) {
-        return res.status(409).json({ error: "E-mail já está em uso por outro usuário." });
+        return res.status(409).json({ error: "E-mail já¡ está¡ em uso por outro usuá¡rio." });
       }
 
       const verificationCode = generateVerificationCode();
       const verificationExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-      // Atualiza somente o email; NÃO altera/zera a coluna username
+      // Atualiza somente o email; NáƒO altera/zera a coluna username
       await sql`
         UPDATE usuarios
         SET email = ${value}, email_verified = FALSE, verification_code = ${verificationCode}, verification_code_expires_at = ${verificationExpiresAt}, updatedat = ${now}
         WHERE id_us = ${userId}
       `;
 
-      // Tenta enviar e-mail (não bloqueante)
+      // Tenta enviar e-mail (ná£o bloqueante)
       try {
         await sendVerificationEmail(value, verificationCode);
       } catch (err) {
-        console.warn("Falha ao enviar e-mail de verificação após alteração de e-mail (update-field):", err);
+        console.warn("Falha ao enviar e-mail de verificaçáo apá³s alteraçáo de e-mail (update-field):", err);
       }
     }
 
     const [updated] = await sql`SELECT id_us, username, email, email_verified FROM usuarios WHERE id_us = ${userId}`;
 
-    return res.status(200).json({ success: true, data: {
-      id: updated.id_us,
-      username: updated.username,
-      email: updated.email,
-      isVerified: updated.email_verified,
-    }});
+    return res.status(200).json({
+      success: true, data: {
+        id: updated.id_us,
+        username: updated.username,
+        email: updated.email,
+        isVerified: updated.email_verified,
+      }
+    });
   } catch (error) {
     console.error("Erro na rota update-field:", error);
     return res.status(500).json({ error: "Erro interno ao atualizar campo.", details: error.message });
@@ -784,7 +1227,7 @@ app.put("/api/user/update-field", verifyToken, async (req, res) => {
 
 // ------------------- ROTAS DE TRAINERS / BUSCAS / UPLOADS ------------------ //
 
-// Lista de trainers (basic, defensivo - retorna usuários como trainers quando aplicável) ✅
+// Lista de trainers (basic, defensivo - retorna usuá¡rios como trainers quando aplicá¡vel) âœ…
 app.get("/api/trainers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 20;
@@ -799,7 +1242,7 @@ app.get("/api/trainers", async (req, res) => {
     `;
     const hasRoleCol = !!colCheck;
 
-    // Se houver token, tentamos obter o role do requester (permitir personalizações)
+    // Se houver token, tentamos obter o role do requester (permitir personalizaá§áµes)
     let requesterRole = null;
     const authHeader = req.headers['authorization'];
     if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -809,7 +1252,7 @@ app.get("/api/trainers", async (req, res) => {
     }
 
     if (hasRoleCol) {
-      // Usar a coluna role (mais performático quando indexado)
+      // Usar a coluna role (mais performá¡tico quando indexado)
       if (q) {
         const pattern = `%${q}%`;
         const data = await sql`
@@ -836,7 +1279,7 @@ app.get("/api/trainers", async (req, res) => {
       return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
     }
 
-    // Fallback: inferir trainers pelo tipo_documento = 'CNPJ' ou por presença em trainer_posts
+    // Fallback: inferir trainers pelo tipo_documento = 'CNPJ' ou por presená§a em trainer_posts
     if (q) {
       const pattern = `%${q}%`;
       const data = await sql`
@@ -870,7 +1313,7 @@ app.get("/api/trainers", async (req, res) => {
   }
 });
 
-// Detalhe de um trainer (busca por id) ✅
+// Detalhe de um trainer (busca por id) âœ…
 app.get("/api/trainers/:id", async (req, res) => {
   const id = req.params.id;
   try {
@@ -880,7 +1323,7 @@ app.get("/api/trainers/:id", async (req, res) => {
       WHERE id_us = ${id}
       LIMIT 1
     `;
-    if (!row) return res.status(404).json({ error: "Trainer não encontrado." });
+    if (!row) return res.status(404).json({ error: "Trainer ná£o encontrado." });
     return res.status(200).json({ data: row });
   } catch (err) {
     console.error("Erro em GET /api/trainers/:id", err);
@@ -888,7 +1331,7 @@ app.get("/api/trainers/:id", async (req, res) => {
   }
 });
 
-// Lista de posts do trainer (se existir tabela trainer_posts) ✅
+// Lista de posts do trainer (se existir tabela trainer_posts) âœ…
 app.get("/api/trainers/:id/posts", async (req, res) => {
   const trainerId = req.params.id;
   const limit = parseInt(req.query.limit) || 10;
@@ -912,7 +1355,7 @@ app.get("/api/trainers/:id/posts", async (req, res) => {
   }
 });
 
-// GET: List personals with complete profile data (usuarios + personal_profiles) ✅
+// GET: List personals with complete profile data (usuarios + personal_profiles) âœ…
 app.get("/api/personals", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 20;
@@ -983,21 +1426,21 @@ app.get("/api/personals", async (req, res) => {
   }
 });
 
-// Upload de cover/avatar para um trainer (processa e retorna URLs; NÃO grava em colunas desconhecidas)
+// Upload de cover/avatar para um trainer (processa e retorna URLs; NáƒO grava em colunas desconhecidas)
 app.put("/api/trainers/:id/cover", verifyToken, upload.single("cover"), async (req, res) => {
   const trainerId = req.params.id;
-  // Permissão: apenas o próprio trainer ou admin pode atualizar
+  // Permissá£o: apenas o prá³prio trainer ou admin pode atualizar
   if (String(req.userId) !== String(trainerId)) {
     // se tiver roles/admin, aqui deveria verificar; por enquanto bloqueia
     return res.status(403).json({ error: "Acesso negado. Apenas o dono pode atualizar a cover." });
   }
 
-  if (!req.file) return res.status(400).json({ error: "Arquivo cover não enviado." });
+  if (!req.file) return res.status(400).json({ error: "Arquivo cover ná£o enviado." });
 
   try {
-    // Reutiliza processamento genérico (poderia ter função própria para cover)
+    // Reutiliza processamento gená©rico (poderia ter funçáo prá³pria para cover)
     const urls = await processAndSaveAvatar(trainerId, req.file.buffer, req.file.mimetype);
-    // Retorna URLs geradas; a gravação em DB fica a critério do backend (schema)
+    // Retorna URLs geradas; a gravaçáo em DB fica a critá©rio do backend (schema)
     return res.status(200).json({ success: true, data: { coverUrl: urls.original, coverThumb: urls.thumb192, coverLarge: urls.thumb512 } });
   } catch (err) {
     console.error("Erro em PUT /api/trainers/:id/cover", err);
@@ -1010,7 +1453,7 @@ app.put("/api/trainers/:id/avatar", verifyToken, upload.single("avatar"), async 
   if (String(req.userId) !== String(trainerId)) {
     return res.status(403).json({ error: "Acesso negado. Apenas o dono pode atualizar o avatar." });
   }
-  if (!req.file) return res.status(400).json({ error: "Arquivo avatar não enviado." });
+  if (!req.file) return res.status(400).json({ error: "Arquivo avatar ná£o enviado." });
   try {
     const urls = await processAndSaveAvatar(trainerId, req.file.buffer, req.file.mimetype);
     return res.status(200).json({ success: true, data: { avatarUrl: urls.original, avatarThumb: urls.thumb96, avatarMedium: urls.thumb192, avatarLarge: urls.thumb512 } });
@@ -1020,28 +1463,28 @@ app.put("/api/trainers/:id/avatar", verifyToken, upload.single("avatar"), async 
   }
 });
 
-// Follow / Unfollow (só se tabela 'follows' existir)
+// Follow / Unfollow (sá³ se tabela 'follows' existir)
 app.post("/api/trainers/:id/follow", verifyToken, async (req, res) => {
   const trainerId = req.params.id;
   const userId = req.userId;
   try {
-    // Validação de entrada
+    // Validaçáo de entrada
     if (!trainerId || isNaN(parseInt(trainerId, 10))) {
-      return res.status(400).json({ error: "ID do trainer inválido." });
+      return res.status(400).json({ error: "ID do trainer invá¡lido." });
     }
 
     const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' ná£o instalada no banco. Implementaçáo pendente." });
 
     // Verificar se o trainer existe antes de criar o follow
     const trainerExists = await sql`SELECT id_us FROM usuarios WHERE id_us = ${parseInt(trainerId, 10)} AND (role = 'trainer' OR role = 'personal')`;
     if (!trainerExists || trainerExists.length === 0) {
-      return res.status(404).json({ error: "Trainer não encontrado." });
+      return res.status(404).json({ error: "Trainer ná£o encontrado." });
     }
 
-    // Verificar se o usuário não está tentando seguir a si mesmo
+    // Verificar se o usuá¡rio ná£o está¡ tentando seguir a si mesmo
     if (parseInt(trainerId, 10) === userId) {
-      return res.status(400).json({ error: "Você não pode seguir a si mesmo." });
+      return res.status(400).json({ error: "Vocáª ná£o pode seguir a si mesmo." });
     }
 
     // Insere ou ignora (supondo constraint unique)
@@ -1061,13 +1504,13 @@ app.delete("/api/trainers/:id/follow", verifyToken, async (req, res) => {
   const trainerId = req.params.id;
   const userId = req.userId;
   try {
-    // Validação de entrada
+    // Validaçáo de entrada
     if (!trainerId || isNaN(parseInt(trainerId, 10))) {
-      return res.status(400).json({ error: "ID do trainer inválido." });
+      return res.status(400).json({ error: "ID do trainer invá¡lido." });
     }
 
     const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' ná£o instalada no banco. Implementaçáo pendente." });
 
     await sql`DELETE FROM follows WHERE follower_user_id = ${userId} AND trainer_id = ${parseInt(trainerId, 10)}`;
     return res.status(200).json({ success: true, following: false });
@@ -1077,32 +1520,32 @@ app.delete("/api/trainers/:id/follow", verifyToken, async (req, res) => {
   }
 });
 
-// Follow múltiplos trainers de uma vez
+// Follow máºltiplos trainers de uma vez
 app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
   const userId = req.userId;
   const { trainerIds } = req.body;
 
   try {
-    // Validação de entrada
+    // Validaçáo de entrada
     if (!Array.isArray(trainerIds) || trainerIds.length === 0) {
-      return res.status(400).json({ error: "trainerIds deve ser um array não vazio." });
+      return res.status(400).json({ error: "trainerIds deve ser um array ná£o vazio." });
     }
 
     if (trainerIds.length > 100) {
-      return res.status(400).json({ error: "Máximo de 100 trainers por vez." });
+      return res.status(400).json({ error: "Má¡ximo de 100 trainers por vez." });
     }
 
     const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' ná£o instalada no banco. Implementaçáo pendente." });
 
-    // Filtra IDs válidos (números)
+    // Filtra IDs vá¡lidos (náºmeros)
     const validIds = trainerIds.filter(id => !isNaN(parseInt(id, 10)));
 
     if (validIds.length === 0) {
-      return res.status(400).json({ error: "Nenhum ID de trainer válido fornecido." });
+      return res.status(400).json({ error: "Nenhum ID de trainer vá¡lido fornecido." });
     }
 
-    // Insere múltiplos follows (ignorando conflitos)
+    // Insere máºltiplos follows (ignorando conflitos)
     for (const trainerId of validIds) {
       await sql`
         INSERT INTO follows (follower_user_id, trainer_id, created_at)
@@ -1111,71 +1554,89 @@ app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
       `;
     }
 
-    return res.status(200).json({ 
-      success: true, 
+    return res.status(200).json({
+      success: true,
       message: `${validIds.length} trainer(s) adicionado(s) com sucesso.`,
-      followedCount: validIds.length 
+      followedCount: validIds.length
     });
   } catch (err) {
     console.error("Erro em POST /api/trainers/follow-multiple", err);
-    return res.status(500).json({ error: "Erro interno ao seguir múltiplos trainers." });
+    return res.status(500).json({ error: "Erro interno ao seguir máºltiplos trainers." });
   }
 });
 
-// Unfollow múltiplos trainers de uma vez
-app.post("/api/trainers/unfollow-multiple", verifyToken, async (req, res) => {
-  const userId = req.userId;
-  const { trainerIds } = req.body;
+// --------------------- SOCIAL / SEGUIR USUÁRIOS --------------------- //
+
+// Seguir um usuário
+app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
+  const followerId = parseInt(req.userId);
+  const followedId = parseInt(req.params.id);
+
+  if (followerId === followedId) {
+    return res.status(400).json({ error: "Você não pode seguir a si mesmo." });
+  }
 
   try {
-    // Validação de entrada
-    if (!Array.isArray(trainerIds) || trainerIds.length === 0) {
-      return res.status(400).json({ error: "trainerIds deve ser um array não vazio." });
-    }
-
-    if (trainerIds.length > 100) {
-      return res.status(400).json({ error: "Máximo de 100 trainers por vez." });
-    }
-
-    const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada no banco. Implementação pendente." });
-
-    // Filtra IDs válidos (números)
-    const validIds = trainerIds.filter(id => !isNaN(parseInt(id, 10)));
-
-    if (validIds.length === 0) {
-      return res.status(400).json({ error: "Nenhum ID de trainer válido fornecido." });
-    }
-
-    // Deleta múltiplos follows
     await sql`
-      DELETE FROM follows 
-      WHERE follower_user_id = ${userId} AND trainer_id = ANY(${validIds})
+      INSERT INTO follows (follower_user_id, followed_user_id)
+      VALUES (${followerId}, ${followedId})
+      ON CONFLICT (follower_user_id, followed_user_id) DO NOTHING
     `;
 
-    return res.status(200).json({ 
-      success: true, 
-      message: `${validIds.length} trainer(s) removido(s) com sucesso.`,
-      unfollowedCount: validIds.length 
-    });
+    return res.status(200).json({ success: true, message: "Usuário seguido com sucesso." });
   } catch (err) {
-    console.error("Erro em POST /api/trainers/unfollow-multiple", err);
-    return res.status(500).json({ error: "Erro interno ao deixar de seguir múltiplos trainers." });
+    console.error("Erro ao seguir usuário:", err);
+    return res.status(500).json({ error: "Erro interno ao seguir usuário." });
+  }
+});
+
+// Deixar de seguir um usuário
+app.delete("/api/user/:id/unfollow", verifyToken, async (req, res) => {
+  const followerId = parseInt(req.userId);
+  const followedId = parseInt(req.params.id);
+
+  try {
+    await sql`
+      DELETE FROM follows 
+      WHERE follower_user_id = ${followerId} AND followed_user_id = ${followedId}
+    `;
+    return res.status(200).json({ success: true, message: "Deixou de seguir com sucesso." });
+  } catch (err) {
+    console.error("Erro ao deixar de seguir:", err);
+    return res.status(500).json({ error: "Erro interno ao deixar de seguir." });
+  }
+});
+
+// Verificar se segue um usuário
+app.get("/api/user/:id/follow-status", verifyToken, async (req, res) => {
+  const followerId = parseInt(req.userId);
+  const followedId = parseInt(req.params.id);
+
+  try {
+    const [follow] = await sql`
+      SELECT 1 FROM follows 
+      WHERE follower_user_id = ${followerId} AND followed_user_id = ${followedId}
+      LIMIT 1
+    `;
+    return res.status(200).json({ isFollowing: !!follow });
+  } catch (err) {
+    console.error("Erro ao verificar follow status:", err);
+    return res.status(200).json({ isFollowing: false });
   }
 });
 
 // -------------------- GRAFO / REDE DE SEGUIDORES -------------------- //
 
-// Retorna um subgrafo (nodes + links) para um usuário, com profundidade configurável.
+// Retorna um subgrafo (nodes + links) para um usuá¡rio, com profundidade configurá¡vel.
 // Query params:
-//  - userId (opcional): id do usuário raiz; se ausente, usa o usuário autenticado
-//  - depth (opcional): profundidade de busca (padrão 2, máximo 5)
-//  - maxNodes (opcional): limite de nós retornados (padrão 500, máximo 2000)
-//  - direction (opcional): 'out' (seguindo), 'in' (seguidores) ou 'both' (padrão)
+//  - userId (opcional): id do usuá¡rio raiz; se ausente, usa o usuá¡rio autenticado
+//  - depth (opcional): profundidade de busca (padrá£o 2, má¡ximo 5)
+//  - maxNodes (opcional): limite de ná³s retornados (padrá£o 500, má¡ximo 2000)
+//  - direction (opcional): 'out' (seguindo), 'in' (seguidores) ou 'both' (padrá£o)
 app.get("/api/graph/network", verifyToken, async (req, res) => {
   try {
     const startId = req.query.userId ? parseInt(req.query.userId, 10) : req.userId;
-    if (!startId) return res.status(400).json({ error: "userId não informado e sessão não encontrada." });
+    if (!startId) return res.status(400).json({ error: "userId ná£o informado e sessá£o ná£o encontrada." });
 
     let depth = parseInt(req.query.depth || "2", 10);
     depth = Number.isNaN(depth) ? 2 : Math.min(Math.max(depth, 1), 5);
@@ -1187,9 +1648,9 @@ app.get("/api/graph/network", verifyToken, async (req, res) => {
 
     // Verifica se tabela 'follows' existe
     const [{ exists }] = await sql`SELECT to_regclass('public.follows') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'follows' não instalada. Execute as migrations para habilitar a rede de seguidores." });
+    if (!exists) return res.status(501).json({ error: "Tabela 'follows' ná£o instalada. Execute as migrations para habilitar a rede de seguidores." });
 
-    // Monta CTE recursivo dependendo da direção solicitada
+    // Monta CTE recursivo dependendo da direçáo solicitada
     let idRows;
     if (direction === "out") {
       idRows = await sql`
@@ -1242,12 +1703,12 @@ app.get("/api/graph/network", verifyToken, async (req, res) => {
 
     const ids = idRows.map((r) => r.id).filter(Boolean);
 
-    // Se só tiver o nó raiz, retornamos apenas ele
+    // Se sá³ tiver o ná³ raiz, retornamos apenas ele
     if (ids.length === 0) {
       return res.status(200).json({ nodes: [], links: [] });
     }
 
-    // Busca dados dos usuários (nós)
+    // Busca dados dos usuá¡rios (ná³s)
     const users = await sql`
       SELECT id_us AS id, nome AS name, username, avatar_url, role
       FROM usuarios
@@ -1255,7 +1716,7 @@ app.get("/api/graph/network", verifyToken, async (req, res) => {
       LIMIT ${maxNodes}
     `;
 
-    // Busca arestas (relacionamentos) entre os nós retornados
+    // Busca arestas (relacionamentos) entre os ná³s retornados
     const edges = await sql`
       SELECT follower_user_id AS source, trainer_id AS target, created_at
       FROM follows
@@ -1273,29 +1734,313 @@ app.get("/api/graph/network", verifyToken, async (req, res) => {
 });
 
 // Search global simples
-app.get("/api/search", async (req, res) => {
+app.get("/api/search", verifyToken, async (req, res) => {
   const q = (req.query.q || "").trim();
-  const limit = parseInt(req.query.limit) || 10;
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = 5;
   if (!q) return res.status(400).json({ error: "Query 'q' é obrigatória." });
+
   try {
     const pattern = `%${q}%`;
+
+    // 1. Buscar Trainers/Usuários (incluindo status de follow para evitar flicker)
     const trainers = await sql`
-      SELECT id_us AS id, nome AS title, username AS subtitle
-      FROM usuarios
-      WHERE nome ILIKE ${pattern} OR username ILIKE ${pattern}
-      LIMIT ${limit} OFFSET ${offset}
+      SELECT u.id_us AS id, u.nome AS title, u.username AS subtitle, u.avatar_url AS image, u.role, u.banner_url,
+             Coalesce(u.location, 'São Paulo') as location,
+             Coalesce(u.job_title, 'Entusiasta Fitness') as job_title,
+             EXISTS(SELECT 1 FROM follows f WHERE f.follower_user_id = ${req.userId} AND f.followed_user_id = u.id_us) as is_following
+      FROM usuarios u
+      WHERE u.nome ILIKE ${pattern} OR u.username ILIKE ${pattern}
+      LIMIT ${limit}
     `;
-    // Retornar tipo para frontend decidir a tela target
-    const results = trainers.map((t) => ({ id: t.id, title: t.title, subtitle: t.subtitle, type: "trainer", target: "TrainerProfile" }));
-    return res.status(200).json({ data: results, meta: { total: results.length, limit, offset } });
+
+    // 2. Buscar Academias
+    const gyms = await sql`
+      SELECT id_academia AS id, nome AS title, endereco_completo AS subtitle, 'gym' AS type
+      FROM academias
+      WHERE nome ILIKE ${pattern} OR endereco_completo ILIKE ${pattern}
+      LIMIT ${limit}
+    `;
+
+    // 3. Buscar Dietas
+    const diets = await sql`
+      SELECT id_dieta AS id, nome AS title, descricao AS subtitle, imageurl AS image, 'diet' AS type
+      FROM dietas
+      WHERE nome ILIKE ${pattern} OR descricao ILIKE ${pattern}
+      LIMIT ${limit}
+    `;
+
+    // 4. Buscar Comunidades
+    const communities = await sql`
+      SELECT id_comunidade AS id, nome AS title, descricao AS subtitle, imageurl AS image, 'community' AS type
+      FROM comunidades
+      WHERE nome ILIKE ${pattern} OR descricao ILIKE ${pattern}
+      LIMIT ${limit}
+    `;
+
+    // Unificar resultados
+    const results = [
+      ...trainers.map((t) => {
+        const isTrainer = t.role === 'trainer' || t.role === 'personal';
+        return {
+          id: t.id,
+          title: t.title,
+          subtitle: t.subtitle,
+          image: t.image,
+          type: isTrainer ? 'trainer' : 'user',
+          target: isTrainer ? 'TrainerProfile' : 'ProfilePFScreen',
+          data: {
+            ...t,
+            name: t.title,
+            username: t.subtitle,
+            photo: t.image,
+            banner: t.banner_url,
+            isFollowing: t.is_following
+          }
+        };
+      }),
+      ...gyms.map((g) => ({
+        id: g.id,
+        title: g.title,
+        subtitle: g.subtitle,
+        type: 'gym',
+        target: 'MapScreen',
+        data: g
+      })),
+      ...diets.map((d) => ({
+        id: d.id,
+        title: d.title,
+        subtitle: d.subtitle,
+        image: d.image,
+        type: 'diet',
+        target: 'DietDetails',
+        data: d
+      })),
+      ...communities.map((c) => ({
+        id: c.id,
+        title: c.title,
+        subtitle: c.subtitle,
+        image: c.image,
+        type: 'community',
+        target: 'CommunityDetails',
+        data: c
+      }))
+    ];
+
+    return res.status(200).json({ data: results });
   } catch (err) {
-    console.error("Erro em GET /api/search", err);
+    console.error("Erro em GET /api/search:", err);
     return res.status(500).json({ error: "Erro interno na busca." });
   }
 });
 
-// Notifications (consulta básica se tabela existir)
+// Obter perfil público de um usuário (incluindo is_following)
+app.get("/api/user/:id", verifyToken, async (req, res) => {
+  const userId = req.params.id;
+  const requesterId = req.userId;
+  try {
+    const [user] = await sql`
+      SELECT id_us as id, nome as name, username, avatar_url as photo, banner_url as banner,
+             location, job_title, bio,
+             EXISTS(SELECT 1 FROM follows f WHERE f.follower_user_id = ${requesterId} AND f.followed_user_id = id_us) as is_following
+      FROM usuarios
+      WHERE id_us = ${userId}
+    `;
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...user,
+        isFollowing: user.is_following
+      }
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/user/:id:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar perfil." });
+  }
+});
+
+// Atualizar bio do usuário
+app.put("/api/user/bio", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { bio } = req.body;
+
+  // Validação: máximo 150 caracteres
+  if (bio && bio.length > 150) {
+    return res.status(400).json({
+      error: "Bio deve ter no máximo 150 caracteres."
+    });
+  }
+
+  try {
+    await sql`
+      UPDATE usuarios 
+      SET bio = ${bio || null}, updated_at = NOW()
+      WHERE id_us = ${userId}
+    `;
+
+    return res.status(200).json({
+      success: true,
+      message: "Bio atualizada com sucesso.",
+      data: { bio }
+    });
+  } catch (err) {
+    console.error("Erro ao atualizar bio:", err);
+    return res.status(500).json({
+      error: "Erro interno ao atualizar bio."
+    });
+  }
+});
+
+// Buscar posts de um usuário específico
+app.get("/api/user/:id/posts", verifyToken, async (req, res) => {
+  const userId = req.params.id;
+
+  // Imagens para usuários ímpares ou trainers
+  const postsSetA = [
+    "https://res.cloudinary.com/ditlmzgrh/image/upload/v1757838100/image_2_kgtuno.jpg",
+    "https://img.freepik.com/free-photo/view-woman-helping-man-exercise-gym_52683-98092.jpg",
+    "https://img.freepik.com/free-photo/medium-shot-people-helping-each-other-gym_23-2149591024.jpg",
+    "https://img.freepik.com/free-photo/man-helping-woman-with-her-workout-gym_23-2149591022.jpg",
+    "https://img.freepik.com/free-photo/man-working-out-gym_23-2149591020.jpg",
+    "https://img.freepik.com/free-photo/woman-working-out-gym_23-2149591018.jpg",
+  ];
+
+  // Imagens para usuários pares
+  const postsSetB = [
+    "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?q=80&w=2670",
+    "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?q=80&w=2670",
+    "https://images.unsplash.com/photo-1544367567-0f2fcb009e0b?q=80&w=2620",
+    "https://images.unsplash.com/photo-1476480862126-209bfaa8edc8?q=80&w=2670",
+    "https://images.unsplash.com/photo-1518611012118-696072aa579a?q=80&w=2670",
+    "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?q=80&w=2670",
+  ];
+
+  const data = (parseInt(userId) % 2 === 0) ? postsSetB : postsSetA;
+
+  return res.status(200).json({ success: true, data });
+});
+
+// Obter estatísticas do usuário (posts, seguidores, seguindo)
+app.get("/api/user/:id/stats", verifyToken, async (req, res) => {
+  const userId = req.params.id;
+
+  try {
+    // Contar seguidores (quem segue este usuário)
+    const [followersCount] = await sql`
+      SELECT COUNT(*) as count
+      FROM follows
+      WHERE followed_user_id = ${userId}
+    `;
+
+    // Contar seguindo (quem este usuário segue)
+    const [followingCount] = await sql`
+      SELECT COUNT(*) as count
+      FROM follows
+      WHERE follower_user_id = ${userId}
+    `;
+
+    // Posts count (mockado por enquanto - retorna 6)
+    // TODO: Quando implementar tabela de posts, substituir por:
+    // SELECT COUNT(*) FROM posts WHERE user_id = ${userId}
+    const postsCount = 6;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        posts: postsCount,
+        followers: parseInt(followersCount.count),
+        following: parseInt(followingCount.count)
+      }
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/user/:id/stats:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar estatísticas." });
+  }
+});
+
+// Obter lista de seguidores de um usuário
+app.get("/api/user/:id/followers", verifyToken, async (req, res) => {
+  const userId = req.params.id;
+  const requesterId = req.userId;
+
+  try {
+    const followers = await sql`
+      SELECT 
+        u.id_us as id,
+        u.nome as name,
+        u.username,
+        u.avatar_url as photo,
+        EXISTS(
+          SELECT 1 FROM follows f2 
+          WHERE f2.follower_user_id = ${requesterId} 
+          AND f2.followed_user_id = u.id_us
+        ) as is_following
+      FROM usuarios u
+      INNER JOIN follows f ON f.follower_user_id = u.id_us
+      WHERE f.followed_user_id = ${userId}
+      ORDER BY f.created_at DESC
+    `;
+
+    return res.status(200).json({
+      success: true,
+      data: followers.map(f => ({
+        id: f.id,
+        name: f.name,
+        username: f.username,
+        photo: f.photo,
+        isFollowing: f.is_following
+      }))
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/user/:id/followers:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar seguidores." });
+  }
+});
+
+// Obter lista de quem o usuário está seguindo
+app.get("/api/user/:id/following", verifyToken, async (req, res) => {
+  const userId = req.params.id;
+  const requesterId = req.userId;
+
+  try {
+    const following = await sql`
+      SELECT 
+        u.id_us as id,
+        u.nome as name,
+        u.username,
+        u.avatar_url as photo,
+        EXISTS(
+          SELECT 1 FROM follows f2 
+          WHERE f2.follower_user_id = ${requesterId} 
+          AND f2.followed_user_id = u.id_us
+        ) as is_following
+      FROM usuarios u
+      INNER JOIN follows f ON f.followed_user_id = u.id_us
+      WHERE f.follower_user_id = ${userId}
+      ORDER BY f.created_at DESC
+    `;
+
+    return res.status(200).json({
+      success: true,
+      data: following.map(f => ({
+        id: f.id,
+        name: f.name,
+        username: f.username,
+        photo: f.photo,
+        isFollowing: f.is_following
+      }))
+    });
+  } catch (err) {
+    console.error("Erro em GET /api/user/:id/following:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar seguindo." });
+  }
+});
+
+// Notifications (consulta bá¡sica se tabela existir)
 app.get("/api/notifications", verifyToken, async (req, res) => {
   const userId = req.userId;
   try {
@@ -1312,7 +2057,7 @@ app.get("/api/notifications", verifyToken, async (req, res) => {
     return res.status(200).json({ data });
   } catch (err) {
     console.error("Erro em GET /api/notifications", err);
-    return res.status(500).json({ error: "Erro interno ao buscar notificações." });
+    return res.status(500).json({ error: "Erro interno ao buscar notificaá§áµes." });
   }
 });
 
@@ -1321,7 +2066,7 @@ app.put("/api/notifications/:id/read", verifyToken, async (req, res) => {
   const id = req.params.id;
   try {
     const [{ exists }] = await sql`SELECT to_regclass('public.notifications') IS NOT NULL AS exists`;
-    if (!exists) return res.status(501).json({ error: "Tabela 'notifications' não instalada." });
+    if (!exists) return res.status(501).json({ error: "Tabela 'notifications' ná£o instalada." });
     await sql`UPDATE notifications SET read = true WHERE id = ${id} AND user_id = ${userId}`;
     return res.status(200).json({ success: true });
   } catch (err) {
@@ -1330,21 +2075,21 @@ app.put("/api/notifications/:id/read", verifyToken, async (req, res) => {
   }
 });
 
-// Endpoint para gerar signed upload (placeholder quando não houver S3 direto)
+// Endpoint para gerar signed upload (placeholder quando ná£o houver S3 direto)
 app.post("/api/uploads/sign", verifyToken, async (req, res) => {
-  // Este endpoint pode ser implementado para S3/GCS, aqui oferecemos comportamento mínimo
+  // Este endpoint pode ser implementado para S3/GCS, aqui oferecemos comportamento má­nimo
   const { filename, contentType, purpose } = req.body || {};
   if (!filename || !contentType) return res.status(400).json({ error: "Informe filename e contentType." });
-  if (!supabase) return res.status(501).json({ error: "Signed uploads não configurados neste ambiente. Use multipart ou configure storage." });
-  // Como fallback retornamos um suggested public path e instruções
+  if (!supabase) return res.status(501).json({ error: "Signed uploads ná£o configurados neste ambiente. Use multipart ou configure storage." });
+  // Como fallback retornamos um suggested public path e instruá§áµes
   const suggestedKey = `${purpose || 'uploads'}/${uuidv4()}_${filename}`;
-  return res.status(200).json({ uploadUrl: null, publicUrl: `supabase://${AVATAR_BUCKET}/${suggestedKey}`, message: "Presigned upload não implementado no servidor; faça upload via backend ou configure S3." });
+  return res.status(200).json({ uploadUrl: null, publicUrl: `supabase://${AVATAR_BUCKET}/${suggestedKey}`, message: "Presigned upload ná£o implementado no servidor; faá§a upload via backend ou configure S3." });
 });
 
 // -------------------------------- DIETAS ---------------------------- //
 
 app.post("/api/dietas", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/dietas ===");
+  console.log("=== INáCIO DA ROTA POST /api/dietas ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -1366,76 +2111,76 @@ app.post("/api/dietas", verifyToken, async (req, res) => {
   } = req.body;
   const descricao = req.body.descricao ?? req.body.descripcion ?? null;
 
-  // Log dos dados extraídos
-  console.log("--- DADOS EXTRAÍDOS ---");
+  // Log dos dados extraá­dos
+  console.log("--- DADOS EXTRAáDOS ---");
   console.log("Nome:", nome);
-  console.log("Descrição:", descricao);
+  console.log("Descriçáo:", descricao);
   console.log("Image URL:", imageurl);
   console.log("Categoria:", categoria);
   console.log("Calorias:", calorias);
   console.log("Tempo de preparo:", tempo_preparo);
   console.log("Gordura:", gordura);
-  console.log("Proteína:", proteina);
+  console.log("Proteá­na:", proteina);
   console.log("Carboidratos:", carboidratos);
 
-  // Validação com logs detalhados
-  console.log("--- VALIDAÇÃO DOS DADOS ---");
+  // Validaçáo com logs detalhados
+  console.log("--- VALIDAá‡áƒO DOS DADOS ---");
   const validationErrors = [];
 
   if (!nome) {
-    validationErrors.push("Nome é obrigatório");
-    console.log("❌ ERRO: Nome não fornecido");
+    validationErrors.push("Nome á© obrigatá³rio");
+    console.log("âŒ ERRO: Nome ná£o fornecido");
   } else {
-    console.log("✅ Nome válido:", nome);
+    console.log("âœ… Nome vá¡lido:", nome);
   }
 
   if (!descricao) {
-    validationErrors.push("Descrição é obrigatória");
-    console.log("❌ ERRO: Descrição não fornecida");
+    validationErrors.push("Descriçáo á© obrigatá³ria");
+    console.log("âŒ ERRO: Descriçáo ná£o fornecida");
   } else {
-    console.log("✅ Descrição válida:", descricao.substring(0, 50) + "...");
+    console.log("âœ… Descriçáo vá¡lida:", descricao.substring(0, 50) + "...");
   }
 
   if (!imageurl) {
-    validationErrors.push("URL da imagem é obrigatória");
-    console.log("❌ ERRO: URL da imagem não fornecida");
+    validationErrors.push("URL da imagem á© obrigatá³ria");
+    console.log("âŒ ERRO: URL da imagem ná£o fornecida");
   } else {
-    console.log("✅ URL da imagem válida:", imageurl);
+    console.log("âœ… URL da imagem vá¡lida:", imageurl);
   }
 
   if (!categoria) {
-    validationErrors.push("Categoria é obrigatória");
-    console.log("❌ ERRO: Categoria não fornecida");
+    validationErrors.push("Categoria á© obrigatá³ria");
+    console.log("âŒ ERRO: Categoria ná£o fornecida");
   } else {
-    console.log("✅ Categoria válida:", categoria);
+    console.log("âœ… Categoria vá¡lida:", categoria);
   }
 
   if (validationErrors.length > 0) {
-    console.log("--- FALHA NA VALIDAÇÃO ---");
+    console.log("--- FALHA NA VALIDAá‡áƒO ---");
     console.log("Erros encontrados:", validationErrors);
     console.log("=== FIM DA ROTA POST /api/dietas (ERRO 400) ===");
     return res.status(400).json({
-      error: "Dados obrigatórios não fornecidos.",
+      error: "Dados obrigatá³rios ná£o fornecidos.",
       details: validationErrors,
     });
   }
 
-  console.log("✅ Todas as validações passaram");
+  console.log("âœ… Todas as validaá§áµes passaram");
 
   try {
     console.log("--- BUSCANDO DADOS DO AUTOR ---");
-    console.log("Buscando usuário com ID:", userId);
+    console.log("Buscando usuá¡rio com ID:", userId);
 
     const [author] =
       await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
 
     if (!author) {
-      console.log("❌ ERRO: Usuário autor não encontrado no banco de dados");
+      console.log("âŒ ERRO: Usuá¡rio autor ná£o encontrado no banco de dados");
       console.log("=== FIM DA ROTA POST /api/dietas (ERRO 404) ===");
-      return res.status(404).json({ error: "Usuário autor não encontrado." });
+      return res.status(404).json({ error: "Usuá¡rio autor ná£o encontrado." });
     }
 
-    console.log("✅ Autor encontrado:", {
+    console.log("âœ… Autor encontrado:", {
       nome: author.nome,
       username: author.username,
       email: author.email,
@@ -1444,7 +2189,7 @@ app.post("/api/dietas", verifyToken, async (req, res) => {
     const authorName = author.nome || author.username || null;
     const authorAvatarUrl = getGravatarUrl(author.email);
 
-    console.log("--- PREPARANDO DADOS PARA INSERÇÃO ---");
+    console.log("--- PREPARANDO DADOS PARA INSERá‡áƒO ---");
     console.log("Nome do autor:", authorName);
     console.log("Avatar URL do autor:", authorAvatarUrl);
 
@@ -1464,12 +2209,12 @@ app.post("/api/dietas", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log("✅ Dieta inserida com sucesso no banco de dados");
+    console.log("âœ… Dieta inserida com sucesso no banco de dados");
     console.log("--- DADOS DA DIETA CRIADA ---");
     console.log("ID da dieta:", newDieta.id_dieta);
     console.log("Nome:", newDieta.nome);
     console.log("Categoria:", newDieta.categoria);
-    console.log("Data de criação:", newDieta.createdat);
+    console.log("Data de criaçáo:", newDieta.createdat);
 
     console.log("--- RESPOSTA DE SUCESSO ---");
     console.log("Status: 201 - Created");
@@ -1480,10 +2225,10 @@ app.post("/api/dietas", verifyToken, async (req, res) => {
       data: newDieta,
     });
   } catch (error) {
-    console.log("--- ERRO DURANTE A EXECUÇÃO ---");
-    console.error("❌ ERRO ao criar dieta:", error);
+    console.log("--- ERRO DURANTE A EXECUá‡áƒO ---");
+    console.error("âŒ ERRO ao criar dieta:", error);
     console.log("Tipo do erro:", error.constructor.name);
-    console.log("Código do erro:", error.code);
+    console.log("Cá³digo do erro:", error.code);
     console.log("Mensagem do erro:", error.message);
     console.log("Stack trace:", error.stack);
 
@@ -1499,7 +2244,7 @@ app.post("/api/dietas", verifyToken, async (req, res) => {
 });
 
 app.get("/api/dietas", verifyToken, async (req, res) => {
-  console.log("Rota GET /api/dietas atingida");
+
   const userId = req.userId;
   const { categoria } = req.query;
 
@@ -1524,7 +2269,7 @@ app.get("/api/dietas", verifyToken, async (req, res) => {
 });
 
 app.put("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
-  console.log("Rota PUT /api/dietas/:id_dieta atingida");
+
   const userId = req.userId;
   const { id_dieta } = req.params;
   const {
@@ -1544,7 +2289,7 @@ app.put("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
   if (!nome || !descricao || !imageurl || !categoria) {
     return res
       .status(400)
-      .json({ error: "Nome, descrição, imagem e categoria são obrigatórios." });
+      .json({ error: "Nome, descriçáo, imagem e categoria sá£o obrigatá³rios." });
   }
 
   try {
@@ -1569,7 +2314,7 @@ app.put("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
 
     if (!updatedDieta) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para editá-la.",
+        error: "Dieta ná£o encontrada ou vocáª ná£o tem permissá£o para editá¡-la.",
       });
     }
     res
@@ -1585,7 +2330,7 @@ app.put("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
 });
 
 app.delete("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
-  console.log("Rota DELETE /api/dietas/:id_dieta atingida");
+
   const userId = req.userId;
   const { id_dieta } = req.params;
 
@@ -1598,10 +2343,10 @@ app.delete("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
 
     if (!deletedDieta) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para excluí-la.",
+        error: "Dieta ná£o encontrada ou vocáª ná£o tem permissá£o para excluá­-la.",
       });
     }
-    res.status(200).json({ message: "Dieta excluída com sucesso!" });
+    res.status(200).json({ message: "Dieta excluá­da com sucesso!" });
   } catch (error) {
     console.error("Erro ao excluir dieta:", error);
     res.status(500).json({
@@ -1614,7 +2359,7 @@ app.delete("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
 // -------------------------------- CHAT ---------------------------- //
 
 app.post("/api/chat", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/dietas ===");
+  console.log("=== INáCIO DA ROTA POST /api/chat ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -1623,269 +2368,500 @@ app.post("/api/chat", verifyToken, async (req, res) => {
   console.log("Headers:", JSON.stringify(req.headers, null, 2));
   console.log("Body completo:", JSON.stringify(req.body, null, 2));
 
-  const userId = req.userId;
-  const {
-    nome,
-    imageurl,
-    categoria,
-    calorias,
-    tempo_preparo,
-    gordura,
-    proteina,
-    carboidratos,
-  } = req.body;
-  const descricao = req.body.descricao ?? req.body.descripcion ?? null;
+  const userId = req.userId; // ID do seu banco de dados (inteiro)
+  const { participant2_id } = req.body;
 
-  // Log dos dados extraídos
-  console.log("--- DADOS EXTRAÍDOS ---");
-  console.log("Nome:", nome);
-  console.log("Descrição:", descricao);
-  console.log("Image URL:", imageurl);
-  console.log("Categoria:", categoria);
-  console.log("Calorias:", calorias);
-  console.log("Tempo de preparo:", tempo_preparo);
-  console.log("Gordura:", gordura);
-  console.log("Proteína:", proteina);
-  console.log("Carboidratos:", carboidratos);
+  // Log dos dados extraá­dos
+  console.log("--- DADOS EXTRAáDOS ---");
+  console.log("Participant2 ID:", participant2_id);
 
-  // Validação com logs detalhados
-  console.log("--- VALIDAÇÃO DOS DADOS ---");
+  // Validaçáo com logs detalhados
+  console.log("--- VALIDAá‡áƒO DOS DADOS ---");
   const validationErrors = [];
 
-  if (!nome) {
-    validationErrors.push("Nome é obrigatório");
-    console.log("❌ ERRO: Nome não fornecido");
+  if (!participant2_id) {
+    validationErrors.push("Participant2 ID á© obrigatá³rio");
+    console.log("âŒ ERRO: Participant2 ID ná£o fornecido");
   } else {
-    console.log("✅ Nome válido:", nome);
-  }
-
-  if (!descricao) {
-    validationErrors.push("Descrição é obrigatória");
-    console.log("❌ ERRO: Descrição não fornecida");
-  } else {
-    console.log("✅ Descrição válida:", descricao.substring(0, 50) + "...");
-  }
-
-  if (!imageurl) {
-    validationErrors.push("URL da imagem é obrigatória");
-    console.log("❌ ERRO: URL da imagem não fornecida");
-  } else {
-    console.log("✅ URL da imagem válida:", imageurl);
-  }
-
-  if (!categoria) {
-    validationErrors.push("Categoria é obrigatória");
-    console.log("❌ ERRO: Categoria não fornecida");
-  } else {
-    console.log("✅ Categoria válida:", categoria);
+    console.log("âœ… Participant2 ID vá¡lido:", participant2_id);
   }
 
   if (validationErrors.length > 0) {
-    console.log("--- FALHA NA VALIDAÇÃO ---");
+    console.log("--- FALHA NA VALIDAá‡áƒO ---");
     console.log("Erros encontrados:", validationErrors);
-    console.log("=== FIM DA ROTA POST /api/dietas (ERRO 400) ===");
+    console.log("=== FIM DA ROTA POST /api/chat (ERRO 400) ===");
     return res.status(400).json({
-      error: "Dados obrigatórios não fornecidos.",
+      error: "Dados obrigatá³rios ná£o fornecidos.",
       details: validationErrors,
     });
   }
 
-  console.log("✅ Todas as validações passaram");
+  console.log("âœ… Todas as validaá§áµes passaram");
 
   try {
-    console.log("--- BUSCANDO DADOS DO AUTOR ---");
-    console.log("Buscando usuário com ID:", userId);
-
-    const [author] =
-      await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
-
-    if (!author) {
-      console.log("❌ ERRO: Usuário autor não encontrado no banco de dados");
-      console.log("=== FIM DA ROTA POST /api/dietas (ERRO 404) ===");
-      return res.status(404).json({ error: "Usuário autor não encontrado." });
+    // Testar conexá£o com o banco de dados antes de tentar a consulta
+    try {
+      await sql`SELECT 1`;
+    } catch (dbError) {
+      console.error("Erro na conexá£o com o banco de dados:", dbError);
+      return res.status(503).json({
+        error: "Serviá§o de banco de dados temporariamente indisponá­vel.",
+        details: dbError.message
+      });
     }
 
-    console.log("✅ Autor encontrado:", {
-      nome: author.nome,
-      username: author.username,
-      email: author.email,
-    });
+    console.log("--- VERIFICANDO SE USUáRIOS EXISTEM ---");
+    console.log("Buscando usuá¡rio com ID:", participant2_id);
 
-    const authorName = author.nome || author.username || null;
-    const authorAvatarUrl = getGravatarUrl(author.email);
-
-    console.log("--- PREPARANDO DADOS PARA INSERÇÃO ---");
-    console.log("Nome do autor:", authorName);
-    console.log("Avatar URL do autor:", authorAvatarUrl);
-
-    console.log("--- EXECUTANDO INSERT NO BANCO DE DADOS ---");
-    const [newDieta] = await sql`
-      INSERT INTO dietas (
-        id_us, nome, descricao, imageurl, calorias, tempo_preparo,
-        gordura, proteina, carboidratos, nome_autor, avatar_autor_url,
-        createdat, updatedat, categoria
-      )
-      VALUES (
-        ${userId}, ${nome}, ${descricao}, ${imageurl}, ${calorias || null},
-        ${tempo_preparo || null}, ${gordura || null}, ${proteina || null},
-        ${carboidratos || null}, ${authorName || null}, ${authorAvatarUrl || null},
-        ${new Date()}, ${new Date()}, ${categoria}
-      )
-      RETURNING *;
+    // Verificar se o outro usuá¡rio existe no seu banco de dados
+    const [otherUser] = await sql`
+      SELECT id_us FROM usuarios WHERE id_us = ${participant2_id}
     `;
 
-    console.log("✅ Dieta inserida com sucesso no banco de dados");
-    console.log("--- DADOS DA DIETA CRIADA ---");
-    console.log("ID da dieta:", newDieta.id_dieta);
-    console.log("Nome:", newDieta.nome);
-    console.log("Categoria:", newDieta.categoria);
-    console.log("Data de criação:", newDieta.createdat);
+    if (!otherUser) {
+      console.log("âŒ ERRO: Usuá¡rio participante ná£o encontrado no banco de dados");
+      console.log("=== FIM DA ROTA POST /api/chat (ERRO 404) ===");
+      return res.status(404).json({ error: "Usuá¡rio participante ná£o encontrado." });
+    }
+
+    console.log("âœ… Usuá¡rio participante encontrado:", otherUser.id_us);
+
+    // Obter os UUIDs do Supabase Auth para ambos os usuá¡rios
+    const currentUserMapping = await getUserAuthId(userId);
+    const otherUserMapping = await getUserAuthId(participant2_id);
+
+    if (!currentUserMapping || !otherUserMapping) {
+      console.log("âŒ ERRO: Usuá¡rios ná£o encontrados no sistema de autenticaçáo do Supabase");
+      return res.status(404).json({
+        error: "Usuá¡rios ná£o encontrados no sistema de autenticaçáo."
+      });
+    }
+
+    const currentUserId = currentUserMapping.auth_user_id;
+    const otherUserId = otherUserMapping.auth_user_id;
+
+    console.log("âœ… UUIDs do Supabase Auth obtidos");
+    console.log("Current user UUID:", currentUserId);
+    console.log("Other user UUID:", otherUserId);
+
+    // Verificar se já¡ existe um chat entre esses dois usuá¡rios no Supabase
+    console.log("--- VERIFICANDO SE CHAT Já EXISTE NO SUPABASE ---");
+    const { data: existingChat, error: chatError } = await supabase
+      .from('chats')
+      .select('id')
+      .or(`and(participant1_id.eq.${currentUserId},participant2_id.eq.${otherUserId}),and(participant1_id.eq.${otherUserId},participant2_id.eq.${currentUserId})`)
+      .single();
+
+    if (existingChat && !chatError) {
+      console.log("âœ… Chat já¡ existe com ID:", existingChat.id);
+      return res.status(200).json({
+        message: "Chat já¡ existente",
+        chatId: existingChat.id,
+        data: existingChat,
+      });
+    }
+
+    console.log("--- CRIANDO NOVO CHAT NO SUPABASE ---");
+
+    // Criar o novo chat no Supabase
+    const { data: newChat, error: insertError } = await supabase
+      .from('chats')
+      .insert({
+        participant1_id: currentUserId,
+        participant2_id: otherUserId,
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error("Erro ao criar chat no Supabase:", insertError);
+      return res.status(500).json({
+        error: "Erro ao criar chat.",
+        details: insertError.message
+      });
+    }
+
+    console.log("âœ… Chat inserido com sucesso no Supabase");
+    console.log("--- DADOS DO CHAT CRIADO ---");
+    console.log("ID do chat:", newChat.id);
+    console.log("Participant1 ID:", newChat.participant1_id);
+    console.log("Participant2 ID:", newChat.participant2_id);
+    console.log("Data de criaçáo:", newChat.created_at);
 
     console.log("--- RESPOSTA DE SUCESSO ---");
     console.log("Status: 201 - Created");
-    console.log("=== FIM DA ROTA POST /api/dietas (SUCESSO) ===");
+    console.log("=== FIM DA ROTA POST /api/chat (SUCESSO) ===");
 
     res.status(201).json({
-      message: "Dieta criada com sucesso!",
-      data: newDieta,
+      message: "Chat criado com sucesso!",
+      chatId: newChat.id,
+      data: newChat,
     });
   } catch (error) {
-    console.log("--- ERRO DURANTE A EXECUÇÃO ---");
-    console.error("❌ ERRO ao criar dieta:", error);
+    console.log("--- ERRO DURANTE A EXECUá‡áƒO ---");
+    console.error("âŒ ERRO ao criar chat:", error);
     console.log("Tipo do erro:", error.constructor.name);
-    console.log("Código do erro:", error.code);
+    console.log("Cá³digo do erro:", error.code);
     console.log("Mensagem do erro:", error.message);
     console.log("Stack trace:", error.stack);
 
+    // Verificar se á© um erro de conexá£o com o banco de dados
+    if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+      return res.status(503).json({
+        error: "Erro de conexá£o com o banco de dados. Serviá§o temporariamente indisponá­vel.",
+        details: "O sistema de chat está¡ temporariamente indisponá­vel. Tente novamente mais tarde."
+      });
+    }
+
     console.log("--- RESPOSTA DE ERRO ---");
     console.log("Status: 500 - Internal Server Error");
-    console.log("=== FIM DA ROTA POST /api/dietas (ERRO 500) ===");
+    console.log("=== FIM DA ROTA POST /api/chat (ERRO 500) ===");
 
     res.status(500).json({
-      error: "Erro interno do servidor ao criar dieta.",
+      error: "Erro interno do servidor ao criar chat.",
       details: error.message,
     });
+  }
+});
+
+app.get("/api/chat/contacts/mutual", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    // Busca usuá¡rios que seguem o atual AND sá£o seguidos pelo atual
+    const mutualFollowers = await sql`
+      SELECT 
+        u.id_us AS id, 
+        u.nome AS name, 
+        u.username, 
+        u.photo AS avatar
+      FROM usuarios u
+      WHERE u.id_us IN (
+        SELECT f1.trainer_id 
+        FROM follows f1
+        WHERE f1.follower_user_id = ${userId}
+        INTERSECT
+        SELECT f2.follower_user_id 
+        FROM follows f2
+        WHERE f2.trainer_id = ${userId}
+      )
+    `;
+
+    return res.status(200).json({ data: mutualFollowers });
+  } catch (err) {
+    console.error("Erro ao buscar seguidores máºtuos:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar contatos." });
   }
 });
 
 app.get("/api/chat", verifyToken, async (req, res) => {
-  dados;
-  console.log("Rota GET /api/dietas atingida");
-  const userId = req.userId;
-  const { categoria } = req.query;
+
+  const userId = req.userId; // ID do seu banco de dados (inteiro)
 
   try {
-    let query = sql`SELECT id_us, nome, descricao, imageurl, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url, createdat, updatedat, categoria, id_dieta FROM dietas WHERE id_us = ${userId}`;
-
-    if (categoria) {
-      query = sql`${query} AND categoria = ${categoria}`;
+    // Testar conexá£o com o banco de dados antes de tentar a consulta
+    try {
+      await sql`SELECT 1`;
+    } catch (dbError) {
+      console.error("Erro na conexá£o com o banco de dados:", dbError);
+      return res.status(503).json({
+        error: "Serviá§o de banco de dados temporariamente indisponá­vel.",
+        details: dbError.message
+      });
     }
 
-    query = sql`${query} ORDER BY createdat DESC;`;
+    // Obter o UUID do Supabase Auth para o usuá¡rio atual
+    const userMapping = await getUserAuthId(userId);
+    if (!userMapping) {
+      return res.status(404).json({
+        error: "Usuá¡rio ná£o encontrado no sistema de autenticaçáo."
+      });
+    }
 
-    const dietas = await query;
-    res.status(200).json({ data: dietas });
+    const supabaseUserId = userMapping.auth_user_id;
+
+    // Buscar todos os chats em que o usuá¡rio participa no Supabase
+    const { data: chats, error: chatError } = await supabase
+      .from('chats')
+      .select(`
+        id,
+        participant1_id,
+        participant2_id,
+        last_message,
+        last_timestamp,
+        unread_count_p1,
+        unread_count_p2,
+        created_at
+      `)
+      .or(`participant1_id.eq.${supabaseUserId},participant2_id.eq.${supabaseUserId}`)
+      .order('last_timestamp', { ascending: false });
+
+    if (chatError) {
+      console.error("Erro ao buscar chats no Supabase:", chatError);
+      return res.status(500).json({
+        error: "Erro ao obter chats.",
+        details: chatError.message
+      });
+    }
+
+    // Mapear os resultados para incluir unread_count apropriado e dados do participante
+    const chatsWithDetails = await Promise.all(chats.map(async (chat) => {
+      const otherParticipantId = chat.participant1_id === supabaseUserId
+        ? chat.participant2_id
+        : chat.participant1_id;
+
+      let participantName = `User ${otherParticipantId.substring(0, 5)}`;
+      let participantAvatar = "https://i.pravatar.cc/150?img=1";
+
+      try {
+        // Obter dados diretamente da tabela usuarios pelo auth_user_id
+        const [user] = await sql`
+          SELECT nome, photo FROM usuarios WHERE auth_user_id = ${otherParticipantId}
+        `;
+        if (user) {
+          participantName = user.nome;
+          participantAvatar = user.photo || participantAvatar;
+        }
+      } catch (err) {
+        console.error("Erro ao buscar detalhes do participante:", otherParticipantId, err);
+      }
+
+      return {
+        ...chat,
+        unread_count: chat.participant1_id === supabaseUserId
+          ? chat.unread_count_p2
+          : chat.unread_count_p1,
+        participant_name: participantName,
+        participant_avatar: participantAvatar
+      };
+    }));
+
+    res.status(200).json({ data: chatsWithDetails });
   } catch (error) {
-    console.error("Erro ao listar dietas:", error);
+    console.error("Erro ao listar chats:", error);
+
+    // Verificar se á© um erro de conexá£o com o banco de dados
+    if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
+      return res.status(503).json({
+        error: "Erro de conexá£o com o banco de dados. Serviá§o temporariamente indisponá­vel.",
+        details: "O sistema está¡ temporariamente indisponá­vel. Tente novamente mais tarde."
+      });
+    }
+
     res.status(500).json({
-      error: "Erro interno do servidor ao listar dietas.",
+      error: "Erro interno do servidor ao obter chats.",
       details: error.message,
     });
   }
 });
 
-app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
-  console.log("Rota PUT /api/dietas/:id_dieta atingida");
-  const userId = req.userId;
-  const { id_dieta } = req.params;
-  const {
-    nome,
-    descricao,
-    imageurl,
-    categoria,
-    calorias,
-    tempo_preparo,
-    gordura,
-    proteina,
-    carboidratos,
-    nome_autor,
-    avatar_autor_url,
-  } = req.body;
 
-  if (!nome || !descricao || !imageurl || !categoria) {
-    return res
-      .status(400)
-      .json({ error: "Nome, descrição, imagem e categoria são obrigatórios." });
-  }
+// Rota para deletar ou atualizar chat removida para simplificaçáo ou movida
+
+app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
+
+  const userId = req.userId;
+  const { id_chat } = req.params;
+  const { last_message, last_timestamp } = req.body;
 
   try {
-    const [updatedDieta] = await sql`
-      UPDATE dietas
+    // Verificar se o usuá¡rio á© parte do chat
+    const [chat] = await sql`
+      SELECT participant1_id, participant2_id
+      FROM chats
+      WHERE id = ${id_chat}
+    `;
+
+    if (!chat || (chat.participant1_id !== userId && chat.participant2_id !== userId)) {
+      return res.status(403).json({
+        error: "Vocáª ná£o tem permissá£o para atualizar este chat.",
+      });
+    }
+
+    // Atualizar o chat
+    const [updatedChat] = await sql`
+      UPDATE chats
       SET
-        nome = ${nome},
-        descricao = ${descricao},
-        imageurl = ${imageurl},
-        calorias = COALESCE(${calorias || null}, calorias),
-        tempo_preparo = COALESCE(${tempo_preparo || null}, tempo_preparo),
-        gordura = COALESCE(${gordura || null}, gordura),
-        proteina = COALESCE(${proteina || null}, proteina),
-        carboidratos = COALESCE(${carboidratos || null}, carboidratos),
-        nome_autor = COALESCE(${nome_autor || null}, nome_autor),
-        avatar_autor_url = COALESCE(${avatar_autor_url || null}, avatar_autor_url),
-        categoria = ${categoria},
-        updatedat = ${new Date()}
-      WHERE id_dieta = ${id_dieta} AND id_us = ${userId}
+        last_message = COALESCE(${last_message || null}, last_message),
+        last_timestamp = COALESCE(${last_timestamp || new Date()}, last_timestamp)
+      WHERE id = ${id_chat}
       RETURNING *;
     `;
 
-    if (!updatedDieta) {
+    if (!updatedChat) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para editá-la.",
+        error: "Chat ná£o encontrado ou vocáª ná£o tem permissá£o para editá¡-lo.",
       });
     }
+
     res
       .status(200)
-      .json({ message: "Dieta atualizada com sucesso!", data: updatedDieta });
+      .json({ message: "Chat atualizado com sucesso!", data: updatedChat });
   } catch (error) {
-    console.error("Erro ao editar dieta:", error);
+    console.error("Erro ao editar chat:", error);
     res.status(500).json({
-      error: "Erro interno do servidor ao editar dieta.",
+      error: "Erro interno do servidor ao editar chat.",
       details: error.message,
     });
   }
 });
 
 app.delete("/api/chat/:id_chat", verifyToken, async (req, res) => {
-  console.log("Rota DELETE /api/dietas/:id_dieta atingida");
+
   const userId = req.userId;
-  const { id_dieta } = req.params;
+  const { id_chat } = req.params;
 
   try {
-    const [deletedDieta] = await sql`
-      DELETE FROM dietas
-      WHERE id_dieta = ${id_dieta} AND id_us = ${userId}
+    // Verificar se o usuá¡rio á© parte do chat
+    const [chat] = await sql`
+      SELECT participant1_id, participant2_id
+      FROM chats
+      WHERE id = ${id_chat}
+    `;
+
+    if (!chat || (chat.participant1_id !== userId && chat.participant2_id !== userId)) {
+      return res.status(403).json({
+        error: "Vocáª ná£o tem permissá£o para excluir este chat.",
+      });
+    }
+
+    const [deletedChat] = await sql`
+      DELETE FROM chats
+      WHERE id = ${id_chat} AND (participant1_id = ${userId} OR participant2_id = ${userId})
       RETURNING *;
     `;
 
-    if (!deletedDieta) {
+    if (!deletedChat) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para excluí-la.",
+        error: "Chat ná£o encontrado ou vocáª ná£o tem permissá£o para excluá­-lo.",
       });
     }
-    res.status(200).json({ message: "Dieta excluída com sucesso!" });
+    res.status(200).json({ message: "Chat excluá­do com sucesso!" });
   } catch (error) {
-    console.error("Erro ao excluir dieta:", error);
+    console.error("Erro ao excluir chat:", error);
     res.status(500).json({
-      error: "Erro interno do servidor ao excluir dieta.",
+      error: "Erro interno do servidor ao excluir chat.",
       details: error.message,
     });
+  }
+});
+
+// Rota para enviar mensagem
+app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
+
+  const userId = req.userId; // ID do banco (inteiro)
+  const { id_chat } = req.params;
+  const { text, image_url } = req.body;
+
+  if (!text && !image_url) {
+    return res.status(400).json({ error: "Texto ou imagem á© obrigatá³rio." });
+  }
+
+  try {
+    // Obter UUID do Supabase diretamente da tabela usuarios
+    const [user] = await sql`SELECT auth_user_id FROM usuarios WHERE id_us = ${userId}`;
+    if (!user || !user.auth_user_id) {
+      return res.status(404).json({ error: "ID de autenticaçáo ná£o encontrado para este usuá¡rio." });
+    }
+    const supabaseUserId = user.auth_user_id;
+
+    // Verificar se o usuá¡rio faz parte do chat
+    const { data: chat, error: chatErr } = await supabase
+      .from('chats')
+      .select('id, participant1_id, participant2_id')
+      .eq('id', id_chat)
+      .single();
+
+    if (chatErr || !chat) {
+      return res.status(404).json({ error: "Chat ná£o encontrado." });
+    }
+
+    if (chat.participant1_id !== supabaseUserId && chat.participant2_id !== supabaseUserId) {
+      return res.status(403).json({ error: "Sem permissá£o para este chat." });
+    }
+
+    const encryptedText = text ? encryptMessage(text) : null;
+
+    const { data: newMessage, error: msgErr } = await supabase
+      .from('messages')
+      .insert({
+        chat_id: id_chat,
+        sender_id: supabaseUserId,
+        text: encryptedText,
+        image_url: image_url || null,
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (msgErr) throw msgErr;
+
+    // Atualizar meta do chat
+    await supabase.from('chats').update({
+      last_message: text || 'Imagem',
+      last_timestamp: new Date().toISOString()
+    }).eq('id', id_chat);
+
+    res.status(201).json({ data: newMessage });
+  } catch (error) {
+    console.error("Erro no POST messages:", error);
+    res.status(500).json({ error: "Erro interno", details: error.message });
+  }
+});
+
+// Rota para obter mensagens de um chat
+app.get("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
+
+  const userId = req.userId;
+  const { id_chat } = req.params;
+  const { limit = 50, offset = 0 } = req.query;
+
+  try {
+    const [user] = await sql`SELECT auth_user_id FROM usuarios WHERE id_us = ${userId}`;
+    if (!user || !user.auth_user_id) {
+      return res.status(404).json({ error: "ID de autenticaçáo ná£o encontrado." });
+    }
+    const supabaseUserId = user.auth_user_id;
+
+    const { data: chat, error: chatErr } = await supabase
+      .from('chats')
+      .select('id, participant1_id, participant2_id')
+      .eq('id', id_chat)
+      .single();
+
+    if (chatErr || !chat) {
+      return res.status(404).json({ error: "Chat ná£o encontrado." });
+    }
+
+    if (chat.participant1_id !== supabaseUserId && chat.participant2_id !== supabaseUserId) {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+
+    const { data: rawMessages, error: msgErr } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('chat_id', id_chat)
+      .order('created_at', { ascending: false })
+      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+    if (msgErr) throw msgErr;
+
+    const messages = rawMessages.map(m => ({
+      ...m,
+      text: m.text ? decryptMessage(m.text) : m.text
+    }));
+
+    res.status(200).json({ data: messages });
+  } catch (error) {
+    console.error("Erro no GET messages:", error);
+    res.status(500).json({ error: "Erro interno", details: error.message });
   }
 });
 
 // -------------------------------- PROFILE ---------------------------- //
 
 app.post("/api/profile", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/dietas ===");
+  console.log("=== INáCIO DA ROTA POST /api/dietas ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -1907,76 +2883,76 @@ app.post("/api/profile", verifyToken, async (req, res) => {
   } = req.body;
   const descricao = req.body.descricao ?? req.body.descripcion ?? null;
 
-  // Log dos dados extraídos
-  console.log("--- DADOS EXTRAÍDOS ---");
+  // Log dos dados extraá­dos
+  console.log("--- DADOS EXTRAáDOS ---");
   console.log("Nome:", nome);
-  console.log("Descrição:", descricao);
+  console.log("Descriçáo:", descricao);
   console.log("Image URL:", imageurl);
   console.log("Categoria:", categoria);
   console.log("Calorias:", calorias);
   console.log("Tempo de preparo:", tempo_preparo);
   console.log("Gordura:", gordura);
-  console.log("Proteína:", proteina);
+  console.log("Proteá­na:", proteina);
   console.log("Carboidratos:", carboidratos);
 
-  // Validação com logs detalhados
-  console.log("--- VALIDAÇÃO DOS DADOS ---");
+  // Validaçáo com logs detalhados
+  console.log("--- VALIDAá‡áƒO DOS DADOS ---");
   const validationErrors = [];
 
   if (!nome) {
-    validationErrors.push("Nome é obrigatório");
-    console.log("❌ ERRO: Nome não fornecido");
+    validationErrors.push("Nome á© obrigatá³rio");
+    console.log("âŒ ERRO: Nome ná£o fornecido");
   } else {
-    console.log("✅ Nome válido:", nome);
+    console.log("âœ… Nome vá¡lido:", nome);
   }
 
   if (!descricao) {
-    validationErrors.push("Descrição é obrigatória");
-    console.log("❌ ERRO: Descrição não fornecida");
+    validationErrors.push("Descriçáo á© obrigatá³ria");
+    console.log("âŒ ERRO: Descriçáo ná£o fornecida");
   } else {
-    console.log("✅ Descrição válida:", descricao.substring(0, 50) + "...");
+    console.log("âœ… Descriçáo vá¡lida:", descricao.substring(0, 50) + "...");
   }
 
   if (!imageurl) {
-    validationErrors.push("URL da imagem é obrigatória");
-    console.log("❌ ERRO: URL da imagem não fornecida");
+    validationErrors.push("URL da imagem á© obrigatá³ria");
+    console.log("âŒ ERRO: URL da imagem ná£o fornecida");
   } else {
-    console.log("✅ URL da imagem válida:", imageurl);
+    console.log("âœ… URL da imagem vá¡lida:", imageurl);
   }
 
   if (!categoria) {
-    validationErrors.push("Categoria é obrigatória");
-    console.log("❌ ERRO: Categoria não fornecida");
+    validationErrors.push("Categoria á© obrigatá³ria");
+    console.log("âŒ ERRO: Categoria ná£o fornecida");
   } else {
-    console.log("✅ Categoria válida:", categoria);
+    console.log("âœ… Categoria vá¡lida:", categoria);
   }
 
   if (validationErrors.length > 0) {
-    console.log("--- FALHA NA VALIDAÇÃO ---");
+    console.log("--- FALHA NA VALIDAá‡áƒO ---");
     console.log("Erros encontrados:", validationErrors);
     console.log("=== FIM DA ROTA POST /api/dietas (ERRO 400) ===");
     return res.status(400).json({
-      error: "Dados obrigatórios não fornecidos.",
+      error: "Dados obrigatá³rios ná£o fornecidos.",
       details: validationErrors,
     });
   }
 
-  console.log("✅ Todas as validações passaram");
+  console.log("âœ… Todas as validaá§áµes passaram");
 
   try {
     console.log("--- BUSCANDO DADOS DO AUTOR ---");
-    console.log("Buscando usuário com ID:", userId);
+    console.log("Buscando usuá¡rio com ID:", userId);
 
     const [author] =
       await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
 
     if (!author) {
-      console.log("❌ ERRO: Usuário autor não encontrado no banco de dados");
+      console.log("âŒ ERRO: Usuá¡rio autor ná£o encontrado no banco de dados");
       console.log("=== FIM DA ROTA POST /api/dietas (ERRO 404) ===");
-      return res.status(404).json({ error: "Usuário autor não encontrado." });
+      return res.status(404).json({ error: "Usuá¡rio autor ná£o encontrado." });
     }
 
-    console.log("✅ Autor encontrado:", {
+    console.log("âœ… Autor encontrado:", {
       nome: author.nome,
       username: author.username,
       email: author.email,
@@ -1985,7 +2961,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
     const authorName = author.nome || author.username || null;
     const authorAvatarUrl = getGravatarUrl(author.email);
 
-    console.log("--- PREPARANDO DADOS PARA INSERÇÃO ---");
+    console.log("--- PREPARANDO DADOS PARA INSERá‡áƒO ---");
     console.log("Nome do autor:", authorName);
     console.log("Avatar URL do autor:", authorAvatarUrl);
 
@@ -2005,12 +2981,12 @@ app.post("/api/profile", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log("✅ Dieta inserida com sucesso no banco de dados");
+    console.log("âœ… Dieta inserida com sucesso no banco de dados");
     console.log("--- DADOS DA DIETA CRIADA ---");
     console.log("ID da dieta:", newDieta.id_dieta);
     console.log("Nome:", newDieta.nome);
     console.log("Categoria:", newDieta.categoria);
-    console.log("Data de criação:", newDieta.createdat);
+    console.log("Data de criaçáo:", newDieta.createdat);
 
     console.log("--- RESPOSTA DE SUCESSO ---");
     console.log("Status: 201 - Created");
@@ -2021,10 +2997,10 @@ app.post("/api/profile", verifyToken, async (req, res) => {
       data: newDieta,
     });
   } catch (error) {
-    console.log("--- ERRO DURANTE A EXECUÇÃO ---");
-    console.error("❌ ERRO ao criar dieta:", error);
+    console.log("--- ERRO DURANTE A EXECUá‡áƒO ---");
+    console.error("âŒ ERRO ao criar dieta:", error);
     console.log("Tipo do erro:", error.constructor.name);
-    console.log("Código do erro:", error.code);
+    console.log("Cá³digo do erro:", error.code);
     console.log("Mensagem do erro:", error.message);
     console.log("Stack trace:", error.stack);
 
@@ -2040,7 +3016,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
 });
 
 app.get("/api/profile", verifyToken, async (req, res) => {
-  console.log("Rota GET /api/dietas atingida");
+
   const userId = req.userId;
   const { categoria } = req.query;
 
@@ -2065,7 +3041,7 @@ app.get("/api/profile", verifyToken, async (req, res) => {
 });
 
 app.put("/api/profile/:id_profile", verifyToken, async (req, res) => {
-  console.log("Rota PUT /api/dietas/:id_dieta atingida");
+
   const userId = req.userId;
   const { id_dieta } = req.params;
   const {
@@ -2085,7 +3061,7 @@ app.put("/api/profile/:id_profile", verifyToken, async (req, res) => {
   if (!nome || !descricao || !imageurl || !categoria) {
     return res
       .status(400)
-      .json({ error: "Nome, descrição, imagem e categoria são obrigatórios." });
+      .json({ error: "Nome, descriçáo, imagem e categoria sá£o obrigatá³rios." });
   }
 
   try {
@@ -2110,7 +3086,7 @@ app.put("/api/profile/:id_profile", verifyToken, async (req, res) => {
 
     if (!updatedDieta) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para editá-la.",
+        error: "Dieta ná£o encontrada ou vocáª ná£o tem permissá£o para editá¡-la.",
       });
     }
     res
@@ -2126,7 +3102,7 @@ app.put("/api/profile/:id_profile", verifyToken, async (req, res) => {
 });
 
 app.delete("/api/profile/:id_profile", verifyToken, async (req, res) => {
-  console.log("Rota DELETE /api/dietas/:id_dieta atingida");
+
   const userId = req.userId;
   const { id_dieta } = req.params;
 
@@ -2139,10 +3115,10 @@ app.delete("/api/profile/:id_profile", verifyToken, async (req, res) => {
 
     if (!deletedDieta) {
       return res.status(404).json({
-        error: "Dieta não encontrada ou você não tem permissão para excluí-la.",
+        error: "Dieta ná£o encontrada ou vocáª ná£o tem permissá£o para excluá­-la.",
       });
     }
-    res.status(200).json({ message: "Dieta excluída com sucesso!" });
+    res.status(200).json({ message: "Dieta excluá­da com sucesso!" });
   } catch (error) {
     console.error("Erro ao excluir dieta:", error);
     res.status(500).json({
@@ -2155,13 +3131,29 @@ app.delete("/api/profile/:id_profile", verifyToken, async (req, res) => {
 // -------------------------------- COMUNIDADES ---------------------------- //
 
 app.get("/api/comunidades", verifyToken, async (req, res) => {
-  console.log("Rota GET /api/comunidades atingida");
+
   const userId = req.userId;
   const { categoria } = req.query;
 
   try {
     let query = sql`
-      SELECT id_comunidade, nome, descricao, imageurl, participantes, max_participantes, categoria, tipo_comunidade
+      SELECT 
+        id_comunidade, 
+        nome, 
+        descricao, 
+        imageurl, 
+        participantes, 
+        max_participantes, 
+        categoria, 
+        tipo_comunidade,
+        duracao,
+        calorias,
+        data_evento,
+        faixa_etaria,
+        premiacao,
+        local_inicio,
+        local_fim,
+        telefone_contato
       FROM comunidades
     `;
 
@@ -2184,12 +3176,29 @@ app.get("/api/comunidades", verifyToken, async (req, res) => {
 
 // GET: Detalhes de uma comunidade específica
 app.get("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
-  console.log("Rota GET /api/comunidades/:id_comunidade atingida");
+
   const { id_comunidade } = req.params;
 
   try {
     const [comunidade] = await sql`
-      SELECT id_comunidade, nome, descricao, imageurl, participantes, max_participantes, categoria, tipo_comunidade, id_us
+      SELECT 
+        id_comunidade, 
+        nome, 
+        descricao, 
+        imageurl, 
+        participantes, 
+        max_participantes, 
+        categoria, 
+        tipo_comunidade, 
+        id_us,
+        duracao,
+        calorias,
+        data_evento,
+        faixa_etaria,
+        premiacao,
+        local_inicio,
+        local_fim,
+        telefone_contato
       FROM comunidades
       WHERE id_comunidade = ${id_comunidade}
     `;
@@ -2210,12 +3219,12 @@ app.get("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
 
 // POST: Criar nova comunidade
 app.post("/api/comunidades", verifyToken, async (req, res) => {
-  console.log("Rota POST /api/comunidades atingida");
+
   const userId = req.userId;
   const { nome, descricao, imageurl, max_participantes, categoria, tipo_comunidade } = req.body;
 
   if (!nome || !categoria) {
-    return res.status(400).json({ error: "Nome e categoria são obrigatórios." });
+    return res.status(400).json({ error: "Nome e categoria sá£o obrigatá³rios." });
   }
 
   try {
@@ -2239,9 +3248,9 @@ app.post("/api/comunidades", verifyToken, async (req, res) => {
   }
 });
 
-// POST: Entrar na comunidade (Simulação de incremento)
+// POST: Entrar na comunidade (Simulaçáo de incremento)
 app.post("/api/comunidades/:id_comunidade/entrar", verifyToken, async (req, res) => {
-  console.log("Rota POST /api/comunidades/:id_comunidade/entrar atingida");
+
   const { id_comunidade } = req.params;
 
   try {
@@ -2254,10 +3263,10 @@ app.post("/api/comunidades/:id_comunidade/entrar", verifyToken, async (req, res)
     `;
 
     if (!updated) {
-      return res.status(404).json({ error: "Comunidade não encontrada." });
+      return res.status(404).json({ error: "Comunidade ná£o encontrada." });
     }
 
-    res.status(200).json({ message: "Você entrou na comunidade!", data: updated });
+    res.status(200).json({ message: "Vocáª entrou na comunidade!", data: updated });
   } catch (error) {
     console.error("Erro ao entrar na comunidade:", error);
     res.status(500).json({
@@ -2268,7 +3277,7 @@ app.post("/api/comunidades/:id_comunidade/entrar", verifyToken, async (req, res)
 });
 
 app.delete("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
-  console.log("Rota DELETE /api/comunidades/:id_comunidade atingida");
+
   const userId = req.userId;
   const { id_comunidade } = req.params;
 
@@ -2281,10 +3290,10 @@ app.delete("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
 
     if (!deletedCommunity) {
       return res.status(404).json({
-        error: "Comunidade não encontrada ou você não tem permissão para excluí-la.",
+        error: "Comunidade ná£o encontrada ou vocáª ná£o tem permissá£o para excluá­-la.",
       });
     }
-    res.status(200).json({ message: "Comunidade excluída com sucesso!" });
+    res.status(200).json({ message: "Comunidade excluá­da com sucesso!" });
   } catch (error) {
     console.error("Erro ao excluir comunidade:", error);
     res.status(500).json({
@@ -2294,11 +3303,153 @@ app.delete("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
   }
 });
 
+// -------------------------------- ACADEMIAS PARCEIRAS ---------------------------- //
+
+// GET: Listar todas as academias ativas
+app.get("/api/academias", verifyToken, async (req, res) => {
+  try {
+    const academias = await sql`
+      SELECT 
+        id_academia,
+        nome,
+        rating,
+        total_avaliacoes,
+        endereco_completo,
+        rua,
+        numero,
+        bairro,
+        cidade,
+        estado,
+        cep,
+        latitude,
+        longitude,
+        telefone,
+        whatsapp,
+        ativo
+      FROM academias
+      WHERE ativo = TRUE
+      ORDER BY rating DESC, total_avaliacoes DESC
+    `;
+
+    res.status(200).json({ data: academias });
+  } catch (error) {
+    console.error("Erro ao listar academias:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao listar academias.",
+      details: error.message,
+    });
+  }
+});
+
+// GET: Buscar academias próximas (usando fórmula Haversine)
+// IMPORTANTE: Esta rota deve vir ANTES de /academias/:id_academia
+app.get("/api/academias/nearby", verifyToken, async (req, res) => {
+  const { lat, lng, raio = 10 } = req.query;
+
+  if (!lat || !lng) {
+    return res.status(400).json({
+      error: "Parâmetros 'lat' e 'lng' são obrigatórios."
+    });
+  }
+
+  const latitude = parseFloat(lat);
+  const longitude = parseFloat(lng);
+  const raioKm = parseFloat(raio);
+
+  try {
+    // Fórmula Haversine para calcular distância usando subquery
+    const academias = await sql`
+      SELECT * FROM (
+        SELECT 
+          id_academia,
+          nome,
+          rating,
+          total_avaliacoes,
+          endereco_completo,
+          rua,
+          numero,
+          bairro,
+          cidade,
+          estado,
+          cep,
+          latitude,
+          longitude,
+          telefone,
+          whatsapp,
+          (
+            6371 * acos(
+              LEAST(1, GREATEST(-1, 
+                cos(radians(${latitude})) * 
+                cos(radians(latitude)) * 
+                cos(radians(longitude) - radians(${longitude})) + 
+                sin(radians(${latitude})) * 
+                sin(radians(latitude))
+              ))
+            )
+          ) AS distancia_km
+        FROM academias
+        WHERE ativo = TRUE
+      ) AS academias_com_distancia
+      WHERE distancia_km <= ${raioKm}
+      ORDER BY distancia_km ASC
+    `;
+
+    res.status(200).json({ data: academias });
+  } catch (error) {
+    console.error("Erro ao buscar academias próximas:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao buscar academias próximas.",
+      details: error.message,
+    });
+  }
+});
+
+// GET: Detalhes de uma academia específica
+app.get("/api/academias/:id_academia", verifyToken, async (req, res) => {
+  const { id_academia } = req.params;
+
+  try {
+    const [academia] = await sql`
+      SELECT 
+        id_academia,
+        nome,
+        rating,
+        total_avaliacoes,
+        endereco_completo,
+        rua,
+        numero,
+        bairro,
+        cidade,
+        estado,
+        cep,
+        latitude,
+        longitude,
+        telefone,
+        whatsapp,
+        ativo
+      FROM academias
+      WHERE id_academia = ${id_academia} AND ativo = TRUE
+    `;
+
+    if (!academia) {
+      return res.status(404).json({ error: "Academia não encontrada." });
+    }
+
+    res.status(200).json({ data: academia });
+  } catch (error) {
+    console.error("Erro ao buscar detalhes da academia:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao buscar detalhes da academia.",
+      details: error.message,
+    });
+  }
+});
+
 // -------------------------------- DADOS DE CALORIAS ---------------------------- //
 
 // GET: Buscar dados de calorias
 app.get("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA GET /api/dados/calories ===");
+  console.log("=== INáCIO DA ROTA GET /api/dados/calories ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -2336,9 +3487,9 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
         startDate.setDate(startDate.getDate() - 7);
     }
 
-    console.log("Buscando dados de calorias de", startDate, "até", endDate);
+    console.log("Buscando dados de calorias de", startDate, "atá©", endDate);
 
-    // Busca os dados de calorias do usuário
+    // Busca os dados de calorias do usuá¡rio
     const caloriesData = await sql`
       SELECT 
         id_dado,
@@ -2353,9 +3504,9 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
       ORDER BY timestamp ASC
     `;
 
-    console.log(`✅ Encontrados ${caloriesData.length} registros de calorias`);
+    console.log(`âœ… Encontrados ${caloriesData.length} registros de calorias`);
 
-    // Agrupa dados se necessário
+    // Agrupa dados se necessá¡rio
     const groupedData = {};
     caloriesData.forEach((item) => {
       const key = item.period.toISOString();
@@ -2371,20 +3522,20 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
       groupedData[key].count += 1;
     });
 
-    // Calcula a média de calorias por período
+    // Calcula a má©dia de calorias por perá­odo
     const processedData = Object.values(groupedData).map((item) => ({
       date: item.date,
       calories: Math.round(item.calories / item.count),
       timestamp: item.timestamp,
     }));
 
-    // Se não houver dados, gera dados mockados
+    // Se ná£o houver dados, gera dados mockados
     const data =
       processedData.length > 0
         ? processedData
         : generateMockCaloriesData(timeframe);
 
-    // Calcula estatísticas
+    // Calcula estatá­sticas
     const totalCalories = data[data.length - 1]?.calories || 0;
     const dailyGoal = 2000;
     const remainingCalories = Math.max(0, dailyGoal - totalCalories);
@@ -2399,12 +3550,12 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
     console.log("--- RESPOSTA DE SUCESSO ---");
     console.log("Total de calorias:", totalCalories);
     console.log("Calorias restantes:", remainingCalories);
-    console.log("Total de pontos no gráfico:", data.length);
+    console.log("Total de pontos no grá¡fico:", data.length);
     console.log("=== FIM DA ROTA GET /api/dados/calories (SUCESSO) ===");
 
     res.status(200).json(response);
   } catch (error) {
-    console.error("❌ Erro ao buscar dados de calorias:", error);
+    console.error("âŒ Erro ao buscar dados de calorias:", error);
     console.log("=== FIM DA ROTA GET /api/dados/calories (ERRO 500) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao buscar dados de calorias.",
@@ -2415,7 +3566,7 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
 
 // POST: Salvar dados de calorias
 app.post("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/dados/calories ===");
+  console.log("=== INáCIO DA ROTA POST /api/dados/calories ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
   console.log("Body:", req.body);
@@ -2424,8 +3575,8 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
   const { calories, timestamp } = req.body;
 
   if (!calories) {
-    console.log("❌ Erro: Calorias não fornecidas");
-    return res.status(400).json({ error: "Calorias são obrigatórias." });
+    console.log("âŒ Erro: Calorias ná£o fornecidas");
+    return res.status(400).json({ error: "Calorias sá£o obrigatá³rias." });
   }
 
   try {
@@ -2441,7 +3592,7 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log("✅ Registro de calorias criado com sucesso");
+    console.log("âœ… Registro de calorias criado com sucesso");
     console.log("ID do registro:", newRecord.id_dado);
     console.log("=== FIM DA ROTA POST /api/dados/calories (SUCESSO) ===");
 
@@ -2450,7 +3601,7 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
       data: newRecord,
     });
   } catch (error) {
-    console.error("❌ Erro ao salvar dados de calorias:", error);
+    console.error("âŒ Erro ao salvar dados de calorias:", error);
     console.log("=== FIM DA ROTA POST /api/dados/calories (ERRO 500) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao salvar dados de calorias.",
@@ -2461,30 +3612,30 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
 
 // -------------------------------- WEAR OS DEVICES ---------------------------- //
 
-// POST: Registrar automaticamente um dispositivo Wear OS ✅
+// POST: Registrar automaticamente um dispositivo Wear OS âœ…
 app.post("/api/wearos/register", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/wearos/register-device ===");
+  console.log("=== INáCIO DA ROTA POST /api/wearos/register-device ===");
   console.log("User ID:", req.userId);
   console.log("Body recebido:", req.body);
 
   const userId = req.userId;
-  const { 
-    deviceName, 
-    deviceModel, 
-    deviceType = "Wear OS", 
-    deviceVersion, 
-    tokenAcesso 
+  const {
+    deviceName,
+    deviceModel,
+    deviceType = "Wear OS",
+    deviceVersion,
+    tokenAcesso
   } = req.body;
 
   if (!deviceName || !deviceModel) {
-    console.log("❌ Erro: Nome e modelo do dispositivo são obrigatórios");
-    return res.status(400).json({ 
-      error: "Nome e modelo do dispositivo são obrigatórios." 
+    console.log("âŒ Erro: Nome e modelo do dispositivo sá£o obrigatá³rios");
+    return res.status(400).json({
+      error: "Nome e modelo do dispositivo sá£o obrigatá³rios."
     });
   }
 
   try {
-    // Verificar se já existe um dispositivo com este modelo para o usuário
+    // Verificar se já¡ existe um dispositivo com este modelo para o usuá¡rio
     const existingDevice = await sql`
       SELECT id_disp FROM dispositivos
       WHERE id_us = ${userId}
@@ -2493,9 +3644,9 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
     `;
 
     if (existingDevice.length > 0) {
-      console.log("✅ Dispositivo já registrado para o usuário:", existingDevice[0].id_disp);
+      console.log("âœ… Dispositivo já¡ registrado para o usuá¡rio:", existingDevice[0].id_disp);
       return res.status(200).json({
-        message: "Dispositivo já estava registrado",
+        message: "Dispositivo já¡ estava registrado",
         deviceId: existingDevice[0].id_disp,
         device: existingDevice[0]
       });
@@ -2513,7 +3664,7 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log("✅ Dispositivo registrado com sucesso:", newDevice.id_disp);
+    console.log("âœ… Dispositivo registrado com sucesso:", newDevice.id_disp);
     console.log("=== FIM DA ROTA POST /api/wearos/register-device ===");
 
     res.status(201).json({
@@ -2522,7 +3673,7 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
       device: newDevice
     });
   } catch (error) {
-    console.error("❌ Erro ao registrar dispositivo Wear OS:", error);
+    console.error("âŒ Erro ao registrar dispositivo Wear OS:", error);
     console.log("=== FIM DA ROTA POST /api/wearos/register-device (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao registrar dispositivo.",
@@ -2531,9 +3682,9 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
   }
 });
 
-// GET: Listar dispositivos Wear OS do usuário ✅
+// GET: Listar dispositivos Wear OS do usuá¡rio âœ…
 app.get("/api/wearos/devices", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA GET /api/wearos/devices ===");
+  console.log("=== INáCIO DA ROTA GET /api/wearos/devices ===");
   console.log("User ID:", req.userId);
 
   const userId = req.userId;
@@ -2547,7 +3698,7 @@ app.get("/api/wearos/devices", verifyToken, async (req, res) => {
       ORDER BY createdat DESC;
     `;
 
-    console.log(`✅ Encontrados ${devices.length} dispositivos Wear OS`);
+    console.log(`âœ… Encontrados ${devices.length} dispositivos Wear OS`);
     console.log("=== FIM DA ROTA GET /api/wearos/devices ===");
 
     res.status(200).json({
@@ -2556,7 +3707,7 @@ app.get("/api/wearos/devices", verifyToken, async (req, res) => {
       count: devices.length
     });
   } catch (error) {
-    console.error("❌ Erro ao listar dispositivos Wear OS:", error);
+    console.error("âŒ Erro ao listar dispositivos Wear OS:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/devices (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao listar dispositivos.",
@@ -2565,9 +3716,9 @@ app.get("/api/wearos/devices", verifyToken, async (req, res) => {
   }
 });
 
-// GET: Verificar se o usuário tem dispositivos Wear OS registrados ✅
+// GET: Verificar se o usuá¡rio tem dispositivos Wear OS registrados âœ…
 app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA GET /api/wearos/has-devices ===");
+  console.log("=== INáCIO DA ROTA GET /api/wearos/has-devices ===");
   console.log("User ID:", req.userId);
 
   const userId = req.userId;
@@ -2582,7 +3733,7 @@ app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
 
     const hasDevices = result[0].device_count > 0;
 
-    console.log(`✅ Usuário ${userId} tem ${result[0].device_count} dispositivos Wear OS`);
+    console.log(`âœ… Usuá¡rio ${userId} tem ${result[0].device_count} dispositivos Wear OS`);
     console.log("=== FIM DA ROTA GET /api/wearos/has-devices ===");
 
     res.status(200).json({
@@ -2590,7 +3741,7 @@ app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
       deviceCount: parseInt(result[0].device_count)
     });
   } catch (error) {
-    console.error("❌ Erro ao verificar dispositivos Wear OS:", error);
+    console.error("âŒ Erro ao verificar dispositivos Wear OS:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/has-devices (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao verificar dispositivos.",
@@ -2599,9 +3750,9 @@ app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
   }
 });
 
-// POST: Registrar dados de saúde do Wear OS
+// POST: Registrar dados de saáºde do Wear OS
 app.post("/api/wearos/health", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA POST /api/wearos/health-data ===");
+  console.log("=== INáCIO DA ROTA POST /api/wearos/health-data ===");
   console.log("User ID:", req.userId);
   console.log("Body recebido:", JSON.stringify(req.body, null, 2));
 
@@ -2617,13 +3768,13 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
   } = req.body;
 
   if (!deviceId) {
-    console.log("❌ Erro: ID do dispositivo é obrigatório");
+    console.log("âŒ Erro: ID do dispositivo á© obrigatá³rio");
     return res.status(400).json({
-      error: "ID do dispositivo é obrigatório."
+      error: "ID do dispositivo á© obrigatá³rio."
     });
   }
 
-  // Verificar se o dispositivo pertence ao usuário
+  // Verificar se o dispositivo pertence ao usuá¡rio
   const deviceCheck = await sql`
     SELECT id_disp FROM dispositivos
     WHERE id_disp = ${deviceId}
@@ -2631,16 +3782,16 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
   `;
 
   if (deviceCheck.length === 0) {
-    console.log("❌ Erro: Dispositivo não encontrado ou não pertence ao usuário");
+    console.log("âŒ Erro: Dispositivo ná£o encontrado ou ná£o pertence ao usuá¡rio");
     return res.status(404).json({
-      error: "Dispositivo não encontrado ou não pertence ao usuário."
+      error: "Dispositivo ná£o encontrado ou ná£o pertence ao usuá¡rio."
     });
   }
 
   try {
     const healthRecords = [];
 
-    // Registrar dados de frequência cardíaca (usando tabela healthkit)
+    // Registrar dados de frequáªncia cardá­aca (usando tabela healthkit)
     if (heartRate !== null && heartRate !== undefined) {
       const [heartRateRecord] = await sql`
         INSERT INTO healthkit (
@@ -2655,7 +3806,7 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
       healthRecords.push(heartRateRecord);
     }
 
-    // Registrar dados de pressão arterial (usando tabela healthkit)
+    // Registrar dados de pressá£o arterial (usando tabela healthkit)
     if (bloodPressure !== null && bloodPressure !== undefined) {
       const [pressureRecord] = await sql`
         INSERT INTO healthkit (
@@ -2670,7 +3821,7 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
       healthRecords.push(pressureRecord);
     }
 
-    // Registrar dados de oxigênio (usando tabela healthkit)
+    // Registrar dados de oxigáªnio (usando tabela healthkit)
     if (oxygenSaturation !== null && oxygenSaturation !== undefined) {
       const [oxygenRecord] = await sql`
         INSERT INTO healthkit (
@@ -2685,33 +3836,33 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
       healthRecords.push(oxygenRecord);
     }
 
-    console.log(`✅ ${healthRecords.length} registros de saúde criados para o dispositivo ${deviceId}`);
+    console.log(`âœ… ${healthRecords.length} registros de saáºde criados para o dispositivo ${deviceId}`);
     console.log("=== FIM DA ROTA POST /api/wearos/health-data ===");
 
     res.status(201).json({
-      message: "Dados de saúde registrados com sucesso!",
+      message: "Dados de saáºde registrados com sucesso!",
       records: healthRecords,
       count: healthRecords.length
     });
   } catch (error) {
-    console.error("❌ Erro ao registrar dados de saúde:", error);
+    console.error("âŒ Erro ao registrar dados de saáºde:", error);
     console.log("=== FIM DA ROTA POST /api/wearos/health-data (ERRO) ===");
     res.status(500).json({
-      error: "Erro interno do servidor ao registrar dados de saúde.",
+      error: "Erro interno do servidor ao registrar dados de saáºde.",
       details: error.message
     });
   }
 });
 
-// GET: Obter dados de saúde mais recentes de dispositivos Wear OS ✅
+// GET: Obter dados de saáºde mais recentes de dispositivos Wear OS âœ…
 app.get("/api/wearos/health", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA GET /api/wearos/latest-health-data ===");
+  console.log("=== INáCIO DA ROTA GET /api/wearos/latest-health-data ===");
   console.log("User ID:", req.userId);
 
   const userId = req.userId;
 
   try {
-    // Primeiro, obter os dispositivos Wear OS do usuário
+    // Primeiro, obter os dispositivos Wear OS do usuá¡rio
     const devices = await sql`
       SELECT id_disp FROM dispositivos
       WHERE id_us = ${userId}
@@ -2720,7 +3871,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
     `;
 
     if (devices.length === 0) {
-      console.log("✅ Nenhum dispositivo Wear OS encontrado para o usuário");
+      console.log("âœ… Nenhum dispositivo Wear OS encontrado para o usuá¡rio");
       return res.status(200).json({
         message: "Nenhum dispositivo Wear OS registrado",
         heartRate: null,
@@ -2730,9 +3881,9 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
       });
     }
 
-    // Obter os dados de saúde mais recentes para cada tipo da tabela healthkit
+    // Obter os dados de saáºde mais recentes para cada tipo da tabela healthkit
     const [heartRateData, pressureData, oxygenData] = await Promise.all([
-      // Frequência cardíaca
+      // Frequáªncia cardá­aca
       sql`
         SELECT h.valor, h.createdat, d.nome as device_name
         FROM healthkit h
@@ -2743,7 +3894,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
         LIMIT 1;
       `,
 
-      // Pressão arterial
+      // Pressá£o arterial
       sql`
         SELECT h.valor, h.createdat, d.nome as device_name
         FROM healthkit h
@@ -2754,7 +3905,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
         LIMIT 1;
       `,
 
-      // Oxigênio (SpO2)
+      // Oxigáªnio (SpO2)
       sql`
         SELECT h.valor, h.createdat, d.nome as device_name
         FROM healthkit h
@@ -2767,7 +3918,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
     ]);
 
     const result = {
-      message: "Dados de saúde mais recentes recuperados",
+      message: "Dados de saáºde mais recentes recuperados",
       heartRate: heartRateData[0]?.valor ? parseFloat(heartRateData[0].valor) : null,
       pressure: pressureData[0]?.valor ? parseFloat(pressureData[0].valor) : null,
       oxygen: oxygenData[0]?.valor ? parseFloat(oxygenData[0].valor) : null,
@@ -2780,7 +3931,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
       deviceCount: devices.length
     };
 
-    console.log("✅ Dados de saúde recuperados com sucesso");
+    console.log("âœ… Dados de saáºde recuperados com sucesso");
     console.log("Heart Rate:", result.heartRate);
     console.log("Pressure:", result.pressure);
     console.log("Oxygen:", result.oxygen);
@@ -2788,25 +3939,25 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
 
     res.status(200).json(result);
   } catch (error) {
-    console.error("❌ Erro ao obter dados de saúde:", error);
+    console.error("âŒ Erro ao obter dados de saáºde:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/latest-health-data (ERRO) ===");
     res.status(500).json({
-      error: "Erro interno do servidor ao obter dados de saúde.",
+      error: "Erro interno do servidor ao obter dados de saáºde.",
       details: error.message
     });
   }
 });
 
-// GET: Obter histórico de dados de saúde do Wear OS ✅
+// GET: Obter histá³rico de dados de saáºde do Wear OS âœ…
 app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA GET /api/wearos/health-history ===");
+  console.log("=== INáCIO DA ROTA GET /api/wearos/health-history ===");
   console.log("User ID:", req.userId);
   const { timeframe = "1d", dataType = "all" } = req.query;
 
   const userId = req.userId;
 
   try {
-    // Obter dispositivos Wear OS do usuário
+    // Obter dispositivos Wear OS do usuá¡rio
     const devices = await sql`
       SELECT id_disp FROM dispositivos
       WHERE id_us = ${userId}
@@ -2859,22 +4010,22 @@ app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
 
     const healthHistory = await query;
 
-    console.log(`✅ Encontrados ${healthHistory.length} registros de saúde`);
+    console.log(`âœ… Encontrados ${healthHistory.length} registros de saáºde`);
     console.log("Timeframe:", timeframe, "DataType:", dataType);
     console.log("=== FIM DA ROTA GET /api/wearos/health-history ===");
 
     res.status(200).json({
-      message: "Histórico de dados de saúde recuperado",
+      message: "Histá³rico de dados de saáºde recuperado",
       data: healthHistory,
       totalRecords: healthHistory.length,
       timeframe: timeframe,
       dataType: dataType
     });
   } catch (error) {
-    console.error("❌ Erro ao obter histórico de saúde:", error);
+    console.error("âŒ Erro ao obter histá³rico de saáºde:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/health-history (ERRO) ===");
     res.status(500).json({
-      error: "Erro interno do servidor ao obter histórico de saúde.",
+      error: "Erro interno do servidor ao obter histá³rico de saáºde.",
       details: error.message
     });
   }
@@ -2882,7 +4033,7 @@ app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
 
 // PUT: Atualizar status do dispositivo Wear OS
 app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA PUT /api/wearos/device-status/:deviceId ===");
+  console.log("=== INáCIO DA ROTA PUT /api/wearos/device-status/:deviceId ===");
   console.log("User ID:", req.userId);
   console.log("Device ID:", req.params.deviceId);
   console.log("Body:", req.body);
@@ -2893,18 +4044,18 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
 
   if (!status) {
     return res.status(400).json({
-      error: "Status é obrigatório."
+      error: "Status á© obrigatá³rio."
     });
   }
 
   if (!['ativo', 'inativo', 'conectando', 'desconectado'].includes(status)) {
     return res.status(400).json({
-      error: "Status inválido. Use: ativo, inativo, conectando, desconectado"
+      error: "Status invá¡lido. Use: ativo, inativo, conectando, desconectado"
     });
   }
 
   try {
-    // Verificar se o dispositivo pertence ao usuário
+    // Verificar se o dispositivo pertence ao usuá¡rio
     const deviceCheck = await sql`
       SELECT id_disp FROM dispositivos
       WHERE id_disp = ${deviceId}
@@ -2913,7 +4064,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
 
     if (deviceCheck.length === 0) {
       return res.status(404).json({
-        error: "Dispositivo não encontrado ou não pertence ao usuário."
+        error: "Dispositivo ná£o encontrado ou ná£o pertence ao usuá¡rio."
       });
     }
 
@@ -2924,7 +4075,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log(`✅ Status do dispositivo ${deviceId} atualizado para: ${status}`);
+    console.log(`âœ… Status do dispositivo ${deviceId} atualizado para: ${status}`);
     console.log("=== FIM DA ROTA PUT /api/wearos/device-status/:deviceId ===");
 
     res.status(200).json({
@@ -2932,7 +4083,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
       device: updatedDevice
     });
   } catch (error) {
-    console.error("❌ Erro ao atualizar status do dispositivo:", error);
+    console.error("âŒ Erro ao atualizar status do dispositivo:", error);
     console.log("=== FIM DA ROTA PUT /api/wearos/device-status/:deviceId (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao atualizar status do dispositivo.",
@@ -2943,7 +4094,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
 
 // DELETE: Remover dispositivo Wear OS
 app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
-  console.log("=== INÍCIO DA ROTA DELETE /api/wearos/device/:deviceId ===");
+  console.log("=== INáCIO DA ROTA DELETE /api/wearos/device/:deviceId ===");
   console.log("User ID:", req.userId);
   console.log("Device ID:", req.params.deviceId);
 
@@ -2951,7 +4102,7 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
   const deviceId = req.params.deviceId;
 
   try {
-    // Verificar se o dispositivo pertence ao usuário
+    // Verificar se o dispositivo pertence ao usuá¡rio
     const deviceCheck = await sql`
       SELECT id_disp FROM dispositivos
       WHERE id_disp = ${deviceId}
@@ -2960,11 +4111,11 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
 
     if (deviceCheck.length === 0) {
       return res.status(404).json({
-        error: "Dispositivo não encontrado ou não pertence ao usuário."
+        error: "Dispositivo ná£o encontrado ou ná£o pertence ao usuá¡rio."
       });
     }
 
-    // Remover registros de saúde associados
+    // Remover registros de saáºde associados
     await sql`
       DELETE FROM healthkit
       WHERE id_disp = ${deviceId};
@@ -2977,15 +4128,15 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
       RETURNING *;
     `;
 
-    console.log(`✅ Dispositivo ${deviceId} e dados associados removidos`);
+    console.log(`âœ… Dispositivo ${deviceId} e dados associados removidos`);
     console.log("=== FIM DA ROTA DELETE /api/wearos/device/:deviceId ===");
 
     res.status(200).json({
-      message: "Dispositivo e dados de saúde associados removidos com sucesso!",
+      message: "Dispositivo e dados de saáºde associados removidos com sucesso!",
       device: deletedDevice
     });
   } catch (error) {
-    console.error("❌ Erro ao remover dispositivo:", error);
+    console.error("âŒ Erro ao remover dispositivo:", error);
     console.log("=== FIM DA ROTA DELETE /api/wearos/device/:deviceId (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao remover dispositivo.",
@@ -3000,10 +4151,10 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
 app.get("/api/appointments/availability/:trainerId", async (req, res) => {
   const trainerId = req.params.trainerId;
   const { date } = req.query; // YYYY-MM-DD
-  
+
   try {
     if (!trainerId || isNaN(parseInt(trainerId, 10))) {
-      return res.status(400).json({ error: "ID do trainer inválido." });
+      return res.status(400).json({ error: "ID do trainer invá¡lido." });
     }
 
     console.log(`[/api/appointments/availability/${trainerId}] Buscando disponibilidade para date=${date}`);
@@ -3011,16 +4162,16 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
     // Verificar se a tabela disponibilidade_trainer existe
     const [{ exists: dispExists }] = await sql`SELECT to_regclass('public.disponibilidade_trainer') IS NOT NULL AS exists`;
     if (!dispExists) {
-      console.warn("[GET /appointments/availability] Tabela disponibilidade_trainer não existe");
+      console.warn("[GET /appointments/availability] Tabela disponibilidade_trainer ná£o existe");
       return res.status(200).json({
         availableSlots: [],
         bookedSlots: [],
         available: false,
-        message: "Disponibilidades não configuradas para este trainer"
+        message: "Disponibilidades ná£o configuradas para este trainer"
       });
     }
 
-    // Buscar disponibilidade do trainer (horários configurados)
+    // Buscar disponibilidade do trainer (horá¡rios configurados)
     const availability = await sql`
       SELECT 
         id,
@@ -3039,14 +4190,14 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
     console.log(`[/api/appointments/availability/${trainerId}] Encontrados ${availability.length} registros de disponibilidade`);
 
     if (!date) {
-      // Retorna disponibilidade semanal padrão
+      // Retorna disponibilidade semanal padrá£o
       return res.status(200).json({
         availability: availability,
         message: "Disponibilidade semanal do trainer"
       });
     }
 
-    // Se uma data específica foi informada, retorna horários disponíveis nesse dia
+    // Se uma data especá­fica foi informada, retorna horá¡rios disponá­veis nesse dia
     const searchDate = new Date(date);
     const dayOfWeek = searchDate.getDay();
 
@@ -3060,11 +4211,11 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
         available: false,
         availableSlots: [],
         bookedSlots: [],
-        message: "Trainer não tem disponibilidade neste dia"
+        message: "Trainer ná£o tem disponibilidade neste dia"
       });
     }
 
-    // Buscar agendamentos já feitos nesta data
+    // Buscar agendamentos já¡ feitos nesta data
     let bookedSlots = [];
     try {
       bookedSlots = await sql`
@@ -3083,19 +4234,19 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
       try {
         const slotStart = slot.hora_inicio;
         const slotEnd = slot.hora_fim;
-        
+
         console.log(`[/api/appointments/availability/${trainerId}] Processando slot: ${slotStart} - ${slotEnd}`);
-        
-        // Gerar horários em intervalos de 1 hora
+
+        // Gerar horá¡rios em intervalos de 1 hora
         let current = new Date(`2000-01-01 ${slotStart}`);
         const end = new Date(`2000-01-01 ${slotEnd}`);
-        
+
         while (current < end) {
           const currentTime = current.toTimeString().substring(0, 5);
           const nextHour = new Date(current.getTime() + 60 * 60 * 1000);
           const nextTime = nextHour.toTimeString().substring(0, 5);
 
-          // Verificar se este horário não conflita com reservas
+          // Verificar se este horá¡rio ná£o conflita com reservas
           const conflict = bookedSlots.some(book => {
             return currentTime >= book.hora_inicio && currentTime < book.hora_fim;
           });
@@ -3115,7 +4266,7 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
       }
     });
 
-    console.log(`[/api/appointments/availability/${trainerId}] Retornando ${availableSlots.length} slots disponíveis`);
+    console.log(`[/api/appointments/availability/${trainerId}] Retornando ${availableSlots.length} slots disponá­veis`);
 
     return res.status(200).json({
       date: date,
@@ -3136,12 +4287,12 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
 
   try {
     if (!trainerId || !date || !startTime || !endTime) {
-      return res.status(400).json({ error: "Trainer ID, data, hora de início e fim são obrigatórios." });
+      return res.status(400).json({ error: "Trainer ID, data, hora de iná­cio e fim sá£o obrigatá³rios." });
     }
 
     const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
     if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
     }
 
     // Verificar se o trainer existe
@@ -3150,10 +4301,10 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
       AND (role = 'trainer' OR role = 'personal')
     `;
     if (!trainerExists || trainerExists.length === 0) {
-      return res.status(404).json({ error: "Trainer não encontrado." });
+      return res.status(404).json({ error: "Trainer ná£o encontrado." });
     }
 
-    // Verificar disponibilidade usando a função PL/pgsql
+    // Verificar disponibilidade usando a funçáo PL/pgsql
     const [availCheck] = await sql`
       SELECT * FROM verificar_disponibilidade(
         ${parseInt(trainerId, 10)},
@@ -3164,8 +4315,8 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
     `;
 
     if (!availCheck.disponivel) {
-      return res.status(409).json({ 
-        error: availCheck.motivo || "Horário não disponível" 
+      return res.status(409).json({
+        error: availCheck.motivo || "Horá¡rio ná£o disponá­vel"
       });
     }
 
@@ -3191,13 +4342,13 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Erro em POST /api/appointments", err);
     if (err.code === '23505') {
-      return res.status(409).json({ error: "Já existe um agendamento neste horário." });
+      return res.status(409).json({ error: "Já¡ existe um agendamento neste horá¡rio." });
     }
     return res.status(500).json({ error: "Erro ao criar agendamento." });
   }
 });
 
-// GET: Listar agendamentos do usuário (como cliente ou trainer)
+// GET: Listar agendamentos do usuá¡rio (como cliente ou trainer)
 app.get("/api/appointments", verifyToken, async (req, res) => {
   const userId = req.userId;
   const { role = "client" } = req.query; // 'client' ou 'trainer'
@@ -3205,7 +4356,7 @@ app.get("/api/appointments", verifyToken, async (req, res) => {
   try {
     const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
     if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
     }
 
     let appointments;
@@ -3249,19 +4400,19 @@ app.get("/api/appointments", verifyToken, async (req, res) => {
   }
 });
 
-// GET: Buscar agendamentos de um trainer em uma data específica
+// GET: Buscar agendamentos de um trainer em uma data especá­fica
 app.get("/api/appointments/trainer/:trainerId", async (req, res) => {
   const trainerId = req.params.trainerId;
   const { date } = req.query; // YYYY-MM-DD
 
   try {
     if (!trainerId || isNaN(parseInt(trainerId, 10))) {
-      return res.status(400).json({ error: "ID do trainer inválido." });
+      return res.status(400).json({ error: "ID do trainer invá¡lido." });
     }
 
     const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
     if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
     }
 
     let query = sql`
@@ -3299,7 +4450,7 @@ app.put("/api/appointments/:appointmentId", verifyToken, async (req, res) => {
   try {
     const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
     if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
     }
 
     // Buscar o agendamento
@@ -3308,12 +4459,12 @@ app.put("/api/appointments/:appointmentId", verifyToken, async (req, res) => {
     `;
 
     if (!appointment) {
-      return res.status(404).json({ error: "Agendamento não encontrado." });
+      return res.status(404).json({ error: "Agendamento ná£o encontrado." });
     }
 
-    // Verificar permissão (trainer ou cliente do agendamento)
+    // Verificar permissá£o (trainer ou cliente do agendamento)
     if (appointment.id_trainer !== userId && appointment.id_usuario !== userId) {
-      return res.status(403).json({ error: "Sem permissão para atualizar este agendamento." });
+      return res.status(403).json({ error: "Sem permissá£o para atualizar este agendamento." });
     }
 
     const [updated] = await sql`
@@ -3344,7 +4495,7 @@ app.delete("/api/appointments/:appointmentId", verifyToken, async (req, res) => 
   try {
     const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
     if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos não instalado." });
+      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
     }
 
     const [appointment] = await sql`
@@ -3352,12 +4503,12 @@ app.delete("/api/appointments/:appointmentId", verifyToken, async (req, res) => 
     `;
 
     if (!appointment) {
-      return res.status(404).json({ error: "Agendamento não encontrado." });
+      return res.status(404).json({ error: "Agendamento ná£o encontrado." });
     }
 
-    // Verificar permissão
+    // Verificar permissá£o
     if (appointment.id_trainer !== userId && appointment.id_usuario !== userId) {
-      return res.status(403).json({ error: "Sem permissão para cancelar este agendamento." });
+      return res.status(403).json({ error: "Sem permissá£o para cancelar este agendamento." });
     }
 
     await sql`
@@ -3374,7 +4525,7 @@ app.delete("/api/appointments/:appointmentId", verifyToken, async (req, res) => 
   }
 });
 
-// Endpoint de inicialização - criar tabelas de agendamentos se não existirem
+// Endpoint de inicializaçáo - criar tabelas de agendamentos se ná£o existirem
 app.post("/api/init/agendamentos", async (req, res) => {
   try {
     console.log("[POST /init/agendamentos] Inicializando tabelas de agendamentos...");
@@ -3382,15 +4533,15 @@ app.post("/api/init/agendamentos", async (req, res) => {
     const schema = fs.readFileSync("./agendamentos-schema.sql", "utf-8");
     const statements = schema.split(";").filter(s => s.trim());
 
-    // Executar cada instrução separadamente, ignorando erros de dependência
+    // Executar cada instruçáo separadamente, ignorando erros de dependáªncia
     for (const statement of statements) {
       if (statement.trim()) {
         try {
           await sql.unsafe(statement);
-          console.log(`✓ Executado: ${statement.substring(0, 50)}...`);
+          console.log(`âœ“ Executado: ${statement.substring(0, 50)}...`);
         } catch (stmtErr) {
-          console.log(`⚠ Pulo instrução (pode ser dependência): ${stmtErr.message}`);
-          console.log(`  Instrução: ${statement.trim()}`);
+          console.log(`âš  Pulo instruçáo (pode ser dependáªncia): ${stmtErr.message}`);
+          console.log(`  Instruçáo: ${statement.trim()}`);
         }
       }
     }
@@ -3409,7 +4560,52 @@ app.post("/api/init/agendamentos", async (req, res) => {
   }
 });
 
-// -------------------------------- INICIALIZAÇÃO ---------------------------- //
+// -------------------------------- COMUNIDADES -------------------------------- //
+
+app.get("/api/comunidades", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { categoria } = req.query;
+
+  try {
+    let query = sql`
+      SELECT 
+        id_comunidade, 
+        nome, 
+        descricao, 
+        imageurl, 
+        participantes, 
+        max_participantes, 
+        categoria, 
+        tipo_comunidade,
+        duracao,
+        calorias,
+        data_evento,
+        faixa_etaria,
+        premiacao,
+        local_inicio,
+        local_fim,
+        telefone_contato
+      FROM comunidades
+    `;
+
+    if (categoria && categoria !== "Todas") {
+      query = sql`${query} WHERE categoria = ${categoria}`;
+    }
+
+    query = sql`${query} ORDER BY createdat DESC`;
+
+    const comunidades = await query;
+    res.status(200).json({ data: comunidades });
+  } catch (error) {
+    console.error("Erro ao listar comunidades:", error);
+    res.status(500).json({
+      error: "Erro interno do servidor ao listar comunidades.",
+      details: error.message,
+    });
+  }
+});
+
+// -------------------------------- INICIALIZAÃ‡ÃƒO ---------------------------- //
 
 if (process.env.NODE_ENV !== 'production') {
   app.listen(port, "0.0.0.0", () => {
@@ -3419,3 +4615,4 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 module.exports = app;
+
