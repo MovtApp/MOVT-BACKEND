@@ -1,0 +1,10 @@
+﻿[dotenv@17.2.3] injecting env (9) from .env -- tip: ­ƒæÑ sync secrets across teammates & machines: https://dotenvx.com/ops
+POSTS DATA:
+[
+  {
+    "id": 6,
+    "id_us": 14,
+    "image_url": "https://ypnpdjgsyzdwsmnxsoqj.supabase.co/storage/v1/object/public/diet-images/1770074807501.png",
+    "tipo": "POST"
+  }
+]

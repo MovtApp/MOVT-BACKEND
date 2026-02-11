@@ -1,5 +1,6 @@
 ﻿require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const postgres = require("postgres");
 const bcrypt = require("bcrypt");
 const { v4: uuidv4 } = require("uuid");
@@ -51,6 +52,22 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
 
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS formacao TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS verificado BOOLEAN DEFAULT FALSE`;
+
+    // Garantir tabela de posts
+    await sql`CREATE TABLE IF NOT EXISTS posts (
+      id SERIAL PRIMARY KEY,
+      id_us INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      image_url TEXT NOT NULL,
+      legenda TEXT,
+      tipo TEXT DEFAULT 'POST',
+      likes_count INTEGER DEFAULT 0,
+      comments_count INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
     // Garantir tabela de follows e migrar se necessário
     await sql`CREATE TABLE IF NOT EXISTS follows (
       id SERIAL PRIMARY KEY,
@@ -93,6 +110,27 @@ const transporter = nodemailer.createTransport({
     rejectUnauthorized: false,
   },
 });
+
+// Funçáo auxiliar para resolver ID de usuário (pode ser INTEGER ou UUID)
+async function resolveUserId(id) {
+  if (!id) return null;
+
+  // Se for um UUID (contém hífens), busca no mapeamento
+  if (typeof id === 'string' && id.includes('-')) {
+    try {
+      const [mapping] = await sql`
+        SELECT id_us FROM user_id_mapping WHERE auth_user_id = ${id}
+      `;
+      if (mapping) return mapping.id_us;
+    } catch (err) {
+      console.error("Erro ao resolver UUID para id_us:", err);
+    }
+  }
+
+  // Caso contrário, tenta converter para inteiro
+  const numericId = parseInt(id, 10);
+  return isNaN(numericId) ? null : numericId;
+}
 
 // Funçáo auxiliar para obter o UUID do Supabase Auth a partir do ID do seu banco
 async function getUserAuthId(userId) {
@@ -324,9 +362,10 @@ function decryptMessage(encryptedText) {
 }
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use(cors());
 
 // Middleware de verificaçáo de sessá£o
 function verifyToken(req, res, next) {
@@ -1315,16 +1354,67 @@ app.get("/api/trainers", async (req, res) => {
 
 // Detalhe de um trainer (busca por id) âœ…
 app.get("/api/trainers/:id", async (req, res) => {
-  const id = req.params.id;
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: "ID inválido." });
   try {
-    const [row] = await sql`
-      SELECT id_us AS id, nome AS name, username, avatar_url, updatedat
+    // Busca dados básicos e de regularização do usuário
+    const [user] = await sql`
+      SELECT id_us AS id, nome AS name, username, avatar_url, banner_url, cref, formacao, verificado, bio, location
       FROM usuarios
       WHERE id_us = ${id}
       LIMIT 1
     `;
-    if (!row) return res.status(404).json({ error: "Trainer ná£o encontrado." });
-    return res.status(200).json({ data: row });
+
+    if (!user) return res.status(404).json({ error: "Trainer não encontrado." });
+
+    // Busca perfil profissional
+    const [profile] = await sql`
+      SELECT descricao AS description, experiencia_anos AS "experienceYears", especialidades
+      FROM personal_profiles
+      WHERE id_trainer = ${id}
+      LIMIT 1
+    `;
+
+    // Busca contagem de agendamentos reais
+    const [{ count: agendamentosCount }] = await sql`
+      SELECT count(*)::int FROM agendamentos 
+      WHERE id_trainer = ${id} OR id_pj = ${id}
+    `;
+
+    // Busca contagem e média de avaliações
+    const [{ count: avaliacoesCount }] = await sql`
+      SELECT count(*)::int FROM avaliacoes 
+      WHERE id_pj = ${id}
+    `;
+
+    // Busca endereço da academia vinculada
+    const [gym] = await sql`
+      SELECT a.id_academia, a.nome, a.endereco_completo, a.rua, a.numero, a.bairro, a.cidade, a.estado
+      FROM gym_trainers gt
+      JOIN academias a ON gt.gym_id = a.id_academia
+      WHERE gt.personal_id = ${id} AND gt.status = 'active'
+      LIMIT 1
+    `;
+
+    const trainerData = {
+      ...user,
+      description: profile?.description || user.bio || "Personal Trainer",
+      experienceYears: profile?.experienceYears || 0,
+      especialidades: profile?.especialidades || [],
+      agendamentosCount: agendamentosCount || 0,
+      avaliacoesCount: avaliacoesCount || 0,
+      verificado: user.verificado || false,
+      cref: user.cref || "Não informado",
+      formacao: user.formacao || "Não informada",
+      gym: gym || null,
+      address: gym
+        ? `${gym.rua}, ${gym.numero}, ${gym.bairro}, ${gym.cidade} - ${gym.estado}`
+        : (user.location || "Atendimento domiciliar / Online")
+    };
+
+    console.log(`[DEBUG] Trainer ${id} address:`, trainerData.address, 'Gym:', !!gym);
+
+    return res.status(200).json({ data: trainerData });
   } catch (err) {
     console.error("Erro em GET /api/trainers/:id", err);
     return res.status(500).json({ error: "Erro interno ao obter trainer." });
@@ -1361,6 +1451,7 @@ app.get("/api/personals", async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const offset = parseInt(req.query.offset) || 0;
     const q = req.query.q && req.query.q.trim();
+    const gymId = req.query.gymId ? parseInt(req.query.gymId) : null;
 
     // Check if personal_profiles table exists
     const [{ exists }] = await sql`SELECT to_regclass('public.personal_profiles') IS NOT NULL AS exists`;
@@ -1368,58 +1459,147 @@ app.get("/api/personals", async (req, res) => {
       return res.status(200).json({ data: [], meta: { total: 0, limit, offset } });
     }
 
-    if (q) {
-      const pattern = `%${q}%`;
-      const data = await sql`
-        SELECT
-          u.id_us AS id,
-          u.nome AS name,
-          u.username,
-          u.avatar_url AS "avatarUrl",
-          u.email,
-          u.telefone,
-          pp.descricao AS description,
-          pp.experiencia_anos AS "experienceYears",
-          pp.especialidades,
-          pp.rating,
-          pp.total_avaliacoes AS "totalRatings",
-          pp.createdat,
-          pp.updatedat
-        FROM usuarios u
-        LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
-        WHERE u.role = 'personal' AND (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
-        ORDER BY u.nome
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-      const [{ count } = { count: null }] = await sql`
-        SELECT count(*) FROM usuarios WHERE role = 'personal' AND (username ILIKE ${pattern} OR nome ILIKE ${pattern})
-      `;
-      return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+    let data;
+    let totalCount;
+
+    if (gymId) {
+      // Filtrar personais vinculados a uma academia específica
+      if (q) {
+        const pattern = `%${q}%`;
+        data = await sql`
+          SELECT
+            u.id_us AS id,
+            u.nome AS name,
+            u.username,
+            u.avatar_url AS "avatarUrl",
+            u.email,
+            u.telefone,
+            pp.descricao AS description,
+            pp.experiencia_anos AS "experienceYears",
+            pp.especialidades,
+            pp.rating,
+            pp.total_avaliacoes AS "totalRatings",
+            pp.createdat,
+            pp.updatedat
+          FROM usuarios u
+          JOIN gym_trainers gt ON u.id_us = gt.personal_id
+          LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+          WHERE (u.role = 'personal' OR u.role = 'trainer')
+            AND gt.gym_id = ${gymId}
+            AND gt.status = 'active'
+            AND (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
+          ORDER BY u.nome
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+        const [{ count }] = await sql`
+          SELECT count(*) 
+          FROM usuarios u
+          JOIN gym_trainers gt ON u.id_us = gt.personal_id
+          WHERE (u.role = 'personal' OR u.role = 'trainer')
+            AND gt.gym_id = ${gymId}
+            AND gt.status = 'active'
+            AND (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
+        `;
+        totalCount = count;
+      } else {
+        data = await sql`
+          SELECT
+            u.id_us AS id,
+            u.nome AS name,
+            u.username,
+            u.avatar_url AS "avatarUrl",
+            u.email,
+            u.telefone,
+            pp.descricao AS description,
+            pp.experiencia_anos AS "experienceYears",
+            pp.especialidades,
+            pp.rating,
+            pp.total_avaliacoes AS "totalRatings",
+            pp.createdat,
+            pp.updatedat
+          FROM usuarios u
+          JOIN gym_trainers gt ON u.id_us = gt.personal_id
+          LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+          WHERE (u.role = 'personal' OR u.role = 'trainer')
+            AND gt.gym_id = ${gymId}
+            AND gt.status = 'active'
+          ORDER BY u.nome
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+        const [{ count }] = await sql`
+          SELECT count(*) 
+          FROM usuarios u
+          JOIN gym_trainers gt ON u.id_us = gt.personal_id
+          WHERE (u.role = 'personal' OR u.role = 'trainer')
+            AND gt.gym_id = ${gymId}
+            AND gt.status = 'active'
+        `;
+        totalCount = count;
+      }
+    } else {
+      // Comportamento original: listar todos os personals
+      if (q) {
+        const pattern = `%${q}%`;
+        data = await sql`
+          SELECT
+            u.id_us AS id,
+            u.nome AS name,
+            u.username,
+            u.avatar_url AS "avatarUrl",
+            u.email,
+            u.telefone,
+            pp.descricao AS description,
+            pp.experiencia_anos AS "experienceYears",
+            pp.especialidades,
+            pp.rating,
+            pp.total_avaliacoes AS "totalRatings",
+            pp.createdat,
+            pp.updatedat
+          FROM usuarios u
+          LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+          WHERE (u.role = 'personal' OR u.role = 'trainer') AND (u.username ILIKE ${pattern} OR u.nome ILIKE ${pattern})
+          ORDER BY u.nome
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+        const [{ count }] = await sql`
+          SELECT count(*) FROM usuarios WHERE (role = 'personal' OR role = 'trainer') AND (username ILIKE ${pattern} OR nome ILIKE ${pattern})
+        `;
+        totalCount = count;
+      } else {
+        data = await sql`
+          SELECT
+            u.id_us AS id,
+            u.nome AS name,
+            u.username,
+            u.avatar_url AS "avatarUrl",
+            u.email,
+            u.telefone,
+            pp.descricao AS description,
+            pp.experiencia_anos AS "experienceYears",
+            pp.especialidades,
+            pp.rating,
+            pp.total_avaliacoes AS "totalRatings",
+            pp.createdat,
+            pp.updatedat
+          FROM usuarios u
+          LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
+          WHERE (u.role = 'personal' OR u.role = 'trainer')
+          ORDER BY u.nome
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+        const [{ count }] = await sql`SELECT count(*) FROM usuarios WHERE (role = 'personal' OR role = 'trainer')`;
+        totalCount = count;
+      }
     }
 
-    const data = await sql`
-      SELECT
-        u.id_us AS id,
-        u.nome AS name,
-        u.username,
-        u.avatar_url AS "avatarUrl",
-        u.email,
-        u.telefone,
-        pp.descricao AS description,
-        pp.experiencia_anos AS "experienceYears",
-        pp.especialidades,
-        pp.rating,
-        pp.total_avaliacoes AS "totalRatings",
-        pp.createdat,
-        pp.updatedat
-      FROM usuarios u
-      LEFT JOIN personal_profiles pp ON u.id_us = pp.id_trainer
-      WHERE u.role = 'personal'
-      ORDER BY u.nome
-      LIMIT ${limit} OFFSET ${offset}
-    `;
-    const [{ count } = { count: null }] = await sql`SELECT count(*) FROM usuarios WHERE role = 'personal'`;
-    return res.status(200).json({ data, meta: { total: parseInt(count, 10) || data.length, limit, offset } });
+    return res.status(200).json({
+      data,
+      meta: {
+        total: parseInt(totalCount, 10) || data.length,
+        limit,
+        offset
+      }
+    });
   } catch (err) {
     console.error("Erro em GET /api/personals:", err);
     return res.status(500).json({ error: "Erro interno ao listar personals." });
@@ -1570,7 +1750,11 @@ app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
 // Seguir um usuário
 app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
   const followerId = parseInt(req.userId);
-  const followedId = parseInt(req.params.id);
+  const followedId = await resolveUserId(req.params.id);
+
+  if (!followedId) {
+    return res.status(404).json({ error: "Usuário não encontrado." });
+  }
 
   if (followerId === followedId) {
     return res.status(400).json({ error: "Você não pode seguir a si mesmo." });
@@ -1593,7 +1777,11 @@ app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
 // Deixar de seguir um usuário
 app.delete("/api/user/:id/unfollow", verifyToken, async (req, res) => {
   const followerId = parseInt(req.userId);
-  const followedId = parseInt(req.params.id);
+  const followedId = await resolveUserId(req.params.id);
+
+  if (!followedId) {
+    return res.status(404).json({ error: "Usuário não encontrado." });
+  }
 
   try {
     await sql`
@@ -1610,7 +1798,11 @@ app.delete("/api/user/:id/unfollow", verifyToken, async (req, res) => {
 // Verificar se segue um usuário
 app.get("/api/user/:id/follow-status", verifyToken, async (req, res) => {
   const followerId = parseInt(req.userId);
-  const followedId = parseInt(req.params.id);
+  const followedId = await resolveUserId(req.params.id);
+
+  if (!followedId) {
+    return res.status(200).json({ isFollowing: false });
+  }
 
   try {
     const [follow] = await sql`
@@ -1835,8 +2027,13 @@ app.get("/api/search", verifyToken, async (req, res) => {
 
 // Obter perfil público de um usuário (incluindo is_following)
 app.get("/api/user/:id", verifyToken, async (req, res) => {
-  const userId = req.params.id;
+  const userId = await resolveUserId(req.params.id);
   const requesterId = req.userId;
+
+  if (!userId) {
+    return res.status(404).json({ error: "Usuário não encontrado." });
+  }
+
   try {
     const [user] = await sql`
       SELECT id_us as id, nome as name, username, avatar_url as photo, banner_url as banner,
@@ -1897,36 +2094,64 @@ app.put("/api/user/bio", verifyToken, async (req, res) => {
 
 // Buscar posts de um usuário específico
 app.get("/api/user/:id/posts", verifyToken, async (req, res) => {
-  const userId = req.params.id;
+  const userId = await resolveUserId(req.params.id);
 
-  // Imagens para usuários ímpares ou trainers
-  const postsSetA = [
-    "https://res.cloudinary.com/ditlmzgrh/image/upload/v1757838100/image_2_kgtuno.jpg",
-    "https://img.freepik.com/free-photo/view-woman-helping-man-exercise-gym_52683-98092.jpg",
-    "https://img.freepik.com/free-photo/medium-shot-people-helping-each-other-gym_23-2149591024.jpg",
-    "https://img.freepik.com/free-photo/man-helping-woman-with-her-workout-gym_23-2149591022.jpg",
-    "https://img.freepik.com/free-photo/man-working-out-gym_23-2149591020.jpg",
-    "https://img.freepik.com/free-photo/woman-working-out-gym_23-2149591018.jpg",
-  ];
+  if (!userId) {
+    return res.status(200).json({ success: true, data: [] });
+  }
 
-  // Imagens para usuários pares
-  const postsSetB = [
-    "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?q=80&w=2670",
-    "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?q=80&w=2670",
-    "https://images.unsplash.com/photo-1544367567-0f2fcb009e0b?q=80&w=2620",
-    "https://images.unsplash.com/photo-1476480862126-209bfaa8edc8?q=80&w=2670",
-    "https://images.unsplash.com/photo-1518611012118-696072aa579a?q=80&w=2670",
-    "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?q=80&w=2670",
-  ];
+  try {
+    const [{ exists }] = await sql`SELECT to_regclass('public.posts') IS NOT NULL AS exists`;
 
-  const data = (parseInt(userId) % 2 === 0) ? postsSetB : postsSetA;
+    if (!exists) {
+      return res.status(200).json({ success: true, data: [] });
+    }
 
-  return res.status(200).json({ success: true, data });
+    const posts = await sql`
+      SELECT * FROM posts 
+      WHERE id_us = ${userId} 
+      ORDER BY created_at DESC
+    `;
+
+    return res.status(200).json({ success: true, data: posts });
+  } catch (err) {
+    console.error(`Erro em GET /api/user/${req.params.id}/posts`, err);
+    return res.status(500).json({ error: "Erro ao buscar posts." });
+  }
+});
+
+// Criar novo post
+app.post("/api/user/posts", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  // O frontend pode enviar 'url', 'imageurl'
+  const { legenda, url, imageurl, tipo } = req.body;
+  const finalUrl = url || imageurl;
+
+  if (!finalUrl) {
+    return res.status(400).json({ error: "URL da imagem é obrigatória." });
+  }
+
+  try {
+    const [newPost] = await sql`
+      INSERT INTO posts (id_us, image_url, legenda, tipo)
+      VALUES (${userId}, ${finalUrl}, ${legenda || null}, ${tipo || 'POST'})
+      RETURNING *
+    `;
+
+    return res.status(201).json({ success: true, message: "Post criado com sucesso!", data: newPost });
+  } catch (err) {
+    console.error("Erro em POST /api/user/posts", err);
+    return res.status(500).json({ error: "Erro ao criar post." });
+  }
 });
 
 // Obter estatísticas do usuário (posts, seguidores, seguindo)
 app.get("/api/user/:id/stats", verifyToken, async (req, res) => {
-  const userId = req.params.id;
+  const userId = await resolveUserId(req.params.id);
+
+  if (!userId) {
+    return res.status(404).json({ error: "Usuário não encontrado." });
+  }
 
   try {
     // Contar seguidores (quem segue este usuário)
@@ -1943,10 +2168,13 @@ app.get("/api/user/:id/stats", verifyToken, async (req, res) => {
       WHERE follower_user_id = ${userId}
     `;
 
-    // Posts count (mockado por enquanto - retorna 6)
-    // TODO: Quando implementar tabela de posts, substituir por:
-    // SELECT COUNT(*) FROM posts WHERE user_id = ${userId}
-    const postsCount = 6;
+    // Posts count real
+    const [postsCountResult] = await sql`
+      SELECT COUNT(*) as count 
+      FROM posts 
+      WHERE id_us = ${userId}
+    `;
+    const postsCount = parseInt(postsCountResult.count);
 
     return res.status(200).json({
       success: true,
@@ -1981,7 +2209,7 @@ app.get("/api/user/:id/followers", verifyToken, async (req, res) => {
         ) as is_following
       FROM usuarios u
       INNER JOIN follows f ON f.follower_user_id = u.id_us
-      WHERE f.followed_user_id = ${userId}
+      WHERE f.followed_user_id = ${await resolveUserId(userId)}
       ORDER BY f.created_at DESC
     `;
 
@@ -2020,7 +2248,7 @@ app.get("/api/user/:id/following", verifyToken, async (req, res) => {
         ) as is_following
       FROM usuarios u
       INNER JOIN follows f ON f.followed_user_id = u.id_us
-      WHERE f.follower_user_id = ${userId}
+      WHERE f.follower_user_id = ${await resolveUserId(userId)}
       ORDER BY f.created_at DESC
     `;
 
@@ -2037,6 +2265,123 @@ app.get("/api/user/:id/following", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Erro em GET /api/user/:id/following:", err);
     return res.status(500).json({ error: "Erro interno ao buscar seguindo." });
+  }
+});
+
+// --------------------- COMENTÁRIOS E LIKES EM POSTS --------------------- //
+
+// Obter comentários de um post
+app.get("/api/user/posts/:id/comments", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  try {
+    const comments = await sql`
+      SELECT c.*, u.nome, u.username, u.avatar_url as photo
+      FROM post_comments c
+      JOIN usuarios u ON c.id_us = u.id_us
+      WHERE c.post_id = ${parseInt(postId, 10)}
+      ORDER BY c.created_at ASC
+    `;
+    return res.status(200).json({ success: true, data: comments });
+  } catch (err) {
+    console.error("Erro ao buscar comentários:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar comentários." });
+  }
+});
+
+// Adicionar comentário em um post
+app.post("/api/user/posts/:id/comment", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.userId;
+  const { comentario } = req.body;
+
+  if (!comentario) return res.status(400).json({ error: "Comentário é obrigatório." });
+
+  try {
+    const [newComment] = await sql`
+      INSERT INTO post_comments (post_id, id_us, comentario)
+      VALUES (${parseInt(postId, 10)}, ${userId}, ${comentario})
+      RETURNING *
+    `;
+
+    // Incrementar contador de comentários
+    await sql`UPDATE posts SET comments_count = comments_count + 1 WHERE id = ${parseInt(postId, 10)}`;
+
+    return res.status(201).json({ success: true, data: newComment });
+  } catch (err) {
+    console.error("Erro ao adicionar comentário:", err);
+    return res.status(500).json({ error: "Erro interno ao adicionar comentário." });
+  }
+});
+
+// Curtir/Descurtir um post (Toggle)
+app.post("/api/user/posts/:id/like", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.userId;
+
+  try {
+    const [existing] = await sql`
+      SELECT id FROM post_likes WHERE post_id = ${parseInt(postId, 10)} AND id_us = ${userId}
+    `;
+
+    if (existing) {
+      // Remover like
+      await sql`DELETE FROM post_likes WHERE id = ${existing.id}`;
+      await sql`UPDATE posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = ${parseInt(postId, 10)}`;
+      return res.status(200).json({ success: true, isLiked: false });
+    } else {
+      // Adicionar like
+      await sql`INSERT INTO post_likes (post_id, id_us) VALUES (${parseInt(postId, 10)}, ${userId})`;
+      await sql`UPDATE posts SET likes_count = likes_count + 1 WHERE id = ${parseInt(postId, 10)}`;
+      return res.status(200).json({ success: true, isLiked: true });
+    }
+  } catch (err) {
+    console.error("Erro ao curtir post:", err);
+    return res.status(500).json({ error: "Erro interno ao curtir post." });
+  }
+});
+
+// Excluir um comentário
+app.delete("/api/user/posts/comments/:id", verifyToken, async (req, res) => {
+  const commentId = req.params.id;
+  const userId = req.userId;
+
+  try {
+    const [comment] = await sql`SELECT post_id, id_us FROM post_comments WHERE id = ${parseInt(commentId, 10)}`;
+    if (!comment) return res.status(404).json({ error: "Comentário não encontrado." });
+
+    // Verificar se o usuário é dono do comentário
+    if (comment.id_us !== userId) {
+      return res.status(403).json({ error: "Não autorizado." });
+    }
+
+    await sql`DELETE FROM post_comments WHERE id = ${parseInt(commentId, 10)}`;
+    await sql`UPDATE posts SET comments_count = GREATEST(0, comments_count - 1) WHERE id = ${comment.post_id}`;
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro ao excluir comentário:", err);
+    return res.status(500).json({ error: "Erro interno ao excluir comentário." });
+  }
+});
+
+// Excluir um post
+app.delete("/api/user/posts/:id", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.userId;
+
+  try {
+    const [post] = await sql`SELECT id_us FROM posts WHERE id = ${parseInt(postId, 10)}`;
+    if (!post) return res.status(404).json({ error: "Post não encontrado." });
+
+    if (post.id_us !== userId) {
+      return res.status(403).json({ error: "Não autorizado." });
+    }
+
+    await sql`DELETE FROM posts WHERE id = ${parseInt(postId, 10)}`;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro ao excluir post:", err);
+    return res.status(500).json({ error: "Erro interno ao excluir post." });
   }
 });
 
@@ -2528,28 +2873,49 @@ app.post("/api/chat", verifyToken, async (req, res) => {
 app.get("/api/chat/contacts/mutual", verifyToken, async (req, res) => {
   const userId = req.userId;
   try {
-    // Busca usuá¡rios que seguem o atual AND sá£o seguidos pelo atual
+    // Busca usuários que seguem o atual AND são seguidos pelo atual
     const mutualFollowers = await sql`
       SELECT 
         u.id_us AS id, 
         u.nome AS name, 
         u.username, 
-        u.photo AS avatar
+        u.avatar_url AS avatar
       FROM usuarios u
       WHERE u.id_us IN (
-        SELECT f1.trainer_id 
+        SELECT f1.followed_user_id 
         FROM follows f1
         WHERE f1.follower_user_id = ${userId}
         INTERSECT
         SELECT f2.follower_user_id 
         FROM follows f2
-        WHERE f2.trainer_id = ${userId}
+        WHERE f2.followed_user_id = ${userId}
       )
     `;
 
     return res.status(200).json({ data: mutualFollowers });
   } catch (err) {
-    console.error("Erro ao buscar seguidores máºtuos:", err);
+    console.error("Erro ao buscar seguidores mútuos:", err);
+    return res.status(500).json({ error: "Erro interno ao buscar contatos." });
+  }
+});
+
+// Rota solicitada pelo app: contatos que o usuário segue
+app.get("/api/chat/contacts/following", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const following = await sql`
+      SELECT 
+        u.id_us AS id, 
+        u.nome AS name, 
+        u.username, 
+        u.avatar_url AS avatar
+      FROM usuarios u
+      JOIN follows f ON u.id_us = f.followed_user_id
+      WHERE f.follower_user_id = ${userId}
+    `;
+    return res.status(200).json({ data: following });
+  } catch (err) {
+    console.error("Erro ao buscar contatos seguidos:", err);
     return res.status(500).json({ error: "Erro interno ao buscar contatos." });
   }
 });
@@ -2616,11 +2982,11 @@ app.get("/api/chat", verifyToken, async (req, res) => {
       try {
         // Obter dados diretamente da tabela usuarios pelo auth_user_id
         const [user] = await sql`
-          SELECT nome, photo FROM usuarios WHERE auth_user_id = ${otherParticipantId}
+          SELECT nome, avatar_url FROM usuarios WHERE auth_user_id = ${otherParticipantId}
         `;
         if (user) {
           participantName = user.nome;
-          participantAvatar = user.photo || participantAvatar;
+          participantAvatar = user.avatar_url || participantAvatar;
         }
       } catch (err) {
         console.error("Erro ao buscar detalhes do participante:", otherParticipantId, err);
@@ -2655,9 +3021,7 @@ app.get("/api/chat", verifyToken, async (req, res) => {
   }
 });
 
-
 // Rota para deletar ou atualizar chat removida para simplificaçáo ou movida
-
 app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
 
   const userId = req.userId;
@@ -2705,6 +3069,7 @@ app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
     });
   }
 });
+
 
 app.delete("/api/chat/:id_chat", verifyToken, async (req, res) => {
 
@@ -2796,11 +3161,28 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
 
     if (msgErr) throw msgErr;
 
-    // Atualizar meta do chat
-    await supabase.from('chats').update({
-      last_message: text || 'Imagem',
-      last_timestamp: new Date().toISOString()
-    }).eq('id', id_chat);
+    // Atualizar meta do chat e incrementar contador de não lidas para o destinatário
+    if (chat.participant1_id === supabaseUserId) {
+      // P1 enviou -> incrementa unread_count_p1 (que é o que P2 vê)
+      await sql`
+        UPDATE chats 
+        SET 
+          unread_count_p1 = unread_count_p1 + 1,
+          last_message = ${text || 'Imagem'},
+          last_timestamp = NOW()
+        WHERE id = ${id_chat}
+      `;
+    } else {
+      // P2 enviou -> incrementa unread_count_p2 (que é o que P1 vê)
+      await sql`
+        UPDATE chats 
+        SET 
+          unread_count_p2 = unread_count_p2 + 1,
+          last_message = ${text || 'Imagem'},
+          last_timestamp = NOW()
+        WHERE id = ${id_chat}
+      `;
+    }
 
     res.status(201).json({ data: newMessage });
   } catch (error) {
@@ -2858,10 +3240,105 @@ app.get("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
   }
 });
 
+// Novo: Rota para marcar mensagens como lidas
+app.post("/api/chat/:id_chat/read", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { id_chat } = req.params;
+
+  try {
+    // 1. Obter UUID do Supabase
+    const [user] = await sql`SELECT auth_user_id FROM usuarios WHERE id_us = ${userId}`;
+    if (!user || !user.auth_user_id) {
+      return res.status(404).json({ error: "ID de autenticação não encontrado." });
+    }
+    const supabaseUserId = user.auth_user_id;
+
+    // 2. Verificar se o chat existe
+    const { data: chat, error: chatErr } = await supabase
+      .from('chats')
+      .select('id, participant1_id, participant2_id')
+      .eq('id', id_chat)
+      .single();
+
+    if (chatErr || !chat) {
+      return res.status(404).json({ error: "Chat não encontrado." });
+    }
+
+    if (chat.participant1_id !== supabaseUserId && chat.participant2_id !== supabaseUserId) {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+
+    // 3. Zerar o contador de não lidas para este usuário
+    // Se eu sou p1, meu contador é unread_count_p2 (mensagens vindas de p2)
+    // Se eu sou p2, meu contador é unread_count_p1 (mensagens vindas de p1)
+    if (chat.participant1_id === supabaseUserId) {
+      await sql`UPDATE chats SET unread_count_p2 = 0 WHERE id = ${id_chat}`;
+    } else {
+      await sql`UPDATE chats SET unread_count_p1 = 0 WHERE id = ${id_chat}`;
+    }
+
+    // 4. Marcar todas as mensagens recebidas como lidas
+    await supabase
+      .from('messages')
+      .update({ is_read: true })
+      .eq('chat_id', id_chat)
+      .neq('sender_id', supabaseUserId);
+
+    res.status(200).json({ message: "Mensagens marcadas como lidas." });
+  } catch (error) {
+    console.error("Erro no POST /chat/:id/read:", error);
+    res.status(500).json({ error: "Erro interno", details: error.message });
+  }
+});
+
+// Novo: Rota para deletar uma mensagem individual
+app.delete("/api/chat/messages/:id_message", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { id_message } = req.params;
+
+  try {
+    // 1. Obter UUID do Supabase
+    const [user] = await sql`SELECT auth_user_id FROM usuarios WHERE id_us = ${userId}`;
+    if (!user || !user.auth_user_id) {
+      return res.status(404).json({ error: "ID de autenticação não encontrado." });
+    }
+    const supabaseUserId = user.auth_user_id;
+
+    // 2. Buscar a mensagem para verificar o remetente
+    const { data: message, error: fetchErr } = await supabase
+      .from('messages')
+      .select('sender_id')
+      .eq('id', id_message)
+      .single();
+
+    if (fetchErr || !message) {
+      return res.status(404).json({ error: "Mensagem não encontrada." });
+    }
+
+    // 3. Verificar se o usuário é o remetente da mensagem
+    if (message.sender_id !== supabaseUserId) {
+      return res.status(403).json({ error: "Você só pode deletar suas próprias mensagens." });
+    }
+
+    // 4. Deletar a mensagem
+    const { error: deleteErr } = await supabase
+      .from('messages')
+      .delete()
+      .eq('id', id_message);
+
+    if (deleteErr) throw deleteErr;
+
+    res.status(200).json({ message: "Mensagem deletada com sucesso!" });
+  } catch (error) {
+    console.error("Erro ao deletar mensagem:", error);
+    res.status(500).json({ error: "Erro interno", details: error.message });
+  }
+});
+
 // -------------------------------- PROFILE ---------------------------- //
 
 app.post("/api/profile", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/dietas ===");
+  console.log("=== INÍCIO DA ROTA POST /api/dietas ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -4145,208 +4622,8 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
   }
 });
 
-// -------------------------------- AGENDAMENTOS (BOOKINGS/APPOINTMENTS) -------------------------------- //
 
-// GET: Buscar disponibilidade do trainer
-app.get("/api/appointments/availability/:trainerId", async (req, res) => {
-  const trainerId = req.params.trainerId;
-  const { date } = req.query; // YYYY-MM-DD
 
-  try {
-    if (!trainerId || isNaN(parseInt(trainerId, 10))) {
-      return res.status(400).json({ error: "ID do trainer invá¡lido." });
-    }
-
-    console.log(`[/api/appointments/availability/${trainerId}] Buscando disponibilidade para date=${date}`);
-
-    // Verificar se a tabela disponibilidade_trainer existe
-    const [{ exists: dispExists }] = await sql`SELECT to_regclass('public.disponibilidade_trainer') IS NOT NULL AS exists`;
-    if (!dispExists) {
-      console.warn("[GET /appointments/availability] Tabela disponibilidade_trainer ná£o existe");
-      return res.status(200).json({
-        availableSlots: [],
-        bookedSlots: [],
-        available: false,
-        message: "Disponibilidades ná£o configuradas para este trainer"
-      });
-    }
-
-    // Buscar disponibilidade do trainer (horá¡rios configurados)
-    const availability = await sql`
-      SELECT 
-        id,
-        id_trainer,
-        dia_semana,
-        hora_inicio,
-        hora_fim,
-        ativo,
-        createdat,
-        updatedat
-      FROM disponibilidade_trainer
-      WHERE id_trainer = ${parseInt(trainerId, 10)} AND ativo = TRUE
-      ORDER BY dia_semana ASC, hora_inicio ASC
-    `;
-
-    console.log(`[/api/appointments/availability/${trainerId}] Encontrados ${availability.length} registros de disponibilidade`);
-
-    if (!date) {
-      // Retorna disponibilidade semanal padrá£o
-      return res.status(200).json({
-        availability: availability,
-        message: "Disponibilidade semanal do trainer"
-      });
-    }
-
-    // Se uma data especá­fica foi informada, retorna horá¡rios disponá­veis nesse dia
-    const searchDate = new Date(date);
-    const dayOfWeek = searchDate.getDay();
-
-    console.log(`[/api/appointments/availability/${trainerId}] Procurando para dia da semana: ${dayOfWeek}`);
-
-    const dayAvailability = availability.filter(a => a.dia_semana === dayOfWeek);
-
-    if (dayAvailability.length === 0) {
-      return res.status(200).json({
-        date: date,
-        available: false,
-        availableSlots: [],
-        bookedSlots: [],
-        message: "Trainer ná£o tem disponibilidade neste dia"
-      });
-    }
-
-    // Buscar agendamentos já¡ feitos nesta data
-    let bookedSlots = [];
-    try {
-      bookedSlots = await sql`
-        SELECT hora_inicio, hora_fim FROM agendamentos
-        WHERE id_trainer = ${parseInt(trainerId, 10)}
-          AND data_agendamento = ${date}
-          AND status IN ('pendente', 'confirmado')
-      `;
-    } catch (bookErr) {
-      console.warn(`[/api/appointments/availability/${trainerId}] Erro ao buscar agendamentos:`, bookErr.message);
-    }
-
-    // Calcular slots livres
-    const availableSlots = [];
-    dayAvailability.forEach(slot => {
-      try {
-        const slotStart = slot.hora_inicio;
-        const slotEnd = slot.hora_fim;
-
-        console.log(`[/api/appointments/availability/${trainerId}] Processando slot: ${slotStart} - ${slotEnd}`);
-
-        // Gerar horá¡rios em intervalos de 1 hora
-        let current = new Date(`2000-01-01 ${slotStart}`);
-        const end = new Date(`2000-01-01 ${slotEnd}`);
-
-        while (current < end) {
-          const currentTime = current.toTimeString().substring(0, 5);
-          const nextHour = new Date(current.getTime() + 60 * 60 * 1000);
-          const nextTime = nextHour.toTimeString().substring(0, 5);
-
-          // Verificar se este horá¡rio ná£o conflita com reservas
-          const conflict = bookedSlots.some(book => {
-            return currentTime >= book.hora_inicio && currentTime < book.hora_fim;
-          });
-
-          if (!conflict) {
-            availableSlots.push({
-              startTime: currentTime,
-              endTime: nextTime,
-              available: true
-            });
-          }
-
-          current = nextHour;
-        }
-      } catch (slotErr) {
-        console.error(`[/api/appointments/availability/${trainerId}] Erro ao processar slot:`, slotErr.message);
-      }
-    });
-
-    console.log(`[/api/appointments/availability/${trainerId}] Retornando ${availableSlots.length} slots disponá­veis`);
-
-    return res.status(200).json({
-      date: date,
-      available: availableSlots.length > 0,
-      availableSlots: availableSlots,
-      bookedSlots: bookedSlots
-    });
-  } catch (err) {
-    console.error(`[/api/appointments/availability/${trainerId}] Erro geral:`, err.message);
-    return res.status(500).json({ error: "Erro ao buscar disponibilidade.", details: err.message });
-  }
-});
-
-// POST: Criar agendamento
-app.post("/api/appointments", verifyToken, async (req, res) => {
-  const userId = req.userId;
-  const { trainerId, date, startTime, endTime, notes } = req.body;
-
-  try {
-    if (!trainerId || !date || !startTime || !endTime) {
-      return res.status(400).json({ error: "Trainer ID, data, hora de iná­cio e fim sá£o obrigatá³rios." });
-    }
-
-    const [{ exists }] = await sql`SELECT to_regclass('public.agendamentos') IS NOT NULL AS exists`;
-    if (!exists) {
-      return res.status(501).json({ error: "Sistema de agendamentos ná£o instalado." });
-    }
-
-    // Verificar se o trainer existe
-    const trainerExists = await sql`
-      SELECT id_us FROM usuarios WHERE id_us = ${parseInt(trainerId, 10)} 
-      AND (role = 'trainer' OR role = 'personal')
-    `;
-    if (!trainerExists || trainerExists.length === 0) {
-      return res.status(404).json({ error: "Trainer ná£o encontrado." });
-    }
-
-    // Verificar disponibilidade usando a funçáo PL/pgsql
-    const [availCheck] = await sql`
-      SELECT * FROM verificar_disponibilidade(
-        ${parseInt(trainerId, 10)},
-        ${date}::DATE,
-        ${startTime}::TIME,
-        ${endTime}::TIME
-      )
-    `;
-
-    if (!availCheck.disponivel) {
-      return res.status(409).json({
-        error: availCheck.motivo || "Horá¡rio ná£o disponá­vel"
-      });
-    }
-
-    // Criar o agendamento
-    const [appointment] = await sql`
-      INSERT INTO agendamentos (
-        id_trainer, id_usuario, data_agendamento, hora_inicio, 
-        hora_fim, status, notas, created_at, updated_at
-      )
-      VALUES (
-        ${parseInt(trainerId, 10)}, ${userId}, ${date}, 
-        ${startTime}, ${endTime}, 'pendente', ${notes || null},
-        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-      )
-      RETURNING *
-    `;
-
-    return res.status(201).json({
-      success: true,
-      message: "Agendamento criado com sucesso!",
-      appointment: appointment
-    });
-  } catch (err) {
-    console.error("Erro em POST /api/appointments", err);
-    if (err.code === '23505') {
-      return res.status(409).json({ error: "Já¡ existe um agendamento neste horá¡rio." });
-    }
-    return res.status(500).json({ error: "Erro ao criar agendamento." });
-  }
-});
 
 // GET: Listar agendamentos do usuá¡rio (como cliente ou trainer)
 app.get("/api/appointments", verifyToken, async (req, res) => {
@@ -4605,7 +4882,188 @@ app.get("/api/comunidades", verifyToken, async (req, res) => {
   }
 });
 
-// -------------------------------- INICIALIZAÃ‡ÃƒO ---------------------------- //
+// ==================== ROTAS DE AGENDAMENTO (APPOINTMENTS) ==================== //
+
+// 1. GET: Disponibilidade
+app.get("/api/appointments/availability/:trainerId", async (req, res) => {
+  const trainerId = req.params.trainerId;
+  const { date } = req.query;
+
+  try {
+    if (!trainerId) return res.status(400).json({ error: "ID inválido." });
+
+    const [{ exists: dispExists }] = await sql`SELECT to_regclass('public.disponibilidade_trainer') IS NOT NULL AS exists`;
+    if (!dispExists) {
+      return res.status(200).json({ available: false, message: "Sem configuração." });
+    }
+
+    const availability = await sql`
+      SELECT * FROM disponibilidade_trainer
+      WHERE id_trainer = ${parseInt(trainerId, 10)} AND ativo = TRUE
+      ORDER BY dia_semana ASC, hora_inicio ASC
+    `;
+
+    if (!date) return res.status(200).json({ availability });
+
+    // Extrair dia da semana usando UTC para evitar problemas de fuso horário do servidor
+    const [year, month, day] = date.split('-').map(Number);
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+
+    console.log(`[GET Availability] Trainer ${trainerId}, Data ${date}, Dia da Semana Calculado: ${dayOfWeek}`);
+
+    const dayAvailability = availability.filter(a => a.dia_semana === dayOfWeek);
+
+    let bookedSlots = [];
+    try {
+      bookedSlots = await sql`
+        SELECT hora_inicio, hora_fim FROM agendamentos
+        WHERE id_trainer = ${parseInt(trainerId, 10)}
+          AND data_agendamento = ${date}
+          AND status IN ('pendente', 'confirmado')
+      `;
+    } catch (e) { }
+
+    const availableSlots = [];
+    dayAvailability.forEach(slot => {
+      // Normalizar horários do banco (HH:mm:ss ou HH:mm) para HH:mm
+      const startTimeDb = (slot.hora_inicio || "").substring(0, 5);
+      const endTimeDb = (slot.hora_fim || "").substring(0, 5);
+
+      if (!startTimeDb || !endTimeDb) return;
+
+      const startH = parseInt(startTimeDb.split(':')[0]);
+      const endH = parseInt(endTimeDb.split(':')[0]);
+
+      for (let h = startH; h < endH; h++) {
+        const startStr = `${h.toString().padStart(2, '0')}:00`;
+        const endStr = `${(h + 1).toString().padStart(2, '0')}:00`;
+
+        const conflict = bookedSlots.some(b => {
+          const bStart = (b.hora_inicio || "").substring(0, 5);
+          const bEnd = (b.hora_fim || "").substring(0, 5);
+          return startStr >= bStart && startStr < bEnd;
+        });
+
+        if (!conflict) {
+          availableSlots.push({ startTime: startStr, endTime: endStr, available: true });
+        }
+      }
+    });
+
+    // Remover duplicatas de slots
+    const uniqueAvailableSlots = availableSlots.filter((slot, index, self) =>
+      index === self.findIndex((s) => s.startTime === slot.startTime && s.endTime === slot.endTime)
+    );
+
+    return res.status(200).json({
+      date,
+      available: uniqueAvailableSlots.length > 0,
+      availableSlots: uniqueAvailableSlots,
+      bookedSlots,
+      calculatedDayOfWeek: dayOfWeek
+    });
+  } catch (err) {
+    console.error(`[GET Availability] Erro:`, err);
+    return res.status(500).json({ error: "Erro interno ao buscar disponibilidade." });
+  }
+});
+
+// 2. POST: Criar Agendamento (CORRIGIDO)
+app.post("/api/appointments", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { trainerId, date, startTime, endTime, notes } = req.body;
+
+  try {
+    console.log(`[POST Appointments] User ${userId} -> Trainer ${trainerId}, Data ${date}, ${startTime}-${endTime}`);
+
+    // Extrair dia da semana usando UTC para consistência total
+    const [year, month, day] = date.split('-').map(Number);
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+
+    // Buscar disponibilidade para o dia calculado
+    const availability = await sql`
+      SELECT * FROM disponibilidade_trainer 
+      WHERE id_trainer = ${parseInt(trainerId, 10)} 
+        AND dia_semana = ${dayOfWeek} 
+        AND ativo = TRUE
+    `;
+
+    console.log(`[POST Appointments] Dia Semana: ${dayOfWeek}, Registros encontrados: ${availability.length}`);
+
+    if (availability.length === 0) {
+      console.log(`[POST Appointments] Erro: Trainer não atende no dia ${dayOfWeek}`);
+      return res.status(409).json({
+        error: "Trainer não atende neste dia da semana",
+        details: { dayOfWeek, date }
+      });
+    }
+
+    // Validar se o horário solicitado está dentro da janela de disponibilidade
+    const hasSlot = availability.some(slot => {
+      const dbStart = (slot.hora_inicio || "").substring(0, 5);
+      const dbEnd = (slot.hora_fim || "").substring(0, 5);
+      const reqStart = (startTime || "").substring(0, 5);
+      const reqEnd = (endTime || "").substring(0, 5);
+
+      const isWithin = reqStart >= dbStart && reqEnd <= dbEnd;
+      if (isWithin) console.log(`[POST Appointments] Horário validado: ${reqStart}-${reqEnd} dentro de ${dbStart}-${dbEnd}`);
+      return isWithin;
+    });
+
+    if (!hasSlot) {
+      console.log(`[POST Appointments] Erro: Horário ${startTime}-${endTime} fora da disponibilidade`);
+      return res.status(409).json({
+        error: "Trainer não tem disponibilidade neste dia/horário",
+        details: { requested: `${startTime}-${endTime}`, dayOfWeek }
+      });
+    }
+
+    // Verificar Conflitos com outros agendamentos
+    const conflicts = await sql`
+      SELECT id_agendamento FROM agendamentos 
+      WHERE id_trainer = ${parseInt(trainerId, 10)}
+        AND data_agendamento = ${date}
+        AND status IN ('pendente', 'confirmado')
+        AND (hora_inicio < ${endTime} AND hora_fim > ${startTime})
+    `;
+
+    if (conflicts.length > 0) {
+      console.log(`[POST Appointments] Erro: Conflito detectado`);
+      return res.status(409).json({ error: "Horário já reservado por outro aluno" });
+    }
+
+    const [appt] = await sql`
+      INSERT INTO agendamentos (
+        id_trainer, id_usuario, data_agendamento, hora_inicio, hora_fim, status, notas
+      ) VALUES (
+        ${parseInt(trainerId, 10)}, ${userId}, ${date}, ${startTime}, ${endTime}, 'confirmado', ${notes}
+      ) RETURNING *
+    `;
+
+    console.log(`[POST Appointments] Agendamento criado: ID ${appt.id_agendamento}`);
+    return res.status(201).json({ success: true, appointment: appt });
+
+  } catch (err) {
+    console.error("[POST Appointments] Erro crítico:", err);
+    return res.status(500).json({ error: "Erro interno ao processar agendamento." });
+  }
+});
+
+// ==================== ROTAS DE ACADEMIAS (GYMS) ==================== //
+
+const gymDetailsRoutes = require('./routes/gymDetails');
+app.use('/api/academias', gymDetailsRoutes);
+
+app.get("/api/academias/nearby", async (req, res) => {
+  try {
+    const gyms = await sql`SELECT * FROM academias WHERE ativo = TRUE LIMIT 10`;
+    return res.status(200).json(gyms);
+  } catch (e) {
+    return res.status(500).json({ error: "Erro ao buscar academias." });
+  }
+});
+
+// -------------------------------- INICIALIZAÇÃO ---------------------------- //
 
 if (process.env.NODE_ENV !== 'production') {
   app.listen(port, "0.0.0.0", () => {

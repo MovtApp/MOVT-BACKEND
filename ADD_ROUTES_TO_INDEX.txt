@@ -1,0 +1,37 @@
+/**
+ * INSTRUÇÕES PARA ADICIONAR AS ROTAS DO GOOGLE PLACES API
+ * 
+ * Arquivo: index.js
+ * Localização: Linha 5102-5104
+ * 
+ * ANTES (linhas 5102-5104):
+ * ```
+ * });
+ * 
+ * // -------------------------------- INICIALIZAÇÃO ---------------------------- //
+ * ```
+ * 
+ * DEPOIS:
+ * ```
+ * });
+ * 
+ * // ==================== ROTAS DE DETALHES DAS ACADEMIAS (GOOGLE PLACES) ==================== //
+ * const gymDetailsRoutes = require('./routes/gymDetails');
+ * app.use('/api/academias', gymDetailsRoutes);
+ * 
+ * // -------------------------------- INICIALIZAÇÃO ---------------------------- //
+ * ```
+ * 
+ * OU SEJA, ADICIONE ESTAS 3 LINHAS entre a linha 5102 e 5104:
+ * 
+ * // ==================== ROTAS DE DETALHES DAS ACADEMIAS (GOOGLE PLACES) ==================== //
+ * const gymDetailsRoutes = require('./routes/gymDetails');
+ * app.use('/api/academias', gymDetailsRoutes);
+ * 
+ */
+
+// Cole este código no index.js na linha 5103 (após o "});" e antes do comentário "INICIALIZAÇÃO"):
+
+// ==================== ROTAS DE DETALHES DAS ACADEMIAS (GOOGLE PLACES) ==================== //
+const gymDetailsRoutes = require('./routes/gymDetails');
+app.use('/api/academias', gymDetailsRoutes);
