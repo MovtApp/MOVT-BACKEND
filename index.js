@@ -380,6 +380,21 @@ console.log(`📡 URL Base configurada: ${BASE_URL}`);
 app.use(express.json());
 app.use(cors());
 
+// Rota raiz para confirmar que o servidor está online
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    message: "MOVT API Backend está rodando!",
+    environment: process.env.NODE_ENV || "development",
+    version: "1.0.0"
+  });
+});
+
+// Alias para /api
+app.get("/api", (req, res) => {
+  res.json({ message: "Use as rotas específicas da API (ex: /api/academias, /api/user)" });
+});
+
 // Middleware de verificaçáo de sessá£o
 function verifyToken(req, res, next) {
   const authHeader = req.headers["authorization"];
