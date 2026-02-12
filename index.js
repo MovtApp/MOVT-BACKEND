@@ -9,7 +9,13 @@ const crypto = require("crypto");
 const multer = require("multer");
 const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const Stripe = require('stripe');
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
+
+if (!stripe) {
+  console.warn("⚠️  Aviso: STRIPE_SECRET_KEY não encontrada. As rotas de pagamento não funcionarão.");
+}
 
 const databaseUrl = process.env.DATABASE_URL;
 const emailUser = process.env.EMAIL_USER;
