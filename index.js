@@ -364,6 +364,13 @@ function decryptMessage(encryptedText) {
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Configuração dinâmica da URL Base do Backend
+const BASE_URL = process.env.APP_URL || (process.env.NODE_ENV === 'production'
+  ? 'https://movt-backend.vercel.app'
+  : `http://localhost:${port}`);
+
+console.log(`📡 URL Base configurada: ${BASE_URL}`);
+
 app.use(express.json());
 app.use(cors());
 
