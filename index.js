@@ -97,6 +97,49 @@ async function initDb() {
       console.log("Aviso: Falha ao renomear coluna ou coluna ja renomeada.");
     }
 
+    await sql`ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_sender_id TEXT DEFAULT NULL`;
+
+    // Garantir coluna de especialidades para usuários (principalmente personals)
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS especialidades TEXT[] DEFAULT '{}'`;
+
+    // Garantir tabela de treinos (usando nome exclusivo para evitar conflito)
+    await sql`CREATE TABLE IF NOT EXISTS conteudo_treinos (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      calories TEXT,
+      minutes TEXT,
+      image_url TEXT,
+      specialty TEXT,
+      level TEXT DEFAULT 'Iniciante',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+    // Inserir treinos padrão se a tabela estiver vazia
+    const [treinosCount] = await sql`SELECT count(*) FROM conteudo_treinos`;
+    if (parseInt(treinosCount.count) === 0) {
+      await sql`
+        INSERT INTO conteudo_treinos (title, calories, minutes, image_url, specialty) VALUES
+        ('Agachamento Pesado', '180 - 250 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_71_jntmsv.jpg', 'Musculação'),
+        ('Supino Reto', '150 - 200 Kcal', '12 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_txncpp.jpg', 'Musculação'),
+        ('HIIT Queima Gordura', '300 - 450 Kcal', '20 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'HIIT'),
+        ('Funcional Core', '200 - 300 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_73_co9eqf.jpg', 'Treinamento Funcional'),
+        ('Pilates Postural', '100 - 150 Kcal', '30 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_75_drh4vh.jpg', 'Pilates'),
+        ('Deadlift Progressiva', '200 - 350 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'Hipertrofia')
+      `;
+    }
+
+    // Tabela para avaliações de treinos concluídos
+    await sql`CREATE TABLE IF NOT EXISTS avaliacoes_treinos (
+      id SERIAL PRIMARY KEY,
+      id_agendamento INTEGER NOT NULL,
+      id_autor TEXT NOT NULL,
+      id_destino TEXT NOT NULL,
+      nota_profissional INTEGER NOT NULL,
+      nota_treino INTEGER NOT NULL,
+      comentario TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
     console.log("✅ Banco de dados sincronizado.");
   } catch (err) {
     console.error("❌ Erro ao sincronizar banco de dados:", err);
@@ -140,30 +183,36 @@ async function resolveUserId(id) {
 
 // Funçáo auxiliar para obter o UUID do Supabase Auth a partir do ID do seu banco
 async function getUserAuthId(userId) {
-  // Esta funçáo deve buscar o mapeamento entre o ID do seu banco e o UUID do Supabase Auth
-  // Primeiro tenta buscar na tabela de mapeamento real
-  const { data, error } = await supabase
-    .from('user_id_mapping')
-    .select('auth_user_id')
-    .eq('id_us', userId)
-    .single();
+  console.log(`[getUserAuthId] Buscando mapeamento para usuário ${userId}...`);
+  try {
+    const { data, error } = await supabase
+      .from('user_id_mapping')
+      .select('auth_user_id')
+      .eq('id_us', userId)
+      .single();
 
-  if (!error && data) {
-    return data;
+    if (error) {
+      console.log(`[getUserAuthId] Aviso: Não encontrei mapeamento direto: ${error.message}`);
+    } else if (data) {
+      console.log(`[getUserAuthId] Mapeamento encontrado: ${data.auth_user_id}`);
+      return data;
+    }
+  } catch (err) {
+    console.error("[getUserAuthId] Erro ao buscar no Supabase:", err.message);
   }
 
-  // Se ná£o encontrar na tabela de mapeamento, vamos buscar o email do usuá¡rio no banco principal
+  console.log(`[getUserAuthId] Tentando obter e-mail para usuário ${userId}...`);
   try {
     const [user] = await sql`
       SELECT id_us, email, nome FROM usuarios WHERE id_us = ${userId}
     `;
 
     if (user && user.email) {
-      // Tenta encontrar ou criar o usuá¡rio no Supabase Auth
+      console.log(`[getUserAuthId] Usuário encontrado: ${user.email}. Garantindo no Supabase Auth...`);
       return await ensureUserInSupabaseAuth(user);
     }
   } catch (dbError) {
-    console.error("Erro ao buscar dados do usuário no banco principal:", dbError);
+    console.error(`[getUserAuthId] Erro no banco: ${dbError.message}`);
   }
 
   return null;
@@ -328,7 +377,11 @@ async function sendVerificationEmail(toEmail, verificationCode) {
 }
 
 // Encryption/Decryption functions for message content
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
+let ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '6f9a2b8c4d7e1f3a5b0c9d8e7f6a5b4c'; // 32 bytes fallback
+if (typeof ENCRYPTION_KEY === 'string' && ENCRYPTION_KEY.length !== 32) {
+  // Ajustar para 32 bytes se necessário (pad ou truncate)
+  ENCRYPTION_KEY = ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32);
+}
 const IV_LENGTH = 16; // For AES-256-CBC, this is always 16
 
 function encryptMessage(text) {
@@ -687,11 +740,12 @@ app.post("/api/login", async (req, res) => {
         .json({ error: "Token de sessá£o inconsistente ou invá¡lido." });
     }
 
+    console.log(`[LOGIN] Buscando mapeamento Supabase para usuário ID ${user.id_us}...`);
     // Obter o UUID do Supabase Auth para o usuá¡rio
     const userMapping = await getUserAuthId(user.id_us);
     const supabase_uid = userMapping ? userMapping.auth_user_id : null;
 
-    console.log(`✅ Login realizado: ${email}`);
+    console.log(`✅ [LOGIN] Sucesso: ${email} (UID: ${supabase_uid})`);
     res.status(200).json({
       message: "Login bem-sucedido!",
       user: {
@@ -2985,6 +3039,7 @@ app.get("/api/chat", verifyToken, async (req, res) => {
         last_timestamp,
         unread_count_p1,
         unread_count_p2,
+        last_sender_id,
         created_at
       `)
       .or(`participant1_id.eq.${supabaseUserId},participant2_id.eq.${supabaseUserId}`)
@@ -3098,7 +3153,6 @@ app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
   }
 });
 
-
 app.delete("/api/chat/:id_chat", verifyToken, async (req, res) => {
 
   const userId = req.userId;
@@ -3197,7 +3251,8 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
         SET 
           unread_count_p1 = unread_count_p1 + 1,
           last_message = ${text || 'Imagem'},
-          last_timestamp = NOW()
+          last_timestamp = NOW(),
+          last_sender_id = ${supabaseUserId}
         WHERE id = ${id_chat}
       `;
     } else {
@@ -3207,7 +3262,8 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
         SET 
           unread_count_p2 = unread_count_p2 + 1,
           last_message = ${text || 'Imagem'},
-          last_timestamp = NOW()
+          last_timestamp = NOW(),
+          last_sender_id = ${supabaseUserId}
         WHERE id = ${id_chat}
       `;
     }
@@ -3332,16 +3388,18 @@ app.delete("/api/chat/messages/:id_message", verifyToken, async (req, res) => {
     }
     const supabaseUserId = user.auth_user_id;
 
-    // 2. Buscar a mensagem para verificar o remetente
+    // 2. Buscar a mensagem para verificar o remetente e obter o chat_id
     const { data: message, error: fetchErr } = await supabase
       .from('messages')
-      .select('sender_id')
+      .select('sender_id, chat_id')
       .eq('id', id_message)
       .single();
 
     if (fetchErr || !message) {
       return res.status(404).json({ error: "Mensagem não encontrada." });
     }
+
+    const chatId = message.chat_id;
 
     // 3. Verificar se o usuário é o remetente da mensagem
     if (message.sender_id !== supabaseUserId) {
@@ -3356,7 +3414,40 @@ app.delete("/api/chat/messages/:id_message", verifyToken, async (req, res) => {
 
     if (deleteErr) throw deleteErr;
 
-    res.status(200).json({ message: "Mensagem deletada com sucesso!" });
+    // 5. Verificar se ainda restam mensagens no chat
+    const { data: remainingMessages, error: countErr } = await supabase
+      .from('messages')
+      .select('id, text, created_at, sender_id')
+      .eq('chat_id', chatId)
+      .order('created_at', { ascending: false });
+
+    if (countErr) {
+      console.error("Erro ao contar mensagens restantes:", countErr);
+    } else if (remainingMessages.length === 0) {
+      // 6. Se não restam mensagens, deletar o chat do Supabase e do banco local
+      console.log(`[Chat Cleanup] Deletando chat vazio: ${chatId}`);
+
+      // Deleta do Supabase
+      await supabase.from('chats').delete().eq('id', chatId);
+
+      // Deleta do Postgres local
+      await sql`DELETE FROM chats WHERE id = ${chatId}`;
+    } else {
+      // 7. Se ainda existem mensagens, atualizar o preview do chat com a mensagem mais recente
+      const lastMsg = remainingMessages[0];
+      const decryptedText = lastMsg.text ? decryptMessage(lastMsg.text) : 'Imagem';
+
+      await sql`
+        UPDATE chats 
+        SET 
+          last_message = ${decryptedText},
+          last_timestamp = ${lastMsg.created_at},
+          last_sender_id = ${lastMsg.sender_id}
+        WHERE id = ${chatId}
+      `;
+    }
+
+    res.status(200).json({ message: "Mensagem deletada com sucesso e chat sincronizado!" });
   } catch (error) {
     console.error("Erro ao deletar mensagem:", error);
     res.status(500).json({ error: "Erro interno", details: error.message });
@@ -3863,41 +3954,85 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
 
   try {
     // Fórmula Haversine para calcular distância usando subquery
-    const academias = await sql`
-      SELECT * FROM (
-        SELECT 
-          id_academia,
-          nome,
-          rating,
-          total_avaliacoes,
-          endereco_completo,
-          rua,
-          numero,
-          bairro,
-          cidade,
-          estado,
-          cep,
-          latitude,
-          longitude,
-          telefone,
-          whatsapp,
-          (
-            6371 * acos(
-              LEAST(1, GREATEST(-1, 
-                cos(radians(${latitude})) * 
-                cos(radians(latitude)) * 
-                cos(radians(longitude) - radians(${longitude})) + 
-                sin(radians(${latitude})) * 
-                sin(radians(latitude))
-              ))
+    const specialty = req.query.specialty;
+
+    let academias;
+    if (specialty) {
+      // Filtrar por academias que possuem personais com a especialidade selecionada
+      academias = await sql`
+        SELECT * FROM (
+          SELECT DISTINCT
+            a.id_academia,
+            a.nome,
+            a.rating,
+            a.total_avaliacoes,
+            a.endereco_completo,
+            a.latitude,
+            a.longitude,
+            a.telefone,
+            a.whatsapp,
+            (
+              6371 * acos(
+                LEAST(1, GREATEST(-1, 
+                  cos(radians(${latitude})) * 
+                  cos(radians(a.latitude)) * 
+                  cos(radians(a.longitude) - radians(${longitude})) + 
+                  sin(radians(${latitude})) * 
+                  sin(radians(a.latitude))
+                ))
+              )
+            ) AS distancia_km
+          FROM academias a
+          JOIN gym_trainers gt ON gt.gym_id = a.id_academia
+          JOIN usuarios u ON gt.personal_id = u.id_us
+          LEFT JOIN personal_profiles pp ON pp.id_trainer = u.id_us
+          WHERE a.ativo = TRUE 
+            AND gt.status = 'active'
+            AND (
+              ${specialty} = ANY(u.especialidades) 
+              OR ${specialty} = ANY(pp.especialidades)
             )
-          ) AS distancia_km
-        FROM academias
-        WHERE ativo = TRUE
-      ) AS academias_com_distancia
-      WHERE distancia_km <= ${raioKm}
-      ORDER BY distancia_km ASC
-    `;
+        ) AS academias_com_distancia
+        WHERE distancia_km <= ${raioKm}
+        ORDER BY distancia_km ASC
+      `;
+    } else {
+      academias = await sql`
+        SELECT * FROM (
+          SELECT 
+            id_academia,
+            nome,
+            rating,
+            total_avaliacoes,
+            endereco_completo,
+            rua,
+            numero,
+            bairro,
+            cidade,
+            estado,
+            cep,
+            latitude,
+            longitude,
+            telefone,
+            whatsapp,
+            (
+              6371 * acos(
+                LEAST(1, GREATEST(-1, 
+                  cos(radians(${latitude})) * 
+                  cos(radians(latitude)) * 
+                  cos(radians(longitude) - radians(${longitude})) + 
+                  sin(radians(${latitude})) * 
+                  sin(radians(latitude))
+                ))
+              )
+            ) AS distancia_km
+          FROM academias
+          WHERE ativo = TRUE
+        ) AS academias_com_distancia
+        WHERE distancia_km <= ${raioKm}
+        ORDER BY distancia_km ASC
+      `;
+    }
 
     res.status(200).json({ data: academias });
   } catch (error) {
@@ -3905,6 +4040,34 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
     res.status(500).json({
       error: "Erro interno do servidor ao buscar academias próximas.",
       details: error.message,
+    });
+  }
+});
+
+// Rota para obter treinos filtrados por especialidade
+app.get("/api/treinos", verifyToken, async (req, res) => {
+  const { specialty } = req.query;
+  try {
+    let treinos;
+    if (specialty) {
+      treinos = await sql`
+        SELECT * FROM conteudo_treinos 
+        WHERE specialty = ${specialty}
+        ORDER BY created_at DESC
+      `;
+    } else {
+      treinos = await sql`
+        SELECT * FROM conteudo_treinos 
+        ORDER BY created_at DESC
+      `;
+    }
+    res.status(200).json({ data: treinos });
+  } catch (err) {
+    console.error("Erro ao carregar treinos:", err);
+    res.status(500).json({
+      error: "Erro ao carregar treinos",
+      details: err.message,
+      stack: err.stack
     });
   }
 });
@@ -4650,9 +4813,6 @@ app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
   }
 });
 
-
-
-
 // GET: Listar agendamentos do usuá¡rio (como cliente ou trainer)
 app.get("/api/appointments", verifyToken, async (req, res) => {
   const userId = req.userId;
@@ -4686,9 +4846,11 @@ app.get("/api/appointments", verifyToken, async (req, res) => {
           a.id_agendamento, a.id_trainer, a.id_usuario, 
           a.data_agendamento, a.hora_inicio, a.hora_fim, 
           a.status, a.notas, a.created_at,
-          u.nome as trainer_name, u.email as trainer_email, u.avatar_url as trainer_avatar
+          u.nome as trainer_name, u.email as trainer_email, u.avatar_url as trainer_avatar,
+          CASE WHEN r.id IS NOT NULL THEN true ELSE false END as avaliado
         FROM agendamentos a
         JOIN usuarios u ON a.id_trainer = u.id_us
+        LEFT JOIN avaliacoes_treinos r ON a.id_agendamento = r.id_agendamento
         WHERE a.id_usuario = ${userId}
         ORDER BY a.data_agendamento DESC, a.hora_inicio DESC
         LIMIT 50
@@ -4997,6 +5159,78 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
 });
 
 // 2. POST: Criar Agendamento (CORRIGIDO)
+// Rota para avaliar um agendamento concluído
+app.post("/api/appointments/:id/rate", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { ratingProfessional, ratingTraining, comment, trainerId } = req.body;
+  const userId = req.userId;
+
+  console.log(`[RATE] Início - AgendamentoID: ${id}, AutorID: ${userId}`);
+
+  try {
+    const numericApptId = parseInt(id, 10);
+    const numericTrainerId = parseInt(trainerId || 0, 10);
+
+    // 1. Verificar agendamento
+    const [appointment] = await sql`
+      SELECT id_agendamento, id_trainer, status FROM agendamentos 
+      WHERE id_agendamento = ${numericApptId} 
+        AND LOWER(status) IN ('concluido', 'concluído')
+    `;
+
+    if (!appointment) {
+      console.log(`[RATE] Erro: Agendamento ${id} não encontrado ou não concluído.`);
+      return res.status(404).json({ error: "Agendamento não encontrado ou não concluído." });
+    }
+
+    const finalTrainerId = numericTrainerId || appointment.id_trainer;
+    console.log(`[RATE] Validado. Inserindo na tabela avaliacoes_treinos para trainer: ${finalTrainerId}`);
+
+    // 2. Salvar avaliação na tabela avaliacoes_treinos (que criamos no initDb)
+    const [rating] = await sql`
+      INSERT INTO avaliacoes_treinos (
+        id_agendamento, id_autor, id_destino, nota_profissional, nota_treino, comentario
+      ) VALUES (
+        ${numericApptId}, ${userId.toString()}, ${finalTrainerId.toString()}, 
+        ${parseInt(ratingProfessional, 10)}, ${parseInt(ratingTraining, 10)}, ${comment || ''}
+      )
+      RETURNING *
+    `;
+
+    console.log(`[RATE] Avaliação salva. Atualizando média do personal...`);
+
+    // 3. Atualizar o ranking do personal no perfil dele (Opcional, não deve travar o envio)
+    try {
+      const [avgData] = await sql`
+        SELECT AVG(nota_profissional) as avg_rating, COUNT(*) as total_ratings
+        FROM avaliacoes_treinos
+        WHERE id_destino = ${finalTrainerId.toString()}
+      `;
+
+      if (avgData && avgData.avg_rating) {
+        await sql`
+          UPDATE personal_profiles 
+          SET rating = ${parseFloat(avgData.avg_rating).toFixed(1)}, 
+              total_avaliacoes = ${parseInt(avgData.total_ratings, 10)}
+          WHERE id_trainer = ${parseInt(finalTrainerId, 10)}
+        `;
+        console.log(`[RATE] Ranking do personal ${finalTrainerId} atualizado.`);
+      }
+    } catch (profileErr) {
+      console.error("[RATE] Aviso: Erro ao atualizar perfil do personal, mas avaliação foi salva:", profileErr.message);
+    }
+
+    return res.status(201).json({ message: "Avaliação enviada com sucesso!", data: rating });
+  } catch (err) {
+    console.error("[RATE] Erro Detalhado:", err);
+    res.status(500).json({
+      error: "Erro interno ao salvar avaliação.",
+      message: err.message,
+      code: err.code
+    });
+  }
+});
+
 app.post("/api/appointments", verifyToken, async (req, res) => {
   const userId = req.userId;
   const { trainerId, date, startTime, endTime, notes } = req.body;
@@ -5064,7 +5298,7 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
       INSERT INTO agendamentos (
         id_trainer, id_usuario, data_agendamento, hora_inicio, hora_fim, status, notas
       ) VALUES (
-        ${parseInt(trainerId, 10)}, ${userId}, ${date}, ${startTime}, ${endTime}, 'confirmado', ${notes}
+        ${parseInt(trainerId, 10)}, ${userId}, ${date}, ${startTime}, ${endTime}, 'pendente', ${notes}
       ) RETURNING *
     `;
 
@@ -5093,12 +5327,18 @@ app.get("/api/academias/nearby", async (req, res) => {
 
 // -------------------------------- INICIALIZAÇÃO ---------------------------- //
 
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(port, "0.0.0.0", () => {
-    console.log(`Servidor rodando em http://localhost:${port}`);
-    console.log(`Servidor também acessível via IP da rede local`);
-  });
-}
+// -------------------------------- INICIALIZAÇÃO ---------------------------- //
+
+console.log("🛠️ Tentando iniciar servidor na porta 3000...");
+
+app.listen(3000, "0.0.0.0", () => {
+  console.log("------------------------------------------");
+  console.log("🚀 BACKEND MOVT RODANDO COM SUCESSO!");
+  console.log("📍 Base URL: http://localhost:3000");
+  console.log("------------------------------------------");
+}).on('error', (err) => {
+  console.error("❌ Erro ao iniciar servidor:", err);
+});
 
 module.exports = app;
 
