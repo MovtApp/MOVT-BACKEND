@@ -1,0 +1,26 @@
+[
+  {
+    "column_name": "id_treino",
+    "data_type": "integer"
+  },
+  {
+    "column_name": "tipo_exercicio",
+    "data_type": "character varying"
+  },
+  {
+    "column_name": "exercicios",
+    "data_type": "character varying"
+  },
+  {
+    "column_name": "tipo_treino",
+    "data_type": "character varying"
+  },
+  {
+    "column_name": "createdat",
+    "data_type": "timestamp without time zone"
+  },
+  {
+    "column_name": "updatedat",
+    "data_type": "timestamp without time zone"
+  }
+]

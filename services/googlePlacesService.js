@@ -172,9 +172,11 @@ function transformOpeningHours(openingHours) {
             formatted[day] = [];
         }
 
+        const is24h = !period.close || (period.open.day === period.close.day && period.open.time === period.close.time);
+
         const opening = {
             abre: period.open.time,
-            fecha: period.close ? period.close.time : '2359'
+            fecha: is24h ? '2359' : period.close.time
         };
 
         formatted[day].push(opening);
@@ -193,11 +195,38 @@ function isCacheValid(lastUpdate) {
     return cacheAge < thirtyDaysInMs;
 }
 
+/**
+ * Autocomplete places search
+ */
+async function autocompletePlaces(query) {
+    try {
+        const response = await axios.get(`${GOOGLE_PLACES_BASE_URL}/autocomplete/json`, {
+            params: {
+                input: query,
+                key: GOOGLE_PLACES_API_KEY,
+                language: 'pt-BR',
+                types: 'establishment',
+                components: 'country:br' // Limit to Brazil
+            }
+        });
+
+        if (response.data.status !== 'OK' && response.data.status !== 'ZERO_RESULTS') {
+            throw new Error(`Google Places Autocomplete error: ${response.data.status}`);
+        }
+
+        return response.data.predictions || [];
+    } catch (error) {
+        console.error('Error in autocomplete:', error);
+        throw error;
+    }
+}
+
 module.exports = {
     getPlaceDetails,
     findPlaceByNameAndLocation,
     getPhotoUrl,
     transformOpeningHours,
     isCacheValid,
-    extractAddressComponents
+    extractAddressComponents,
+    autocompletePlaces
 };
