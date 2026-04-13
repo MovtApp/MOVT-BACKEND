@@ -1,13 +1,18 @@
 const postgres = require("postgres");
-const fs = require("fs");
 require("dotenv").config();
 
-const sql = postgres(process.env.DATABASE_URL);
+const sql = postgres(process.env.DATABASE_URL, {
+  ssl: { rejectUnauthorized: false }
+});
 
-async function check() {
+async function checkSchema() {
   try {
-    const tables = await sql`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`;
-    fs.writeFileSync('tables.txt', tables.map(t => t.table_name).join(', '));
+    const follows = await sql`SELECT column_name FROM information_schema.columns WHERE table_name = 'follows'`;
+    console.log('FOLLOWS:', follows.map(f => f.column_name).join(', '));
+
+    const notifs = await sql`SELECT column_name FROM information_schema.columns WHERE table_name = 'notifications'`;
+    console.log('NOTIFICATIONS:', notifs.map(n => n.column_name).join(', '));
+
     process.exit(0);
   } catch (err) {
     console.error(err);
@@ -15,4 +20,4 @@ async function check() {
   }
 }
 
-check();
+checkSchema();

@@ -72,10 +72,10 @@ module.exports = (sql, verifyToken) => {
           ${telefone}, ${whatsapp}, ${rua}, ${numero}, ${bairro}, ${cidade}, ${estado}, ${cep},
           ${google_place_id || null}, TRUE, NOW(), NOW(),
           ${rating || 0}, ${user_ratings_total || 0}, 
-          ${JSON.stringify({ photos, opening_hours, formatted_address: endereco_completo })}, 
+          ${sql.json({ photos, opening_hours, formatted_address: endereco_completo })}, 
           NOW(),
           ${req.body.website || null}, 
-          ${JSON.stringify(transformOpeningHours(opening_hours))}, 
+          ${sql.json(transformOpeningHours(opening_hours))}, 
           ${photos ? photos.map(p => p.photo_reference) : []}
         ) RETURNING *
       `;
@@ -115,6 +115,28 @@ module.exports = (sql, verifyToken) => {
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Erro ao atualizar academia." });
+    }
+  });
+
+  // PATCH: Alternar status da academia (Admin)
+  router.patch('/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+      const [gym] = await sql`SELECT ativo FROM academias WHERE id_academia = ${id}`;
+      if (!gym) return res.status(404).json({ error: "Academia não encontrada." });
+
+      const newStatus = !gym.ativo;
+      const [updated] = await sql`
+        UPDATE academias 
+        SET ativo = ${newStatus}, updatedat = NOW() 
+        WHERE id_academia = ${id} 
+        RETURNING id_academia, ativo
+      `;
+
+      res.json({ success: true, ativo: updated.ativo });
+    } catch (err) {
+      console.error("❌ Erro PATCH /admin/gyms/:id/status:", err);
+      res.status(500).json({ error: "Erro ao atualizar status da academia." });
     }
   });
 
@@ -222,8 +244,11 @@ module.exports = (sql, verifyToken) => {
       const predictions = await autocompletePlaces(query);
       res.json({ success: true, data: predictions });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Erro ao buscar no Google Places." });
+      console.error("❌ ERRO GOOGLE SEARCH:", err.message);
+      res.status(500).json({ 
+        error: "Erro ao buscar no Google Places.", 
+        details: err.response?.data || err.message 
+      });
     }
   });
 

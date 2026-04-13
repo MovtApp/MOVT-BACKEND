@@ -42,8 +42,10 @@ const sql = postgres(databaseUrl, {
     rejectUnauthorized: false
   },
   max: 10,
-  idle_timeout: 20,
-  connect_timeout: 10,
+  idle_timeout: 60, // Aumentado para manter conexões por mais tempo
+  connect_timeout: 30, // Aumentado para 30s para evitar timeouts de rede
+  max_lifetime: 60 * 30, // 30 minutos de vida máxima por conexão
+  keepalive: true, // Crucial para evitar ECONNRESET e timeouts
   prepare: false,
   onnotice: () => { },
   onclose: () => {
@@ -58,6 +60,14 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS job_title TEXT DEFAULT 'Entusiasta Fitness'`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS updatedat TIMESTAMP DEFAULT CURRENT_TIMESTAMP`;
+    
+    // Novas colunas de avatar e banner (usadas em EditProfileScreen)
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avatar_thumbnail TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avatar_medium TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avatar_large TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS banner_url TEXT DEFAULT NULL`;
 
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj TEXT DEFAULT NULL`;
@@ -87,9 +97,30 @@ async function initDb() {
       id SERIAL PRIMARY KEY,
       follower_user_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
       followed_user_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      status TEXT DEFAULT 'accepted', -- 'pending', 'accepted', 'rejected'
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(follower_user_id, followed_user_id)
     )`;
+    await sql`ALTER TABLE follows ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'accepted'`;
+
+    // Garantir tabela de notificações
+    await sql`CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      type TEXT NOT NULL, -- 'like', 'follow', 'follow_request', 'comment'
+      sender_id INTEGER REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      reference_id INTEGER, -- id do post, etc
+      message TEXT,
+      read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+    
+    // Ativar realtime para a tabela no Supabase
+    try {
+      await sql`ALTER PUBLICATION supabase_realtime ADD TABLE notifications;`;
+    } catch (e) {
+      // Ignorar se já estiver adicionada
+    }
 
     // Se a tabela ja existia com trainer_id, renomear para followed_user_id
     try {
@@ -101,11 +132,13 @@ async function initDb() {
           END IF;
         END $$;
       `;
-    } catch (migrateErr) {
+    } catch (_migrateErr) {
       console.log("Aviso: Falha ao renomear coluna ou coluna ja renomeada.");
     }
 
     await sql`ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_sender_id TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE chats ADD COLUMN IF NOT EXISTS deleted_at_p1 TIMESTAMP WITH TIME ZONE DEFAULT NULL`;
+    await sql`ALTER TABLE chats ADD COLUMN IF NOT EXISTS deleted_at_p2 TIMESTAMP WITH TIME ZONE DEFAULT NULL`;
 
     // Garantir coluna de especialidades para usuários (principalmente personals)
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS especialidades TEXT[] DEFAULT '{}'`;
@@ -184,7 +217,9 @@ async function initDb() {
     // Garantir constraint de comunidade
     try {
       await sql`ALTER TABLE community_members ADD CONSTRAINT community_members_id_comunidade_fkey FOREIGN KEY (id_comunidade) REFERENCES comunidades(id) ON DELETE CASCADE`;
-    } catch (e) {}
+    } catch (_e) {
+      // Ignorar erro se a constraint já existir
+    }
 
     // Garantir colunas extras na tabela academias
     await sql`ALTER TABLE academias ADD COLUMN IF NOT EXISTS website TEXT DEFAULT NULL`;
@@ -209,6 +244,12 @@ async function initDb() {
     // Coluna para marcar se o agendamento já teve check-in de pagamento
     await sql`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS pagamento_verificado BOOLEAN DEFAULT FALSE`;
     await sql`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS valor_recebido DECIMAL(10,2) DEFAULT 0.00`;
+
+    // Garantir colunas de curtidas e comentários na tabela de dietas
+    await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS likes_count INTEGER DEFAULT 0`;
+    await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0`;
+    await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS likes JSONB DEFAULT '[]'`;
+    await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments JSONB DEFAULT '[]'`;
 
     console.log("✅ Banco de dados sincronizado.");
   } catch (err) {
@@ -409,7 +450,7 @@ async function ensureUserInSupabaseAuth(user) {
 
   try {
     // Criar o usuário no Supabase Auth usando o Admin API
-    const { data: newUser, error: createUserError } = await supabase.auth.admin.createUser({
+    const { data: userData, error: createUserError } = await supabase.auth.admin.createUser({
       email: user.email,
       email_confirm: true, // Confirmar o email automaticamente
       password: null, // Não definir senha, pois o usuário já existe no seu sistema
@@ -441,7 +482,7 @@ async function ensureUserInSupabaseAuth(user) {
       .from('user_id_mapping')
       .insert({
         id_us: user.id_us,
-        auth_user_id: data.user.id
+        auth_user_id: userData.user.id
       });
 
     if (insertError) {
@@ -449,8 +490,8 @@ async function ensureUserInSupabaseAuth(user) {
       return null;
     }
 
-    console.log(`Usuário criado e mapeamento realizado para ${user.id_us} -> ${data.user.id}`);
-    return { auth_user_id: data.user.id };
+    console.log(`Usuário criado e mapeamento realizado para ${user.id_us} -> ${userData.user.id}`);
+    return { auth_user_id: userData.user.id };
   } catch (adminError) {
     console.error("Erro ao usar Admin API para criar usuário:", adminError);
     // Em caso de erro, gerar UUID temporário como fallback
@@ -575,7 +616,8 @@ const BASE_URL = process.env.APP_URL || (process.env.NODE_ENV === 'production'
 
 console.log(`📡 URL Base configurada: ${BASE_URL}`);
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 app.use(cors());
 
 // Rota raiz para confirmar que o servidor está online
@@ -620,13 +662,7 @@ function checkFreePlanLimit(feature) {
 
       // ---- Usuário FREE: aplicar restrições ----
 
-      if (feature === 'dietas') {
-        return res.status(403).json({
-          error: 'PREMIUM_REQUIRED',
-          message: 'Criar novas dietas é exclusivo do plano Premium.',
-          feature: 'dietas'
-        });
-      }
+      // dietas: sem restrição de plano — todos os usuários podem criar dietas
 
       if (feature === 'agendamentos') {
         const now = new Date();
@@ -637,13 +673,13 @@ function checkFreePlanLimit(feature) {
             AND created_at >= ${startOfMonth}
         `;
         const used = parseInt(count, 10);
-        if (used >= 2) {
+        if (used >= 50) {
           return res.status(403).json({
             error: 'FREE_LIMIT_REACHED',
-            message: 'Você atingiu o limite de 2 agendamentos por mês no plano gratuito.',
+            message: 'Você atingiu o limite de 50 agendamentos por mês no plano gratuito.',
             feature: 'agendamentos',
             used,
-            limit: 2
+            limit: 50
           });
         }
         return next();
@@ -659,13 +695,13 @@ function checkFreePlanLimit(feature) {
             user.community_joins_month = 0;
           }
         }
-        if (user.community_joins_month >= 2) {
+        if (user.community_joins_month >= 50) {
           return res.status(403).json({
             error: 'FREE_LIMIT_REACHED',
-            message: 'Você atingiu o limite de 2 comunidades por mês no plano gratuito.',
+            message: 'Você atingiu o limite de 50 comunidades por mês no plano gratuito.',
             feature: 'comunidades',
             used: user.community_joins_month,
-            limit: 2
+            limit: 50
           });
         }
         return next();
@@ -1339,13 +1375,13 @@ app.get("/api/plans", async (req, res) => {
 
 // PATCH: Editar plano na Stripe (Admin)
 app.patch("/api/admin/plans/:id", verifyToken, upload.single('image'), async (req, res) => {
-  const adminId = req.userId;
+  const _requesterId = req.userId;
+  const [_requesterRole] = await sql`SELECT role FROM usuarios WHERE id_us = ${_requesterId}`;
   const { id } = req.params; // ID do Produto na Stripe
   const { name, description, price, active } = req.body;
 
   try {
-    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
-    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+    if (!_requesterRole || (_requesterRole.role || "").trim().toLowerCase() !== 'admin') {
       return res.status(403).json({ error: "Acesso negado." });
     }
 
@@ -1407,6 +1443,28 @@ app.patch("/api/admin/plans/:id", verifyToken, upload.single('image'), async (re
   }
 });
 
+// DELETE: Arquivar plano na Stripe (Admin)
+app.delete("/api/admin/plans/:id", verifyToken, async (req, res) => {
+  const adminId = req.userId;
+  const { id } = req.params;
+
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+
+    // Na Stripe, não costumamos "deletar" um plano/produto, mas sim arquivá-lo
+    // para não quebrar assinaturas antigas.
+    await stripe.products.update(id, { active: false });
+
+    res.json({ success: true, message: "Plano arquivado com sucesso!" });
+  } catch (error) {
+    console.error("Erro ao arquivar plano na Stripe:", error);
+    res.status(500).json({ error: "Erro ao arquivar plano na Stripe.", details: error.message });
+  }
+});
+
 app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
   const { priceId, quantity } = req.body;
   const userId = req.userId;
@@ -1438,7 +1496,7 @@ app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
   }
 });
 
-// --------------------- VERIFICAÇÃO DE USUáRIO --------------------- //
+// --------------------- VERIFICAÇÃO DE USUá RIO --------------------- //
 
 app.post("/api/user/send-verification", verifyToken, async (req, res) => {
 
@@ -1615,27 +1673,23 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
     // Se o filtro for 'all', mantemos a visão global. Se houver filtro, focamos no segmento.
     const [dbStats] = await sql`
       SELECT 
-        COUNT(*) FILTER (WHERE 
-          (plan = 'premium' OR plan = 'familia') AND 
-          (plan_expires_at IS NULL OR plan_expires_at > NOW()) AND
-          (${filterPlan === 'all' ? sql`TRUE` : sql`plan = ${filterPlan}`}) AND
-          (${filterStatus === 'all' ? sql`TRUE` : 
-             filterStatus === 'active' ? sql`(plan_expires_at IS NULL OR plan_expires_at > NOW())` :
-             filterStatus === 'risk' ? sql`(plan_expires_at > NOW() AND plan_expires_at < NOW() + INTERVAL '30 days')` :
-             sql`plan_expires_at < NOW()`})
-        ) as active_plans,
-        COUNT(*) FILTER (WHERE role = 'personal' OR role = 'trainer') as total_trainers,
-        COUNT(*) FILTER (WHERE role = 'gym' OR role = 'academy') as total_gyms,
-        COUNT(*) FILTER (WHERE plan IN ('premium','familia') AND plan_expires_at > NOW() AND plan_expires_at < NOW() + INTERVAL '30 days') as expiring_soon,
         COUNT(*) as total_users,
+        COUNT(*) FILTER (WHERE role IN ('personal', 'trainer')) as total_trainers,
+        COUNT(*) FILTER (WHERE role IN ('gym', 'academy')) as total_gyms,
+        (SELECT COUNT(*) FROM academias WHERE ativo = TRUE) as total_gyms_real,
         COUNT(*) FILTER (WHERE plan = 'premium' AND (plan_expires_at IS NULL OR plan_expires_at > NOW())) as premium_count,
         COUNT(*) FILTER (WHERE plan = 'familia' AND (plan_expires_at IS NULL OR plan_expires_at > NOW())) as familia_count,
         COUNT(*) FILTER (WHERE plan = 'free' OR plan IS NULL) as free_count,
-        COUNT(*) FILTER (WHERE plan = 'free' AND plan_expires_at IS NOT NULL AND plan_expires_at BETWEEN NOW() - INTERVAL '30 days' AND NOW()) as churned_30d,
-        COUNT(*) FILTER (WHERE plan IN ('premium','familia') AND plan_expires_at BETWEEN NOW() - INTERVAL '60 days' AND NOW() - INTERVAL '30 days') as prev_month_premium,
-        (SELECT COUNT(*) FROM academias WHERE ativo = TRUE) as total_gyms_real,
+        -- Churn Calculation: Users who expired in the last 30 days and didn't renew
+        COUNT(*) FILTER (WHERE plan_expires_at BETWEEN NOW() - INTERVAL '30 days' AND NOW()) as churned_30d,
+        -- Prev Month Base for Percentage
+        COUNT(*) FILTER (WHERE plan_expires_at BETWEEN NOW() - INTERVAL '60 days' AND NOW() - INTERVAL '31 days') as prev_month_base,
+        -- Activity Stats
+        (SELECT COUNT(*) FROM agendamentos) as total_appointments,
+        (SELECT COUNT(*) FROM posts) as total_posts,
+        (SELECT COUNT(*) FROM comunidades) as total_communities,
         (SELECT COUNT(*) FROM conteudo_treinos) as total_workouts,
-        (SELECT COUNT(*) FROM comunidades) as total_communities
+        (SELECT COUNT(*) FROM usuarios WHERE role = 'admin') as total_admins
       FROM usuarios
     `;
 
@@ -1644,22 +1698,24 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
     const familiaCount = parseInt(dbStats.familia_count || '0');
     const freeCount = parseInt(dbStats.free_count || '0');
     const churned30d = parseInt(dbStats.churned_30d || '0');
-    const prevMonthPremium = Math.max(parseInt(dbStats.prev_month_premium || '0'), 1);
+    const prevMonthBase = Math.max(parseInt(dbStats.prev_month_base || '0'), 100); // Fallback to 100 to avoid high variance
 
-    // Taxa de conversão real (premium + familia)
+    // 2.2 Financial Intelligence
     const paidCount = premiumCount + familiaCount;
     const conversionRate = totalUsers > 0 ? ((paidCount / totalUsers) * 100).toFixed(1) : '0.0';
+    
+    // Monthly Operational Cost (Hypothetical: $0.10 per active user + $500 base)
+    const monthlyCost = (totalUsers * 0.10) + 500;
+    
+    // Churn Rate
+    const churnRate = ((churned30d / prevMonthBase) * 100).toFixed(1);
+    const churnNum = Math.min(parseFloat(churnRate), 100);
+    const churnStatus = churnNum < 5 ? 'green' : churnNum < 15 ? 'yellow' : 'red';
 
-    // Distribuição de planos com 3 tiers
-    const totalForDist = premiumCount + familiaCount + freeCount || 1;
-    const premiumPct = Math.round((premiumCount / totalForDist) * 100);
-    const familiaPct = Math.round((familiaCount / totalForDist) * 100);
-    const freePct = 100 - premiumPct - familiaPct;
-
-    // Taxa de Churn
-    const churnRate = ((churned30d / prevMonthPremium) * 100).toFixed(1);
-    const churnNum = parseFloat(churnRate);
-    const churnStatus = churnNum < 5 ? 'green' : churnNum < 10 ? 'yellow' : 'red';
+    // LTV Estimation: (Average Revenue Per User) / Churn Rate
+    // Assuming Avg Premium is $29.90
+    const arpu = 29.90; 
+    const ltv = churnNum > 0 ? (arpu / (churnNum / 100)) : (arpu * 24); // If churn 0, assume 24 months
 
     // 3. Coletar faturamento real do Stripe com suporte a período
     const period = (req.query.period || 'month'); // 'day' | 'month' | 'year'
@@ -1850,16 +1906,38 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
         { id: 'gyms', label: 'Academias', value: String(dbStats.total_gyms_real || '0'), grow: '+3%', color: '#EF4444' },
         { id: 'stripe_plans', label: 'Planos', value: String(totalStripePlans), grow: '+0%', color: '#BBF246' },
       ],
+      financeKpis: [
+        { id: 'revenue', label: 'Faturamento', value: `R$ ${grossRevenueCurrent.toLocaleString('pt-BR')}`, grow: revenueGrowth, color: '#6366F1' },
+        { id: 'ltv', label: 'Venture LTV', value: `R$ ${ltv.toFixed(2)}`, grow: '+15%', color: '#BBF246' },
+        { id: 'cost', label: 'Custo App', value: `R$ ${monthlyCost.toFixed(2)}`, grow: '-2%', color: '#94A3B8' },
+        { id: 'churn', label: 'Taxa Churn', value: `${churnRate}%`, grow: churnStatus === 'green' ? '-2%' : '+5%', color: churnStatus === 'green' ? '#10B981' : '#EF4444' },
+      ],
       revenue: {
         current: grossRevenueCurrent,
         growth: revenueGrowth,
         chart: revenueData,
       },
       planDistribution: [
-        { label: "Família", count: familiaCount, percent: familiaPct, color: "#10B981" },
-        { label: "Premium", count: premiumCount, percent: premiumPct, color: "#6366F1" },
-        { label: "Free", count: freeCount, percent: Math.max(freePct, 0), color: "#94A3B8" },
+        { label: "Família", count: familiaCount, percent: Math.round((familiaCount / (paidCount || 1)) * 100), color: "#10B981" },
+        { label: "Premium", count: premiumCount, percent: Math.round((premiumCount / (paidCount || 1)) * 100), color: "#6366F1" },
+        { label: "Free", count: freeCount, percent: Math.round((freeCount / (totalUsers || 1)) * 100), color: "#94A3B8" },
       ],
+      churn: {
+        rate: churnRate,
+        status: churnStatus,
+        count: churned30d
+      },
+      ltv: {
+        value: ltv,
+        arpu: arpu
+      },
+      globalStats: {
+        appointments: dbStats.total_appointments,
+        posts: dbStats.total_posts,
+        communities: dbStats.total_communities,
+        workouts: dbStats.total_workouts,
+        admins: dbStats.total_admins
+      },
       conversion: {
         rate: parseFloat(conversionRate),
         totalUsers,
@@ -1934,6 +2012,8 @@ app.get("/api/admin/all-users", verifyToken, async (req, res) => {
         email,
         avatar_url as foto_url,
         plan,
+        role,
+        cref,
         ativo,
         createdat as created_at
       FROM usuarios
@@ -1970,6 +2050,78 @@ app.patch("/api/admin/users/:id/toggle-active", verifyToken, async (req, res) =>
   } catch (err) {
     console.error('[toggle-active]', err);
     res.status(500).json({ error: "Erro ao alternar status do usuário." });
+  }
+});
+
+// PATCH: Mudar papel do usuário (Admin)
+app.patch("/api/admin/users/:id/role", verifyToken, async (req, res) => {
+  const adminId = req.userId;
+  const { id } = req.params;
+  const { role } = req.body;
+
+  if (!role) return res.status(400).json({ error: "Papel não informado." });
+
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+
+    const [updated] = await sql`
+      UPDATE usuarios SET role = ${role} WHERE id_us = ${id} RETURNING id_us, role
+    `;
+
+    if (!updated) return res.status(404).json({ error: "Usuário não encontrado." });
+
+    res.json({ success: true, role: updated.role });
+  } catch (err) {
+    console.error('[update-role]', err);
+    res.status(500).json({ error: "Erro ao mudar papel do usuário." });
+  }
+});
+
+// PATCH: Mudar plano do usuário (Admin)
+app.patch("/api/admin/users/:id/plan", verifyToken, async (req, res) => {
+  const adminId = req.userId;
+  const { id } = req.params;
+  const { plan, expiration_days } = req.body;
+
+  if (!plan) return res.status(400).json({ error: "Plano não informado." });
+
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+
+    // Calcular data de expiração se fornecida
+    let expiresAt = null;
+    if (plan !== 'FREE' && plan !== 'free') {
+      const days = expiration_days || 30;
+      expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + days);
+    }
+
+    const [updated] = await sql`
+      UPDATE usuarios 
+      SET 
+        plan = ${plan}, 
+        plan_expires_at = ${expiresAt},
+        updatedat = NOW()
+      WHERE id_us = ${id} 
+      RETURNING id_us, plan, plan_expires_at
+    `;
+
+    if (!updated) return res.status(404).json({ error: "Usuário não encontrado." });
+
+    res.json({ 
+      success: true, 
+      plan: updated.plan, 
+      expires_at: updated.plan_expires_at 
+    });
+  } catch (err) {
+    console.error('[update-plan]', err);
+    res.status(500).json({ error: "Erro ao mudar plano do usuário." });
   }
 });
 
@@ -2010,7 +2162,7 @@ app.get("/api/admin/trainers", verifyToken, async (req, res) => {
 
     const users = await sql`
       SELECT 
-        id_us, nome, email, avatar_url as foto_url, role as plan, createdat as created_at
+        id_us, nome, email, avatar_url as foto_url, role, cref, ativo, createdat as created_at
       FROM usuarios
       WHERE role IN ('personal', 'trainer')
       ORDER BY nome ASC
@@ -2094,6 +2246,106 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
 });
 
 // -------------------------------- UPLOAD DE AVATAR ---------------------------- //
+
+
+// Sincronizar URLs de imagens após upload direto (Padrão de Elite)
+app.put("/api/user/sync-images", verifyToken, async (req, res) => {
+  const { avatar_url, banner_url } = req.body;
+  const userId = req.userId;
+  const now = new Date();
+
+  try {
+    if (avatar_url) {
+      await sql`
+        UPDATE usuarios
+        SET avatar_url = ${avatar_url},
+            avatar_thumbnail = ${avatar_url},
+            updatedat = ${now}
+        WHERE id_us = ${userId}
+      `;
+    }
+    
+    if (banner_url) {
+      await sql`
+        UPDATE usuarios
+        SET banner_url = ${banner_url},
+            updatedat = ${now}
+        WHERE id_us = ${userId}
+      `;
+    }
+
+    return res.status(200).json({ success: true, message: "Perfil atualizado com sucesso." });
+  } catch (err) {
+    console.error("Erro ao sincronizar imagens:", err);
+    return res.status(500).json({ error: "Erro interno no servidor." });
+  }
+});
+
+
+// Upload de Avatar via Base64 (Padrão de Elite: evita erros de conexão Multipart e RLS)
+app.put("/api/user/avatar-base64", verifyToken, async (req, res) => {
+  const { base64, mimetype } = req.body;
+  const userId = req.userId;
+
+  if (!base64) {
+    return res.status(400).json({ error: "Dados base64 não enviados." });
+  }
+
+  try {
+    // Converter base64 para Buffer
+    const buffer = Buffer.from(base64, "base64");
+    
+    // Processar e salvar (usa Sharp e Mestre Key do Supabase)
+    const urls = await processAndSaveAvatar(userId, buffer, mimetype || "image/jpeg");
+
+    // Atualizar banco
+    const now = new Date();
+    await sql`
+      UPDATE usuarios
+      SET avatar_url = ${urls.original},
+          avatar_thumbnail = ${urls.thumb96},
+          avatar_medium = ${urls.thumb192},
+          avatar_large = ${urls.thumb512},
+          updatedat = ${now}
+      WHERE id_us = ${userId}
+    `;
+
+    return res.status(200).json({ success: true, data: { photo: urls.original } });
+  } catch (err) {
+    console.error("Erro no upload base64 avatar:", err);
+    return res.status(500).json({ error: "Erro interno no processamento via base64." });
+  }
+});
+
+// Upload de Banner via Base64
+app.put("/api/user/banner-base64", verifyToken, async (req, res) => {
+  const { base64, mimetype } = req.body;
+  const userId = req.userId;
+
+  if (!base64) {
+    return res.status(400).json({ error: "Dados base64 não enviados." });
+  }
+
+  try {
+    const buffer = Buffer.from(base64, "base64");
+    
+    // Usamos o processador de avatar que salva numa estrutura similar
+    const urls = await processAndSaveAvatar(userId, buffer, mimetype || "image/jpeg");
+
+    const now = new Date();
+    await sql`
+      UPDATE usuarios
+      SET banner_url = ${urls.original},
+          updatedat = ${now}
+      WHERE id_us = ${userId}
+    `;
+
+    return res.status(200).json({ success: true, data: { banner: urls.original } });
+  } catch (err) {
+    console.error("Erro no upload base64 banner:", err);
+    return res.status(500).json({ error: "Erro interno no processamento de banner." });
+  }
+});
 
 app.put("/api/user/avatar", verifyToken, upload.single("avatar"), async (req, res) => {
   if (!req.file) {
@@ -2781,74 +3033,96 @@ app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
 // --------------------- SOCIAL / SEGUIR USUÁRIOS --------------------- //
 
 // Seguir um usuário
-app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
-  const followerId = parseInt(req.userId);
-  const followedId = await resolveUserId(req.params.id);
 
-  if (!followedId) {
+// --- ROTAS DE SEGUIMENTO (AVANÇADAS) ---
+
+// Seguir um usuário (com suporte a solicitação pendente)
+app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
+  const followedUserId = await resolveUserId(req.params.id);
+  const followerUserId = req.userId;
+
+  if (!followedUserId || isNaN(followedUserId)) {
     return res.status(404).json({ error: "Usuário não encontrado." });
   }
 
-  if (followerId === followedId) {
+  if (followedUserId === followerUserId) {
     return res.status(400).json({ error: "Você não pode seguir a si mesmo." });
   }
 
   try {
-    await sql`
-      INSERT INTO follows (follower_user_id, followed_user_id)
-      VALUES (${followerId}, ${followedId})
-      ON CONFLICT (follower_user_id, followed_user_id) DO NOTHING
+    const [existing] = await sql`
+      SELECT status FROM follows 
+      WHERE follower_user_id = ${followerUserId} AND followed_user_id = ${followedUserId}
     `;
 
-    return res.status(200).json({ success: true, message: "Usuário seguido com sucesso." });
+    if (existing) {
+       // Se já existe, o POST funciona como toggle (desfaz o seguimento)
+       await sql`DELETE FROM follows WHERE follower_user_id = ${followerUserId} AND followed_user_id = ${followedUserId}`;
+       await sql`DELETE FROM notifications WHERE sender_id = ${followerUserId} AND user_id = ${followedUserId} AND type IN ('follow', 'follow_request')`;
+       return res.status(200).json({ success: true, isFollowing: false });
+    }
+
+    const status = 'pending'; 
+    await sql`
+      INSERT INTO follows (follower_user_id, followed_user_id, status)
+      VALUES (${followerUserId}, ${followedUserId}, ${status})
+      ON CONFLICT (follower_user_id, followed_user_id) DO UPDATE SET status = ${status}
+    `;
+
+    // REMOVIDO: Não inserir notificação em atividade para o pedido enviado (ficará apenas na aba solicitações)
+    
+    return res.status(200).json({ success: true, isFollowing: false, status });
   } catch (err) {
     console.error("Erro ao seguir usuário:", err);
     return res.status(500).json({ error: "Erro interno ao seguir usuário." });
   }
 });
 
-// Deixar de seguir um usuário
+// Parar de seguir um usuário (Unfollow)
 app.delete("/api/user/:id/unfollow", verifyToken, async (req, res) => {
-  const followerId = parseInt(req.userId);
-  const followedId = await resolveUserId(req.params.id);
-
-  if (!followedId) {
-    return res.status(404).json({ error: "Usuário não encontrado." });
-  }
+  const followedUserId = await resolveUserId(req.params.id);
+  const followerUserId = req.userId;
 
   try {
     await sql`
       DELETE FROM follows 
-      WHERE follower_user_id = ${followerId} AND followed_user_id = ${followedId}
+      WHERE follower_user_id = ${followerUserId} AND followed_user_id = ${followedUserId}
     `;
+    
+    // Remover notificações de follow associadas
+    await sql`
+      DELETE FROM notifications 
+      WHERE sender_id = ${followerUserId} AND user_id = ${followedUserId} AND type IN ('follow', 'follow_request')
+    `;
+
     return res.status(200).json({ success: true, message: "Deixou de seguir com sucesso." });
   } catch (err) {
-    console.error("Erro ao deixar de seguir:", err);
+    console.error("Erro ao desassociar follow:", err);
     return res.status(500).json({ error: "Erro interno ao deixar de seguir." });
   }
 });
 
-// Verificar se segue um usuário
+// Verificar status de seguimento
 app.get("/api/user/:id/follow-status", verifyToken, async (req, res) => {
-  const followerId = parseInt(req.userId);
-  const followedId = await resolveUserId(req.params.id);
-
-  if (!followedId) {
-    return res.status(200).json({ isFollowing: false });
-  }
+  const followedUserId = await resolveUserId(req.params.id);
+  const followerUserId = req.userId;
 
   try {
     const [follow] = await sql`
-      SELECT 1 FROM follows 
-      WHERE follower_user_id = ${followerId} AND followed_user_id = ${followedId}
-      LIMIT 1
+      SELECT status FROM follows 
+      WHERE follower_user_id = ${followerUserId} AND followed_user_id = ${followedUserId}
     `;
-    return res.status(200).json({ isFollowing: !!follow });
+    
+    return res.status(200).json({ 
+      isFollowing: follow ? (follow.status === 'accepted') : false,
+      status: follow ? follow.status : null 
+    });
   } catch (err) {
-    console.error("Erro ao verificar follow status:", err);
-    return res.status(200).json({ isFollowing: false });
+    console.error("Erro ao buscar status de follow:", err);
+    return res.status(500).json({ isFollowing: false });
   }
 });
+
 
 // -------------------- GRAFO / REDE DE SEGUIDORES -------------------- //
 
@@ -3058,6 +3332,138 @@ app.get("/api/search", verifyToken, async (req, res) => {
   }
 });
 
+// --- NOVAS ROTAS DE NOTIFICAÇÕES E SEGUIMENTO --- //
+
+// Obter notificações do usuário
+app.get("/api/user/notifications", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  console.log(`[DEBUG] Buscando notificações para o usuário id_us: ${userId}`);
+  try {
+    const notifications = await sql`
+      SELECT 
+        n.*, 
+        u.nome as sender_name, 
+        u.username as sender_username, 
+        u.avatar_url as sender_avatar
+      FROM notifications n
+      JOIN usuarios u ON n.sender_id = u.id_us
+      WHERE n.user_id = ${userId}
+      ORDER BY n.created_at DESC
+      LIMIT 50
+    `;
+    console.log(`[DEBUG] Notificações encontradas: ${notifications.length}`);
+    return res.status(200).json({ success: true, data: notifications });
+  } catch (err) {
+    console.error("Erro ao buscar notificações:", err);
+    return res.status(500).json({ error: "Erro ao buscar notificações." });
+  }
+});
+
+// Marcar uma notificação como lida
+app.put("/api/user/notifications/:id/read", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+  try {
+    await sql`
+      UPDATE notifications 
+      SET "read" = TRUE 
+      WHERE id = ${id} AND user_id = ${userId}
+    `;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro ao marcar notificação como lida:", err);
+    return res.status(500).json({ error: "Erro ao atualizar notificação." });
+  }
+});
+
+// Marcar todas as notificações como lidas (Limpar)
+app.put("/api/user/notifications/read-all", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    await sql`
+      UPDATE notifications 
+      SET "read" = TRUE 
+      WHERE user_id = ${userId} AND "read" = FALSE
+    `;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro ao limpar notificações:", err);
+    return res.status(500).json({ error: "Erro ao limpar notificações." });
+  }
+});
+
+// Obter solicitações de amizade pendentes
+app.get("/api/user/follow-requests", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  console.log(`[DEBUG] Buscando solicitações para o usuário id_us: ${userId}`);
+  try {
+    const requests = await sql`
+      SELECT 
+        u.id_us as id, 
+        u.nome as name, 
+        u.username, 
+        u.avatar_url as photo,
+        f.created_at
+      FROM follows f
+      JOIN usuarios u ON f.follower_user_id = u.id_us
+      WHERE f.followed_user_id = ${userId} AND f.status = 'pending'
+      ORDER BY f.created_at DESC
+    `;
+    console.log(`[DEBUG] Solicitações encontradas: ${requests.length}`);
+    return res.status(200).json({ success: true, data: requests });
+  } catch (err) {
+    console.error("Erro ao buscar solicitações:", err);
+    return res.status(500).json({ error: "Erro ao buscar solicitações." });
+  }
+});
+
+// Responder a uma solicitação de amizade
+app.post("/api/user/follow-requests/:senderId/respond", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { senderId } = req.params;
+  const { accept } = req.body;
+
+  try {
+    if (accept) {
+      await sql`
+        UPDATE follows 
+        SET status = 'accepted' 
+        WHERE follower_user_id = ${senderId} AND followed_user_id = ${userId}
+      `;
+      
+      // Criar notificação para quem enviou a solicitação (User A)
+      await sql`
+        INSERT INTO notifications (user_id, type, sender_id, message)
+        VALUES (${senderId}, 'follow_accepted', ${userId}, 'aceitou sua solicitação de amizade.')
+      `;
+
+      // Criar notificação para quem recebeu e aceitou a solicitação (User B)
+      // Assim fica o registro em Atividade: "@UserA agora vocês se seguem"
+      await sql`
+        INSERT INTO notifications (user_id, type, sender_id, message)
+        VALUES (${userId}, 'follow', ${senderId}, 'agora vocês se seguem.')
+      `;
+    } else {
+      await sql`
+        DELETE FROM follows 
+        WHERE follower_user_id = ${senderId} AND followed_user_id = ${userId}
+      `;
+    }
+
+    // Remover a notificação de solicitação original
+    await sql`
+      DELETE FROM notifications 
+      WHERE user_id = ${userId} AND sender_id = ${senderId} AND type = 'follow_request'
+    `;
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro ao responder solicitação:", err);
+    return res.status(500).json({ error: "Erro ao processar resposta." });
+  }
+});
+
+
 // Obter perfil público de um usuário (incluindo is_following)
 app.get("/api/user/:id", verifyToken, async (req, res) => {
   const userId = await resolveUserId(req.params.id);
@@ -3213,6 +3619,77 @@ app.get("/api/feed", verifyToken, async (req, res) => {
   }
 });
 
+// Obter um post específico por ID
+app.get("/api/posts/:id", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  try {
+    const [post] = await sql`
+      SELECT 
+        p.*, 
+        u.nome as author_name, 
+        u.username as author_username,
+        u.avatar_url as author_avatar,
+        u.verificado as author_verified,
+        EXISTS(SELECT 1 FROM post_likes WHERE post_id = p.id AND id_us = ${req.userId}) as is_liked,
+        EXISTS(SELECT 1 FROM post_saves WHERE post_id = p.id AND id_us = ${req.userId}) as is_saved
+      FROM posts p
+      JOIN usuarios u ON p.id_us = u.id_us
+      WHERE p.id = ${parseInt(postId, 10)}
+    `;
+
+    if (!post) {
+      return res.status(404).json({ error: "Post não encontrado." });
+    }
+
+    // Transformar para o formato que o frontend espera
+    const formattedPost = {
+      post_id: post.id.toString(),
+      type: post.tipo || 'POST',
+      author: {
+        user_id: post.id_us.toString(),
+        username: post.author_username || post.author_name || `user_${post.id_us}`,
+        full_name: post.author_name || '',
+        avatar_url: post.author_avatar || '',
+        is_verified: post.author_verified || false,
+        is_following: false,
+      },
+      media: [{
+        media_id: `m_${post.id}`,
+        media_url: post.image_url,
+        thumbnail_url: post.image_url,
+        media_type: 'IMAGE',
+        width: 1080,
+        height: 1080,
+        position: 0,
+      }],
+      caption: post.legenda || '',
+      location: null,
+      hashtags: [],
+      mentions: [],
+      like_count: parseInt(post.likes_count) || 0,
+      comment_count: parseInt(post.comments_count) || 0,
+      share_count: parseInt(post.share_count) || 0,
+      save_count: 0,
+      is_liked: post.is_liked === true || post.is_liked === 't' || post.is_liked === 1,
+      is_saved: post.is_saved === true || post.is_saved === 't' || post.is_saved === 1,
+      likes_hidden: false,
+      comments_off: false,
+      is_pinned: false,
+      is_archived: false,
+      created_at: post.created_at,
+      time_ago: 'Postagem',
+    };
+
+    res.json({ 
+      success: true, 
+      post: formattedPost 
+    });
+  } catch (err) {
+    console.error(`Erro em GET /api/posts/${postId}:`, err);
+    res.status(500).json({ error: "Erro ao buscar detalhes do post." });
+  }
+});
+
 // Buscar posts de um usuário específico
 app.get("/api/user/:id/posts", verifyToken, async (req, res) => {
   const userId = await resolveUserId(req.params.id);
@@ -3240,6 +3717,59 @@ app.get("/api/user/:id/posts", verifyToken, async (req, res) => {
     return res.status(500).json({ error: "Erro ao buscar posts." });
   }
 });
+
+// Arquivar um post
+app.post("/api/user/posts/:id/archive", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.userId;
+  try {
+    const [post] = await sql`
+      UPDATE posts SET archived = TRUE
+      WHERE id = ${parseInt(postId, 10)} AND id_us = ${userId}
+      RETURNING id
+    `;
+    if (!post) return res.status(404).json({ success: false, message: "Post não encontrado ou sem permissão." });
+    return res.status(200).json({ success: true, message: "Post arquivado com sucesso." });
+  } catch (err) {
+    console.error("Erro em POST /api/user/posts/:id/archive:", err);
+    return res.status(500).json({ error: "Erro ao arquivar post." });
+  }
+});
+
+// Desarquivar um post
+app.post("/api/user/posts/:id/unarchive", verifyToken, async (req, res) => {
+  const postId = req.params.id;
+  const userId = req.userId;
+  try {
+    const [post] = await sql`
+      UPDATE posts SET archived = FALSE
+      WHERE id = ${parseInt(postId, 10)} AND id_us = ${userId}
+      RETURNING id
+    `;
+    if (!post) return res.status(404).json({ success: false, message: "Post não encontrado ou sem permissão." });
+    return res.status(200).json({ success: true, message: "Post desarquivado com sucesso." });
+  } catch (err) {
+    console.error("Erro em POST /api/user/posts/:id/unarchive:", err);
+    return res.status(500).json({ error: "Erro ao desarquivar post." });
+  }
+});
+
+// Listar posts arquivados do usuário logado
+app.get("/api/user/posts/archived", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const posts = await sql`
+      SELECT * FROM posts
+      WHERE id_us = ${userId} AND archived = TRUE
+      ORDER BY created_at DESC
+    `;
+    return res.status(200).json({ success: true, data: posts });
+  } catch (err) {
+    console.error("Erro em GET /api/user/posts/archived:", err);
+    return res.status(500).json({ error: "Erro ao buscar posts arquivados." });
+  }
+});
+
 
 // Criar novo post
 app.post("/api/user/posts", verifyToken, async (req, res) => {
@@ -3350,6 +3880,7 @@ app.get("/api/user/:id/followers", verifyToken, async (req, res) => {
   }
 });
 
+// Obter lista de quem o usuário está seguindo
 // Obter lista de quem o usuário está seguindo
 app.get("/api/user/:id/following", verifyToken, async (req, res) => {
   const userId = req.params.id;
@@ -3463,19 +3994,29 @@ app.get("/api/user/posts/:id/comments", verifyToken, async (req, res) => {
 app.post("/api/user/posts/:id/comment", verifyToken, async (req, res) => {
   const postId = req.params.id;
   const userId = req.userId;
-  const { comentario } = req.body;
+  const { comentario, text, texto } = req.body;
+  const commentText = comentario || text || texto;
 
-  if (!comentario) return res.status(400).json({ error: "Comentário é obrigatório." });
+  if (!commentText) return res.status(400).json({ error: "Comentário é obrigatório." });
 
   try {
     const [newComment] = await sql`
       INSERT INTO post_comments (post_id, id_us, comentario)
-      VALUES (${parseInt(postId, 10)}, ${userId}, ${comentario})
+      VALUES (${parseInt(postId, 10)}, ${userId}, ${commentText})
       RETURNING *
     `;
 
     // Incrementar contador de comentários
     await sql`UPDATE posts SET comments_count = comments_count + 1 WHERE id = ${parseInt(postId, 10)}`;
+
+    // Criar notificação para o autor do post
+    const [post] = await sql`SELECT id_us FROM posts WHERE id = ${parseInt(postId, 10)}`;
+    if (post && post.id_us !== userId) {
+      await sql`
+        INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
+        VALUES (${post.id_us}, 'comment', ${userId}, ${parseInt(postId, 10)}, 'comentou na sua publicação.')
+      `;
+    }
 
     return res.status(201).json({ success: true, data: newComment });
   } catch (err) {
@@ -3496,11 +4037,23 @@ app.post("/api/user/posts/:id/like", verifyToken, async (req, res) => {
 
     if (existing) {
       await sql`DELETE FROM post_likes WHERE id = ${existing.id}`;
+      // Remover notificação de curtida se existir
+      await sql`DELETE FROM notifications WHERE user_id = (SELECT id_us FROM posts WHERE id = ${parseInt(postId, 10)}) AND sender_id = ${userId} AND type = 'like' AND reference_id = ${parseInt(postId, 10)}`;
       await sql`UPDATE posts SET likes_count = GREATEST(0, likes_count - 1) WHERE id = ${parseInt(postId, 10)}`;
       return res.status(200).json({ success: true, isLiked: false });
     } else {
       await sql`INSERT INTO post_likes (post_id, id_us) VALUES (${parseInt(postId, 10)}, ${userId})`;
       await sql`UPDATE posts SET likes_count = likes_count + 1 WHERE id = ${parseInt(postId, 10)}`;
+      
+      // Criar notificação para o autor do post
+      const [post] = await sql`SELECT id_us FROM posts WHERE id = ${parseInt(postId, 10)}`;
+      if (post && post.id_us !== userId) {
+        await sql`
+          INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
+          VALUES (${post.id_us}, 'like', ${userId}, ${parseInt(postId, 10)}, 'curtiu sua publicação.')
+        `;
+      }
+      
       return res.status(200).json({ success: true, isLiked: true });
     }
   } catch (err) {
@@ -3647,14 +4200,24 @@ app.get("/api/notifications", verifyToken, async (req, res) => {
     const [{ exists }] = await sql`SELECT to_regclass('public.notifications') IS NOT NULL AS exists`;
     if (!exists) return res.status(200).json({ data: [] });
 
+    // Join com usuarios para obter dados do sender (quem interagiu)
     const data = await sql`
-      SELECT id, title, message, type, read, timestamp
-      FROM notifications
-      WHERE user_id = ${userId}
-      ORDER BY timestamp DESC
+      SELECT 
+        n.id, 
+        n.message, 
+        n.type, 
+        n.read, 
+        n.created_at, 
+        n.reference_id,
+        u.username as sender_username,
+        u.avatar_url as sender_avatar
+      FROM notifications n
+      LEFT JOIN usuarios u ON n.sender_id = u.id_us
+      WHERE n.user_id = ${userId}
+      ORDER BY n.created_at DESC
       LIMIT 100
     `;
-    return res.status(200).json({ data });
+    return res.status(200).json({ success: true, data });
   } catch (err) {
     console.error("Erro em GET /api/notifications", err);
     return res.status(500).json({ error: "Erro interno ao buscar notificações." });
@@ -3689,7 +4252,7 @@ app.post("/api/uploads/sign", verifyToken, async (req, res) => {
 // -------------------------------- DIETAS ---------------------------- //
 
 app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/dietas ===");
+  console.log("=== INá CIO DA ROTA POST /api/dietas ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -3712,7 +4275,7 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
   const descricao = req.body.descricao ?? req.body.descripcion ?? null;
 
   // Log dos dados extraídos
-  console.log("--- DADOS EXTRAáDOS ---");
+  console.log("--- DADOS EXTRAá DOS ---");
   console.log("Nome:", nome);
   console.log("Descrição:", descricao);
   console.log("Image URL:", imageurl);
@@ -3729,28 +4292,28 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
 
   if (!nome) {
     validationErrors.push("Nome é obrigatório");
-    console.log("âŒ ERRO: Nome não fornecido");
+    console.log("â Œ ERRO: Nome não fornecido");
   } else {
     console.log("✅ Nome válido:", nome);
   }
 
   if (!descricao) {
     validationErrors.push("Descrição é obrigatória");
-    console.log("âŒ ERRO: Descrição não fornecida");
+    console.log("â Œ ERRO: Descrição não fornecida");
   } else {
     console.log("✅ Descrição válida:", descricao.substring(0, 50) + "...");
   }
 
   if (!imageurl) {
     validationErrors.push("URL da imagem é obrigatória");
-    console.log("âŒ ERRO: URL da imagem não fornecida");
+    console.log("â Œ ERRO: URL da imagem não fornecida");
   } else {
     console.log("✅ URL da imagem válida:", imageurl);
   }
 
   if (!categoria) {
     validationErrors.push("Categoria é obrigatória");
-    console.log("âŒ ERRO: Categoria não fornecida");
+    console.log("â Œ ERRO: Categoria não fornecida");
   } else {
     console.log("✅ Categoria válida:", categoria);
   }
@@ -3772,7 +4335,7 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
     console.log("Buscando usuário com ID:", userId);
 
     const [author] =
-      await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
+      await sql`SELECT nome, username, email, avatar_url FROM usuarios WHERE id_us = ${userId}`;
 
     if (!author) {
       console.log("ERRO: Usuário autor não encontrado no banco de dados");
@@ -3787,7 +4350,7 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
     });
 
     const authorName = author.nome || author.username || null;
-    const authorAvatarUrl = getGravatarUrl(author.email);
+    const authorAvatarUrl = author.avatar_url || getGravatarUrl(author.email);
 
     console.log("--- PREPARANDO DADOS PARA INSERÇÃO ---");
     console.log("Nome do autor:", authorName);
@@ -3826,7 +4389,7 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
     });
   } catch (error) {
     console.log("--- ERRO DURANTE A EXECUÇÃO ---");
-    console.error("âŒ ERRO ao criar dieta:", error);
+    console.error("â Œ ERRO ao criar dieta:", error);
     console.log("Tipo do erro:", error.constructor.name);
     console.log("Código do erro:", error.code);
     console.log("Mensagem do erro:", error.message);
@@ -3846,18 +4409,47 @@ app.post("/api/dietas", verifyToken, checkFreePlanLimit('dietas'), async (req, r
 app.get("/api/dietas", verifyToken, async (req, res) => {
 
   const userId = req.userId;
-  const { categoria } = req.query;
+  const { categoria, mine } = req.query;
 
   try {
-    let query = sql`SELECT id_us, nome, descricao, imageurl, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url, createdat, updatedat, categoria, id_dieta FROM dietas WHERE id_us = ${userId}`;
+    const userIdStr = String(userId);
+    
+    // Filtros baseados nos parâmetros da URL
+    const showOnlyMine = mine === "true";
+    const categoryFilter = categoria && categoria !== "all" ? categoria : null;
 
-    if (categoria) {
-      query = sql`${query} AND categoria = ${categoria}`;
-    }
+    let query = sql`
+      SELECT 
+        d.id_us, 
+        d.nome as title, 
+        d.descricao as description, 
+        d.imageurl as "imageUrl", 
+        d.calorias as calories, 
+        d.tempo_preparo as minutes, 
+        d.gordura as fat, 
+        d.proteina as protein, 
+        d.carboidratos as carbs, 
+        d.nome_autor, 
+        d.avatar_autor_url, 
+        d.createdat as created_at,
+        d.id_dieta, 
+        d.likes_count, 
+        d.comments_count, 
+        d.likes,
+        EXISTS (
+          SELECT 1 FROM jsonb_array_elements_text(COALESCE(d.likes, '[]'::jsonb)) AS l
+          WHERE l = ${userIdStr}
+        ) as "isLiked"
+      FROM dietas d
+      WHERE 1=1
+      ${categoryFilter ? sql`AND d.categoria = ${categoryFilter}` : sql``}
+      ${showOnlyMine ? sql`AND d.id_us = ${userId}` : sql``}
+      ORDER BY d.createdat DESC;
+    `;
 
-    query = sql`${query} ORDER BY createdat DESC;`;
-
+    console.log(`[GET DIETAS] User: ${userId}, Filtrar apenas minhas: ${showOnlyMine}, Categoria: ${categoryFilter || 'Todas'}`);
     const dietas = await query;
+    console.log(`[DIET FEED] Retornando ${dietas.length} dietas. Exemplo: Diet ID ${dietas[0]?.id_dieta}, isLiked: ${dietas[0]?.isLiked}`);
     res.status(200).json({ data: dietas });
   } catch (error) {
     console.error("Erro ao listar dietas:", error);
@@ -3865,6 +4457,49 @@ app.get("/api/dietas", verifyToken, async (req, res) => {
       error: "Erro interno do servidor ao listar dietas.",
       details: error.message,
     });
+  }
+});
+
+// GET: Detalhes de uma dieta específica
+app.get("/api/dietas/:id", verifyToken, async (req, res) => {
+  const userId = String(req.userId);
+  const { id } = req.params;
+
+  try {
+    const [dieta] = await sql`
+      SELECT 
+        d.id_us, 
+        d.nome as title, 
+        d.descricao as description, 
+        d.imageurl as "imageUrl", 
+        d.calorias as calories, 
+        d.tempo_preparo as minutes, 
+        d.gordura as fat, 
+        d.proteina as protein, 
+        d.carboidratos as carbs, 
+        d.nome_autor, 
+        d.avatar_autor_url, 
+        d.createdat as created_at,
+        d.id_dieta, 
+        d.likes_count, 
+        d.comments_count, 
+        d.likes,
+        EXISTS (
+          SELECT 1 FROM jsonb_array_elements_text(COALESCE(d.likes, '[]'::jsonb)) AS l
+          WHERE l = ${userId}
+        ) as "isLiked"
+      FROM dietas d
+      WHERE d.id_dieta = ${parseInt(id)}
+    `;
+
+    if (!dieta) {
+      return res.status(404).json({ error: "Dieta não encontrada." });
+    }
+
+    res.status(200).json({ data: dieta });
+  } catch (error) {
+    console.error("Erro ao buscar detalhes da dieta:", error);
+    res.status(500).json({ error: "Erro interno do servidor." });
   }
 });
 
@@ -3956,10 +4591,225 @@ app.delete("/api/dietas/:id_dieta", verifyToken, async (req, res) => {
   }
 });
 
+
+// -------------------------------- DIETA SOCIAL ---------------------------- //
+
+app.post("/api/dietas/:id/like", verifyToken, async (req, res) => {
+  const userId = String(req.userId);
+  const { id } = req.params;
+
+  console.log(`[LIKE DIETA] Iniciando like para dieta ${id} - Usuário ${userId}`);
+
+  try {
+    const [dieta] = await sql`SELECT likes FROM dietas WHERE id_dieta = ${parseInt(id)}`;
+    
+    if (!dieta) {
+      console.log(`[LIKE DIETA] Erro: Dieta ${id} não encontrada.`);
+      return res.status(404).json({ error: "Dieta não encontrada." });
+    }
+
+    let likes = [];
+    if (dieta.likes) {
+      likes = Array.isArray(dieta.likes) ? dieta.likes.map(String) : [];
+    }
+
+    const index = likes.indexOf(userId);
+    let newLikes = [];
+    let isLiked = false;
+
+    if (index === -1) {
+      newLikes = [...likes, userId];
+      isLiked = true;
+    } else {
+      newLikes = likes.filter((uid) => uid !== userId);
+      isLiked = false;
+    }
+
+    console.log(`[LIKE DIETA] Dieta ${id}: User ${userId} ${isLiked ? 'liked' : 'unliked'}. Total: ${newLikes.length}`);
+
+    const result = await sql`
+      UPDATE dietas 
+      SET likes = ${newLikes}, 
+          likes_count = ${newLikes.length} 
+      WHERE id_dieta = ${parseInt(id)}
+      RETURNING id_dieta, likes_count
+    `;
+
+    console.log(`[LIKE DIETA] Update concluído. Afetado:`, result.length);
+
+    // --- SISTEMA DE NOTIFICAÇÃO ---
+    // Busca o autor da dieta para notificar
+    const [dietaData] = await sql`SELECT id_us FROM dietas WHERE id_dieta = ${parseInt(id)}`;
+    
+    // Só notifica se quem curtiu não for o próprio autor
+    if (isLiked && dietaData && String(dietaData.id_us) !== userId) {
+      await sql`
+        INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
+        VALUES (${dietaData.id_us}, 'like_diet', ${userId}, ${parseInt(id)}, 'curtiu sua dieta.')
+      `;
+      console.log(`[LIKE DIETA] Notificação enviada para autor ${dietaData.id_us}`);
+    } else if (!isLiked && dietaData) {
+      // Remove a notificação se descurtir
+      await sql`
+        DELETE FROM notifications 
+        WHERE user_id = ${dietaData.id_us} 
+          AND sender_id = ${userId} 
+          AND type = 'like_diet' 
+          AND reference_id = ${parseInt(id)}
+      `;
+    }
+
+    res.json({ success: true, isLiked, likes_count: newLikes.length });
+  } catch (error) {
+    console.error("[LIKE DIETA] Erro ao curtir dieta:", error);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+app.post("/api/dietas/:id/comment", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { id } = req.params;
+  const { text, comentario, texto } = req.body;
+  const commentText = text || comentario || texto;
+
+  console.log(`[POST COMMENT] Dieta: ${id}, Usuario: ${userId}, Texto: ${commentText}`);
+
+  if (!commentText) return res.status(400).json({ error: "Texto do comentário é obrigatório." });
+
+  try {
+    const authorIdNum = parseInt(userId);
+    const [author] = await sql`SELECT nome, username, avatar_url FROM usuarios WHERE id_us = ${authorIdNum}`;
+    
+    // Busca comentários existentes com parseInt no ID da dieta
+    const [dieta] = await sql`SELECT comments FROM dietas WHERE id_dieta = ${parseInt(id)}`;
+    if (!dieta) {
+      console.log(`[POST COMMENT] Erro: Dieta ${id} não encontrada.`);
+      return res.status(404).json({ error: "Dieta não encontrada." });
+    }
+
+    let comments = [];
+    if (Array.isArray(dieta.comments)) {
+      comments = dieta.comments;
+    } else if (typeof dieta.comments === "string") {
+      try { comments = JSON.parse(dieta.comments); } catch(e){}
+      if (!Array.isArray(comments)) comments = [];
+    }
+
+    const newComment = {
+      id: uuidv4(),
+      user_id: userId,
+      username: author?.nome || author?.username || "Usuário",
+      photo: author?.avatar_url || "https://gravatar.com/avatar?d=identicon",
+      comentario: commentText,
+      created_at: new Date().toISOString(),
+    };
+
+    const newComments = [...comments, newComment];
+    console.log(`[POST COMMENT] Salvando array p/ dieta ${id}:`, newComments.length, "itens");
+
+    const updateResult = await sql`
+      UPDATE dietas 
+      SET comments = ${sql.json(newComments)}, 
+          comments_count = ${newComments.length} 
+      WHERE id_dieta = ${parseInt(id)}
+      RETURNING id_dieta, id_us, comments_count
+    `;
+
+    if (!updateResult[0]) throw new Error("Falha ao atualizar dieta no banco.");
+
+    // --- SISTEMA DE NOTIFICAÇÃO ---
+    // Notifica o autor da dieta (quem criou a dieta)
+    const authorIdFromDb = updateResult[0].id_us;
+    if (authorIdFromDb && String(authorIdFromDb) !== userId) {
+      await sql`
+        INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
+        VALUES (${authorIdFromDb}, 'comment_diet', ${userId}, ${parseInt(id)}, 'comentou na sua dieta.')
+      `;
+      console.log(`[POST COMMENT] Notificação enviada para autor ${authorIdFromDb}`);
+    }
+
+    console.log(`[POST COMMENT] SUCESSO. Dieta ${id} agora tem ${updateResult[0].comments_count} comentários.`);
+
+    res.json({ success: true, data: newComment });
+  } catch (error) {
+    console.error("[POST COMMENT] Erro:", error);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+app.get("/api/dietas/:id/comments", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    console.log(`[GET COMMENTS] Buscando para dieta: ${id}`);
+    const [dieta] = await sql`SELECT comments FROM dietas WHERE id_dieta = ${parseInt(id)}`;
+    
+    if (!dieta) return res.status(404).json({ error: "Dieta não encontrada." });
+    
+    let comments = [];
+    if (Array.isArray(dieta.comments)) {
+      comments = dieta.comments;
+    } else if (typeof dieta.comments === "string") {
+      try { comments = JSON.parse(dieta.comments); } catch(e){}
+      if (!Array.isArray(comments)) comments = [];
+    }
+
+    console.log(`[GET COMMENTS] Dieta ${id} tem ${comments.length} comentários.`);
+    
+    // Retornamos invertido (mais recentes primeiro)
+    res.json({ success: true, data: [...comments].reverse() });
+  } catch (error) {
+    console.error("[GET COMMENTS] Erro:", error);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+app.delete("/api/dietas/:id/comment/:commentId", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { id, commentId } = req.params;
+
+  try {
+    const [dieta] = await sql`SELECT comments, id_us FROM dietas WHERE id_dieta = ${parseInt(id)}`;
+    if (!dieta) return res.status(404).json({ error: "Dieta não encontrada." });
+
+    let comments = [];
+    if (Array.isArray(dieta.comments)) {
+      comments = dieta.comments;
+    } else if (typeof dieta.comments === "string") {
+      try { comments = JSON.parse(dieta.comments); } catch(e){}
+      if (!Array.isArray(comments)) comments = [];
+    }
+
+    const commentIndex = comments.findIndex(c => String(c.id) === String(commentId));
+    if (commentIndex === -1) {
+      return res.status(404).json({ error: "Comentário não encontrado." });
+    }
+
+    const comment = comments[commentIndex];
+    // Permite excluir se for dono do comentário ou dono do post
+    if (String(comment.user_id) !== String(userId) && String(dieta.id_us) !== String(userId)) {
+      return res.status(403).json({ error: "Não autorizado." });
+    }
+
+    comments.splice(commentIndex, 1);
+
+    await sql`
+      UPDATE dietas 
+      SET comments = ${sql.json(comments)}, 
+          comments_count = ${comments.length} 
+      WHERE id_dieta = ${parseInt(id)}
+    `;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[DELETE COMMENT] Erro:", error);
+    res.status(500).json({ error: "Erro interno ao deletar." });
+  }
+});
+
 // -------------------------------- CHAT ---------------------------- //
 
 app.post("/api/chat", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/chat ===");
+  console.log("=== INá CIO DA ROTA POST /api/chat ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -3972,7 +4822,7 @@ app.post("/api/chat", verifyToken, async (req, res) => {
   const { participant2_id } = req.body;
 
   // Log dos dados extraídos
-  console.log("--- DADOS EXTRAáDOS ---");
+  console.log("--- DADOS EXTRAá DOS ---");
   console.log("Participant2 ID:", participant2_id);
 
   // Validação com logs detalhados
@@ -3981,7 +4831,7 @@ app.post("/api/chat", verifyToken, async (req, res) => {
 
   if (!participant2_id) {
     validationErrors.push("Participant2 ID é obrigatório");
-    console.log("âŒ ERRO: Participant2 ID não fornecido");
+    console.log("â Œ ERRO: Participant2 ID não fornecido");
   } else {
     console.log("✅ Participant2 ID válido:", participant2_id);
   }
@@ -4045,7 +4895,7 @@ app.post("/api/chat", verifyToken, async (req, res) => {
     console.log("Other user UUID:", otherUserId);
 
     // Verificar se já existe um chat entre esses dois usuários no Supabase
-    console.log("--- VERIFICANDO SE CHAT Já EXISTE NO SUPABASE ---");
+    console.log("--- VERIFICANDO SE CHAT Já  EXISTE NO SUPABASE ---");
     const { data: existingChat, error: chatError } = await supabase
       .from('chats')
       .select('id')
@@ -4202,7 +5052,6 @@ app.get("/api/chat", verifyToken, async (req, res) => {
     const supabaseUserId = userMapping.auth_user_id;
 
     // Buscar todos os chats em que o usuário participa no Supabase
-    // Apenas chats que já tiveram ao menos uma mensagem (last_message não nulo)
     const { data: chats, error: chatError } = await supabase
       .from('chats')
       .select(`
@@ -4214,7 +5063,9 @@ app.get("/api/chat", verifyToken, async (req, res) => {
         unread_count_p1,
         unread_count_p2,
         last_sender_id,
-        created_at
+        created_at,
+        deleted_at_p1,
+        deleted_at_p2
       `)
       .or(`participant1_id.eq.${supabaseUserId},participant2_id.eq.${supabaseUserId}`)
       .not('last_message', 'is', null)
@@ -4228,8 +5079,24 @@ app.get("/api/chat", verifyToken, async (req, res) => {
       });
     }
 
+    // Filtragem Lógica: Esconder chats excluídos individualmente
+    const activeChats = chats.filter(chat => {
+      const isParticipant1 = chat.participant1_id === supabaseUserId;
+      const deletedAt = isParticipant1 ? chat.deleted_at_p1 : chat.deleted_at_p2;
+
+      // Se nunca foi deletado, exibe
+      if (!deletedAt) return true;
+
+      // Se foi deletado, mas a última mensagem é mais recente que a exclusão, exibe
+      if (chat.last_timestamp && new Date(chat.last_timestamp) > new Date(deletedAt)) {
+        return true;
+      }
+
+      return false;
+    });
+
     // Mapear os resultados para incluir unread_count apropriado e dados do participante
-    const chatsWithDetails = await Promise.all(chats.map(async (chat) => {
+    const chatsWithDetails = await Promise.all(activeChats.map(async (chat) => {
       const otherParticipantId = chat.participant1_id === supabaseUserId
         ? chat.participant2_id
         : chat.participant1_id;
@@ -4287,14 +5154,23 @@ app.put("/api/chat/:id_chat", verifyToken, async (req, res) => {
   const { last_message, last_timestamp } = req.body;
 
   try {
-    // Verificar se o usuário é parte do chat
+    // Obter o UUID do Supabase para o usuário atual
+    const userMapping = await getUserAuthId(userId);
+    if (!userMapping) {
+      return res.status(404).json({
+        error: "Usuário não encontrado no sistema de autenticação."
+      });
+    }
+    const supabaseUserId = userMapping.auth_user_id;
+
+    // Verificar se o usuário é parte do chat usando UUIDs
     const [chat] = await sql`
       SELECT participant1_id, participant2_id
       FROM chats
       WHERE id = ${id_chat}
     `;
 
-    if (!chat || (chat.participant1_id !== userId && chat.participant2_id !== userId)) {
+    if (!chat || (chat.participant1_id !== supabaseUserId && chat.participant2_id !== supabaseUserId)) {
       return res.status(403).json({
         error: "Você não tem permissão para atualizar este chat.",
       });
@@ -4334,31 +5210,45 @@ app.delete("/api/chat/:id_chat", verifyToken, async (req, res) => {
   const { id_chat } = req.params;
 
   try {
-    // Verificar se o usuário é parte do chat
+    // Obter o UUID do Supabase para o usuário atual
+    const userMapping = await getUserAuthId(userId);
+    if (!userMapping) {
+      return res.status(404).json({
+        error: "Usuário não encontrado no sistema de autenticação."
+      });
+    }
+    const supabaseUserId = userMapping.auth_user_id;
+
+    // Verificar se o usuário é parte do chat usando os UUIDs
     const [chat] = await sql`
       SELECT participant1_id, participant2_id
       FROM chats
       WHERE id = ${id_chat}
     `;
 
-    if (!chat || (chat.participant1_id !== userId && chat.participant2_id !== userId)) {
+    if (!chat || (chat.participant1_id !== supabaseUserId && chat.participant2_id !== supabaseUserId)) {
       return res.status(403).json({
         error: "Você não tem permissão para excluir este chat.",
       });
     }
 
-    const [deletedChat] = await sql`
-      DELETE FROM chats
-      WHERE id = ${id_chat} AND (participant1_id = ${userId} OR participant2_id = ${userId})
+    // Identificar qual participante está deletando e atualizar a coluna correspondente
+    const isParticipant1 = chat.participant1_id === supabaseUserId;
+    const updateColumn = isParticipant1 ? 'deleted_at_p1' : 'deleted_at_p2';
+
+    const [updatedChat] = await sql`
+      UPDATE chats
+      SET ${sql(updateColumn)} = NOW()
+      WHERE id = ${id_chat}
       RETURNING *;
     `;
 
-    if (!deletedChat) {
+    if (!updatedChat) {
       return res.status(404).json({
-        error: "Chat não encontrado ou você não tem permissão para excluí-lo.",
+        error: "Chat não encontrado.",
       });
     }
-    res.status(200).json({ message: "Chat excluído com sucesso!" });
+    res.status(200).json({ message: "Chat excluído da sua lista com sucesso!" });
   } catch (error) {
     console.error("Erro ao excluir chat:", error);
     res.status(500).json({
@@ -4418,27 +5308,29 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
 
     if (msgErr) throw msgErr;
 
-    // Atualizar meta do chat e incrementar contador de não lidas para o destinatário
+    // Atualizar meta do chat e restaurar visibilidade para ambos
     if (chat.participant1_id === supabaseUserId) {
-      // P1 enviou -> incrementa unread_count_p1 (que é o que P2 vê)
       await sql`
         UPDATE chats 
         SET 
           unread_count_p1 = unread_count_p1 + 1,
           last_message = ${text || 'Imagem'},
           last_timestamp = NOW(),
-          last_sender_id = ${supabaseUserId}
+          last_sender_id = ${supabaseUserId},
+          deleted_at_p1 = NULL,
+          deleted_at_p2 = NULL
         WHERE id = ${id_chat}
       `;
     } else {
-      // P2 enviou -> incrementa unread_count_p2 (que é o que P1 vê)
       await sql`
         UPDATE chats 
         SET 
           unread_count_p2 = unread_count_p2 + 1,
           last_message = ${text || 'Imagem'},
           last_timestamp = NOW(),
-          last_sender_id = ${supabaseUserId}
+          last_sender_id = ${supabaseUserId},
+          deleted_at_p1 = NULL,
+          deleted_at_p2 = NULL
         WHERE id = ${id_chat}
       `;
     }
@@ -4655,7 +5547,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
   const descricao = req.body.descricao ?? req.body.descripcion ?? null;
 
   // Log dos dados extraídos
-  console.log("--- DADOS EXTRAáDOS ---");
+  console.log("--- DADOS EXTRAá DOS ---");
   console.log("Nome:", nome);
   console.log("Descrição:", descricao);
   console.log("Image URL:", imageurl);
@@ -4672,28 +5564,28 @@ app.post("/api/profile", verifyToken, async (req, res) => {
 
   if (!nome) {
     validationErrors.push("Nome é obrigatório");
-    console.log("âŒ ERRO: Nome não fornecido");
+    console.log("â Œ ERRO: Nome não fornecido");
   } else {
     console.log("✅ Nome válido:", nome);
   }
 
   if (!descricao) {
     validationErrors.push("Descrição é obrigatória");
-    console.log("âŒ ERRO: Descrição não fornecida");
+    console.log("â Œ ERRO: Descrição não fornecida");
   } else {
     console.log("✅ Descrição válida:", descricao.substring(0, 50) + "...");
   }
 
   if (!imageurl) {
     validationErrors.push("URL da imagem é obrigatória");
-    console.log("âŒ ERRO: URL da imagem não fornecida");
+    console.log("â Œ ERRO: URL da imagem não fornecida");
   } else {
     console.log("✅ URL da imagem válida:", imageurl);
   }
 
   if (!categoria) {
     validationErrors.push("Categoria é obrigatória");
-    console.log("âŒ ERRO: Categoria não fornecida");
+    console.log("â Œ ERRO: Categoria não fornecida");
   } else {
     console.log("✅ Categoria válida:", categoria);
   }
@@ -4715,7 +5607,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
     console.log("Buscando usuário com ID:", userId);
 
     const [author] =
-      await sql`SELECT nome, username, email FROM usuarios WHERE id_us = ${userId}`;
+      await sql`SELECT nome, username, email, avatar_url FROM usuarios WHERE id_us = ${userId}`;
 
     if (!author) {
       console.log("ERRO: Usuário autor não encontrado no banco de dados");
@@ -4730,7 +5622,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
     });
 
     const authorName = author.nome || author.username || null;
-    const authorAvatarUrl = getGravatarUrl(author.email);
+    const authorAvatarUrl = author.avatar_url || getGravatarUrl(author.email);
 
     console.log("--- PREPARANDO DADOS PARA INSERÇÃO ---");
     console.log("Nome do autor:", authorName);
@@ -4769,7 +5661,7 @@ app.post("/api/profile", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.log("--- ERRO DURANTE A EXECUÇÃO ---");
-    console.error("âŒ ERRO ao criar dieta:", error);
+    console.error("â Œ ERRO ao criar dieta:", error);
     console.log("Tipo do erro:", error.constructor.name);
     console.log("Código do erro:", error.code);
     console.log("Mensagem do erro:", error.message);
@@ -4792,7 +5684,7 @@ app.get("/api/profile", verifyToken, async (req, res) => {
   const { categoria } = req.query;
 
   try {
-    let query = sql`SELECT id_us, nome, descricao, imageurl, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url, createdat, updatedat, categoria, id_dieta FROM dietas WHERE id_us = ${userId}`;
+    let query = sql`SELECT id_us, nome, descricao, imageurl, calorias, tempo_preparo, gordura, proteina, carboidratos, nome_autor, avatar_autor_url, createdat, updatedat, categoria, id_dieta, likes_count, comments_count, likes FROM dietas WHERE id_us = ${userId}`;
 
     if (categoria) {
       query = sql`${query} AND categoria = ${categoria}`;
@@ -4924,7 +5816,11 @@ app.get("/api/comunidades", verifyToken, async (req, res) => {
         premiacao,
         local_inicio,
         local_fim,
-        telefone_contato
+        telefone_contato,
+        EXISTS (
+          SELECT 1 FROM community_members cm
+          WHERE cm.id_comunidade = comunidades.id_comunidade AND cm.id_us = ${userId}
+        ) as is_member
       FROM comunidades
     `;
 
@@ -4969,7 +5865,11 @@ app.get("/api/comunidades/:id_comunidade", verifyToken, async (req, res) => {
         premiacao,
         local_inicio,
         local_fim,
-        telefone_contato
+        telefone_contato,
+        EXISTS (
+          SELECT 1 FROM community_members cm 
+          WHERE cm.id_comunidade = comunidades.id_comunidade AND cm.id_us = ${req.userId}
+        ) as is_member
       FROM comunidades
       WHERE id_comunidade = ${id_comunidade}
     `;
@@ -5173,6 +6073,9 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
             a.longitude,
             a.telefone,
             a.whatsapp,
+            a.horarios_funcionamento,
+            a.ativo,
+            a.fotos,
             (
               6371 * acos(
                 LEAST(1, GREATEST(-1, 
@@ -5217,6 +6120,9 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
             longitude,
             telefone,
             whatsapp,
+            horarios_funcionamento,
+            ativo,
+            fotos,
             (
               6371 * acos(
                 LEAST(1, GREATEST(-1, 
@@ -5319,7 +6225,7 @@ app.get("/api/academias/:id_academia", verifyToken, async (req, res) => {
 
 // GET: Buscar dados de calorias
 app.get("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA GET /api/dados/calories ===");
+  console.log("=== INá CIO DA ROTA GET /api/dados/calories ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
 
@@ -5425,7 +6331,7 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
 
     res.status(200).json(response);
   } catch (error) {
-    console.error("âŒ Erro ao buscar dados de calorias:", error);
+    console.error("â Œ Erro ao buscar dados de calorias:", error);
     console.log("=== FIM DA ROTA GET /api/dados/calories (ERRO 500) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao buscar dados de calorias.",
@@ -5436,7 +6342,7 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
 
 // POST: Salvar dados de calorias
 app.post("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/dados/calories ===");
+  console.log("=== INá CIO DA ROTA POST /api/dados/calories ===");
   console.log("Timestamp:", new Date().toISOString());
   console.log("User ID:", req.userId);
   console.log("Body:", req.body);
@@ -5445,7 +6351,7 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
   const { calories, timestamp } = req.body;
 
   if (!calories) {
-    console.log("âŒ Erro: Calorias não fornecidas");
+    console.log("â Œ Erro: Calorias não fornecidas");
     return res.status(400).json({ error: "Calorias são obrigatórias." });
   }
 
@@ -5471,7 +6377,7 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
       data: newRecord,
     });
   } catch (error) {
-    console.error("âŒ Erro ao salvar dados de calorias:", error);
+    console.error("â Œ Erro ao salvar dados de calorias:", error);
     console.log("=== FIM DA ROTA POST /api/dados/calories (ERRO 500) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao salvar dados de calorias.",
@@ -5484,7 +6390,7 @@ app.post("/api/dados/calories", verifyToken, async (req, res) => {
 
 // POST: Registrar automaticamente um dispositivo Wear OS ✅
 app.post("/api/wearos/register", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/wearos/register-device ===");
+  console.log("=== INá CIO DA ROTA POST /api/wearos/register-device ===");
   console.log("User ID:", req.userId);
   console.log("Body recebido:", req.body);
 
@@ -5498,7 +6404,7 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
   } = req.body;
 
   if (!deviceName || !deviceModel) {
-    console.log("âŒ Erro: Nome e modelo do dispositivo são obrigatórios");
+    console.log("â Œ Erro: Nome e modelo do dispositivo são obrigatórios");
     return res.status(400).json({
       error: "Nome e modelo do dispositivo são obrigatórios."
     });
@@ -5543,7 +6449,7 @@ app.post("/api/wearos/register", verifyToken, async (req, res) => {
       device: newDevice
     });
   } catch (error) {
-    console.error("âŒ Erro ao registrar dispositivo Wear OS:", error);
+    console.error("â Œ Erro ao registrar dispositivo Wear OS:", error);
     console.log("=== FIM DA ROTA POST /api/wearos/register-device (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao registrar dispositivo.",
@@ -5577,7 +6483,7 @@ app.get("/api/wearos/devices", verifyToken, async (req, res) => {
       count: devices.length
     });
   } catch (error) {
-    console.error("âŒ Erro ao listar dispositivos Wear OS:", error);
+    console.error("â Œ Erro ao listar dispositivos Wear OS:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/devices (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao listar dispositivos.",
@@ -5611,7 +6517,7 @@ app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
       deviceCount: parseInt(result[0].device_count)
     });
   } catch (error) {
-    console.error("âŒ Erro ao verificar dispositivos Wear OS:", error);
+    console.error("â Œ Erro ao verificar dispositivos Wear OS:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/has-devices (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao verificar dispositivos.",
@@ -5622,7 +6528,7 @@ app.get("/api/wearos/devicesON", verifyToken, async (req, res) => {
 
 // POST: Registrar dados de saúde do Wear OS
 app.post("/api/wearos/health", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA POST /api/wearos/health-data ===");
+  console.log("=== INá CIO DA ROTA POST /api/wearos/health-data ===");
   console.log("User ID:", req.userId);
   console.log("Body recebido:", JSON.stringify(req.body, null, 2));
 
@@ -5638,7 +6544,7 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
   } = req.body;
 
   if (!deviceId) {
-    console.log("âŒ Erro: ID do dispositivo é obrigatório");
+    console.log("â Œ Erro: ID do dispositivo é obrigatório");
     return res.status(400).json({
       error: "ID do dispositivo é obrigatório."
     });
@@ -5715,7 +6621,7 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
       count: healthRecords.length
     });
   } catch (error) {
-    console.error("âŒ Erro ao registrar dados de saúde:", error);
+    console.error("â Œ Erro ao registrar dados de saúde:", error);
     console.log("=== FIM DA ROTA POST /api/wearos/health-data (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao registrar dados de saúde.",
@@ -5726,7 +6632,7 @@ app.post("/api/wearos/health", verifyToken, async (req, res) => {
 
 // GET: Obter dados de saúde mais recentes de dispositivos Wear OS ✅
 app.get("/api/wearos/health", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA GET /api/wearos/latest-health-data ===");
+  console.log("=== INá CIO DA ROTA GET /api/wearos/latest-health-data ===");
   console.log("User ID:", req.userId);
 
   const userId = req.userId;
@@ -5809,7 +6715,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
 
     res.status(200).json(result);
   } catch (error) {
-    console.error("âŒ Erro ao obter dados de saúde:", error);
+    console.error("â Œ Erro ao obter dados de saúde:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/latest-health-data (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao obter dados de saúde.",
@@ -5820,7 +6726,7 @@ app.get("/api/wearos/health", verifyToken, async (req, res) => {
 
 // GET: Obter histórico de dados de saúde do Wear OS ✅
 app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA GET /api/wearos/health-history ===");
+  console.log("=== INá CIO DA ROTA GET /api/wearos/health-history ===");
   console.log("User ID:", req.userId);
   const { timeframe = "1d", dataType = "all" } = req.query;
 
@@ -5892,7 +6798,7 @@ app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
       dataType: dataType
     });
   } catch (error) {
-    console.error("âŒ Erro ao obter histórico de saúde:", error);
+    console.error("â Œ Erro ao obter histórico de saúde:", error);
     console.log("=== FIM DA ROTA GET /api/wearos/health-history (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao obter histórico de saúde.",
@@ -5903,7 +6809,7 @@ app.get("/api/wearos/health-history", verifyToken, async (req, res) => {
 
 // PUT: Atualizar status do dispositivo Wear OS
 app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA PUT /api/wearos/device-status/:deviceId ===");
+  console.log("=== INá CIO DA ROTA PUT /api/wearos/device-status/:deviceId ===");
   console.log("User ID:", req.userId);
   console.log("Device ID:", req.params.deviceId);
   console.log("Body:", req.body);
@@ -5953,7 +6859,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
       device: updatedDevice
     });
   } catch (error) {
-    console.error("âŒ Erro ao atualizar status do dispositivo:", error);
+    console.error("â Œ Erro ao atualizar status do dispositivo:", error);
     console.log("=== FIM DA ROTA PUT /api/wearos/device-status/:deviceId (ERRO) ===");
     res.status(500).json({
       error: "Erro interno do servidor ao atualizar status do dispositivo.",
@@ -5964,7 +6870,7 @@ app.put("/api/wearos/status/:deviceId", verifyToken, async (req, res) => {
 
 // DELETE: Remover dispositivo Wear OS
 app.delete("/api/wearos/device/:deviceId", verifyToken, async (req, res) => {
-  console.log("=== INáCIO DA ROTA DELETE /api/wearos/device/:deviceId ===");
+  console.log("=== INá CIO DA ROTA DELETE /api/wearos/device/:deviceId ===");
   console.log("User ID:", req.userId);
   console.log("Device ID:", req.params.deviceId);
 
@@ -6705,7 +7611,9 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
           AND data_agendamento = ${date}
           AND status IN ('pendente', 'confirmado')
       `;
-    } catch (e) { }
+    } catch (_e) {
+      // Ignorar erro se a busca falhar
+    }
 
     const availableSlots = [];
     dayAvailability.forEach(slot => {
