@@ -155,17 +155,48 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`;
 
+    // Adicionar novas colunas para compatibilidade com o sistema Pro de treinos
+    await sql`ALTER TABLE conteudo_treinos ADD COLUMN IF NOT EXISTS description TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE conteudo_treinos ADD COLUMN IF NOT EXISTS exercicios JSONB DEFAULT '[]'`;
+    await sql`ALTER TABLE conteudo_treinos ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
+    
+    // Garantir que treinos antigos tenham ativo = true
+    await sql`UPDATE conteudo_treinos SET ativo = TRUE WHERE ativo IS NULL`;
+
     // Inserir treinos padrão se a tabela estiver vazia
     const [treinosCount] = await sql`SELECT count(*) FROM conteudo_treinos`;
     if (parseInt(treinosCount.count) === 0) {
       await sql`
-        INSERT INTO conteudo_treinos (title, calories, minutes, image_url, specialty) VALUES
-        ('Agachamento Pesado', '180 - 250 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_71_jntmsv.jpg', 'Musculação'),
-        ('Supino Reto', '150 - 200 Kcal', '12 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_txncpp.jpg', 'Musculação'),
-        ('HIIT Queima Gordura', '300 - 450 Kcal', '20 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'HIIT'),
-        ('Funcional Core', '200 - 300 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_73_co9eqf.jpg', 'Treinamento Funcional'),
-        ('Pilates Postural', '100 - 150 Kcal', '30 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_75_drh4vh.jpg', 'Pilates'),
-        ('Deadlift Progressiva', '200 - 350 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'Hipertrofia')
+        INSERT INTO conteudo_treinos (title, calories, minutes, image_url, specialty, description) VALUES
+        ('Agachamento Pesado', '180 - 250 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_71_jntmsv.jpg', 'Musculação', 'Foco em pernas e glúteos'),
+        ('Supino Reto', '150 - 200 Kcal', '12 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_txncpp.jpg', 'Musculação', 'Peitoral e tríceps'),
+        ('HIIT Queima Gordura', '300 - 450 Kcal', '20 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'HIIT', 'Explosão e queima calórica intensa'),
+        ('Funcional Core', '200 - 300 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_73_co9eqf.jpg', 'Treinamento Funcional', 'Equilíbrio e estabilidade abdominal'),
+        ('Pilates Postural', '100 - 150 Kcal', '30 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_75_drh4vh.jpg', 'Pilates', 'Flexibilidade e correção postural'),
+        ('Deadlift Progressiva', '200 - 350 Kcal', '15 min', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image111_gu6iim.jpg', 'Hipertrofia', 'Força bruta e massa muscular')
+      `;
+    }
+
+    // Tabela Global de Exercícios para compor os treinos
+    await sql`CREATE TABLE IF NOT EXISTS exercicios (
+      id SERIAL PRIMARY KEY,
+      nome TEXT NOT NULL,
+      descricao TEXT,
+      image_url TEXT,
+      categoria TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+    const [exerciciosCount] = await sql`SELECT count(*) FROM exercicios`;
+    if (parseInt(exerciciosCount.count) === 0) {
+      await sql`
+        INSERT INTO exercicios (nome, descricao, categoria, image_url) VALUES
+        ('Agachamento com Barra', 'Posicione a barra sobre os ombros e flexione os joelhos.', 'Pernas', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_71_jntmsv.jpg'),
+        ('Supino Plano', 'Deite e empurre a barra para cima do peito.', 'Peito', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229915/image_txncpp.jpg'),
+        ('Remada Curvada', 'Puxe a barra em direção ao abdômen mantendo as costas retas.', 'Costas', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_75_drh4vh.jpg'),
+        ('Desenvolvimento Ombro', 'Empurre os halteres para cima partindo da altura das orelhas.', 'Ombros', 'https://img.freepik.com/free-photo/back-view-woman-exercising-with-dumbbells_23-2147789670.jpg'),
+        ('Prancha Abdominal', 'Mantenha o corpo reto apoiado nos antebraços e pontas dos pés.', 'Core', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757513125/prancha_g1v30x.png'),
+        ('Bíceps Rosca Direta', 'Flexione os cotovelos trazendo a barra em direção aos ombros.', 'Braços', 'https://res.cloudinary.com/ditlmzgrh/image/upload/v1757229918/image_73_co9eqf.jpg')
       `;
     }
 
@@ -180,6 +211,40 @@ async function initDb() {
       comentario TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`;
+
+    // Índices para performance de notificações (resolve timeouts de 30s)
+    await sql`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_notifications_sender_id ON notifications(sender_id)`;
+
+    // Tabela de Categorias de Treinos
+    await sql`CREATE TABLE IF NOT EXISTS treino_categorias (
+      id SERIAL PRIMARY KEY,
+      nome TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+    const [treinoCatsCount] = await sql`SELECT count(*) FROM treino_categorias`;
+    if (parseInt(treinoCatsCount.count) === 0) {
+      await sql`
+        INSERT INTO treino_categorias (nome) VALUES
+        ('Hipertrofia'), ('Cardio'), ('Funcional'), ('Yoga'), ('HIIT'), ('Flexibilidade'), ('Crossfit')
+      `;
+    }
+
+    // Tabela de Níveis de Treinos
+    await sql`CREATE TABLE IF NOT EXISTS treino_niveis (
+      id SERIAL PRIMARY KEY,
+      nome TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+    const [treinoNiveisCount] = await sql`SELECT count(*) FROM treino_niveis`;
+    if (parseInt(treinoNiveisCount.count) === 0) {
+      await sql`
+        INSERT INTO treino_niveis (nome) VALUES
+        ('Iniciante'), ('Intermediário'), ('Avançado'), ('Pro')
+      `;
+    }
 
     // ====== PLANOS DE ASSINATURA ======
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'`;
@@ -250,13 +315,37 @@ async function initDb() {
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0`;
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS likes JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments JSONB DEFAULT '[]'`;
+    
+    // TABELA DE DADOS DE SAÚDE (Métricas centrais)
+    await sql`CREATE TABLE IF NOT EXISTS dados_saude (
+      id_dado SERIAL PRIMARY KEY,
+      id_us INTEGER NOT NULL REFERENCES usuarios(id_us) ON DELETE CASCADE,
+      calories DECIMAL(10,2) DEFAULT NULL,
+      steps INTEGER DEFAULT NULL,
+      water_intake_ml INTEGER DEFAULT NULL,
+      sleep_hours DECIMAL(4,2) DEFAULT NULL,
+      heart_rate INTEGER DEFAULT NULL,
+      oxygen_level DECIMAL(5,2) DEFAULT NULL,
+      blood_pressure TEXT DEFAULT NULL,
+      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+    // Garantir evolução de colunas se a tabela já existia
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS oxygen_level DECIMAL(5,2) DEFAULT NULL`;
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS blood_pressure TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS heart_rate INTEGER DEFAULT NULL`;
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS steps INTEGER DEFAULT NULL`;
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS water_intake_ml INTEGER DEFAULT NULL`;
+    await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS sleep_hours DECIMAL(4,2) DEFAULT NULL`;
+
 
     console.log("✅ Banco de dados sincronizado.");
   } catch (err) {
     console.error("❌ Erro ao sincronizar banco de dados:", err);
   }
 }
-initDb();
+// O banco será iniciado no final do arquivo junto com o app.listen
 
 // Configuração Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
@@ -1047,75 +1136,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   };
 }
 
-// Função auxiliar para gerar dados mockados 
-function generateMockCaloriesData(timeframe) {
-  const now = new Date();
-  let data = [];
 
-  switch (timeframe) {
-    case "1d":
-      data = Array.from({ length: 24 }, (_, i) => {
-        const date = new Date(now);
-        date.setHours(i, 0, 0, 0);
-        return {
-          date: date.toISOString(),
-          calories: Math.floor(1400 + Math.random() * 600),
-          timestamp: date.toISOString(),
-        };
-      });
-      break;
-
-    case "1s":
-      data = Array.from({ length: 7 }, (_, i) => {
-        const date = new Date(now);
-        date.setDate(date.getDate() - (6 - i));
-        return {
-          date: date.toISOString(),
-          calories: Math.floor(1500 + Math.random() * 500),
-          timestamp: date.toISOString(),
-        };
-      });
-      break;
-
-    case "1m":
-      data = Array.from({ length: 30 }, (_, i) => {
-        const date = new Date(now);
-        date.setDate(date.getDate() - (29 - i));
-        return {
-          date: date.toISOString(),
-          calories: Math.floor(1400 + Math.random() * 700),
-          timestamp: date.toISOString(),
-        };
-      });
-      break;
-
-    case "1a":
-      data = Array.from({ length: 12 }, (_, i) => {
-        const date = new Date(now);
-        date.setMonth(date.getMonth() - (11 - i));
-        return {
-          date: date.toISOString(),
-          calories: Math.floor(1600 + Math.random() * 400),
-          timestamp: date.toISOString(),
-        };
-      });
-      break;
-
-    case "Tudo":
-      data = Array.from({ length: 60 }, (_, i) => {
-        const date = new Date(now);
-        date.setDate(date.getDate() - (59 - i));
-        return {
-          date: date.toISOString(),
-          calories: Math.floor(1300 + Math.random() * 800),
-          timestamp: date.toISOString(),
-        };
-      });
-      break;
-  }
-
-  return data;
-}
 
 // ------------------- AUTENTICAÇÃO DE USUÁRIO --------------------- //
 
@@ -1651,6 +1672,76 @@ app.get("/api/user/plan-status", verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[plan-status]', err);
     return res.status(500).json({ error: 'Erro ao buscar status do plano.' });
+  }
+});
+
+// GET: Retorna informações detalhadas de faturamento (Stripe) do usuário logado
+app.get("/api/user/billing-info", verifyToken, async (req, res) => {
+  const userId = req.userId;
+
+  try {
+    const [user] = await sql`
+      SELECT email, plan, cpf, cnpj FROM usuarios WHERE id_us = ${userId}
+    `;
+
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+
+    if (!stripe) {
+      return res.status(503).json({ error: "Serviço Stripe não configurado." });
+    }
+
+    // Busca cliente na Stripe pelo email
+    const customers = await stripe.customers.list({ email: user.email, limit: 1 });
+    
+    if (customers.data.length === 0) {
+      return res.json({ 
+        hasSubscription: false, 
+        message: "Nenhuma assinatura encontrada na Stripe para este e-mail.",
+        userType: user.cnpj ? "PJ" : "PF"
+      });
+    }
+
+    const customerId = customers.data[0].id;
+
+    // Busca assinaturas do cliente
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'all',
+      expand: ['data.default_payment_method']
+    });
+
+    let billingData = {
+      hasSubscription: subscriptions.data.length > 0,
+      userType: user.cnpj ? "PJ" : "PF",
+      email: user.email,
+      plan: user.plan
+    };
+
+    if (subscriptions.data.length > 0) {
+      const sub = subscriptions.data[0];
+      
+      const paymentMethod = sub.default_payment_method;
+      
+      billingData = {
+        ...billingData,
+        status: sub.status,
+        planName: sub.items.data[0].plan.nickname || sub.items.data[0].price.nickname || "Plano MOVT",
+        amount: sub.items.data[0].plan.amount / 100,
+        currency: sub.items.data[0].plan.currency,
+        nextBillingDate: new Date(sub.current_period_end * 1000),
+        card: paymentMethod && paymentMethod.card ? {
+          brand: paymentMethod.card.brand,
+          last4: paymentMethod.card.last4,
+          expMonth: paymentMethod.card.exp_month,
+          expYear: paymentMethod.card.exp_year
+        } : null
+      };
+    }
+
+    res.json(billingData);
+  } catch (error) {
+    console.error("Erro ao buscar billing info:", error);
+    res.status(500).json({ error: "Erro ao buscar dados de faturamento.", details: error.message });
   }
 });
 
@@ -6154,18 +6245,30 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
 
 // Rota para obter treinos filtrados por especialidade
 app.get("/api/treinos", verifyToken, async (req, res) => {
-  const { specialty } = req.query;
+  const { specialty, isDaily } = req.query;
   try {
     let treinos;
+    // Se isDaily for true, podemos filtrar por algum critério ou simplesmente retornar os mais recentes
+    const filterDaily = isDaily === 'true' ? sql`AND level = 'Iniciante'` : sql``;
+
     if (specialty) {
       treinos = await sql`
-        SELECT * FROM conteudo_treinos 
-        WHERE specialty = ${specialty}
+        SELECT 
+          id as id_treino, title as nome, calories as calorias, minutes as duracao, 
+          image_url as imageurl, specialty as categoria, level as nivel, 
+          description as descricao, description, exercicios, created_at 
+        FROM conteudo_treinos 
+        WHERE specialty = ${specialty} AND (ativo = TRUE OR ativo IS NULL) ${filterDaily}
         ORDER BY created_at DESC
       `;
     } else {
       treinos = await sql`
-        SELECT * FROM conteudo_treinos 
+        SELECT 
+          id as id_treino, title as nome, calories as calorias, minutes as duracao, 
+          image_url as imageurl, specialty as categoria, level as nivel, 
+          description as descricao, description, exercicios, created_at 
+        FROM conteudo_treinos 
+        WHERE (ativo = TRUE OR ativo IS NULL) ${filterDaily}
         ORDER BY created_at DESC
       `;
     }
@@ -6177,6 +6280,43 @@ app.get("/api/treinos", verifyToken, async (req, res) => {
       details: err.message,
       stack: err.stack
     });
+  }
+});
+
+// Rota para obter exercícios globais
+app.get("/api/exercicios", verifyToken, async (req, res) => {
+  try {
+    const exercicios = await sql`
+      SELECT id as id_exercicio, nome, descricao, image_url, categoria 
+      FROM exercicios 
+      ORDER BY nome ASC
+    `;
+    res.status(200).json({ data: exercicios });
+  } catch (err) {
+    console.error("Erro ao carregar exercícios:", err);
+    res.status(500).json({ error: "Erro ao carregar exercícios", details: err.message });
+  }
+});
+
+// Rota para obter categorias de treinos
+app.get("/api/treino-categorias", verifyToken, async (req, res) => {
+  try {
+    const categorias = await sql`SELECT nome FROM treino_categorias ORDER BY nome ASC`;
+    res.status(200).json({ data: categorias.map(c => c.nome) });
+  } catch (err) {
+    console.error("Erro ao buscar categorias de treinos:", err);
+    res.status(500).json({ error: "Erro ao buscar categorias de treinos" });
+  }
+});
+
+// Rota para obter níveis de treinos
+app.get("/api/treino-niveis", verifyToken, async (req, res) => {
+  try {
+    const niveis = await sql`SELECT nome FROM treino_niveis ORDER BY id ASC`;
+    res.status(200).json({ data: niveis.map(n => n.nome) });
+  } catch (err) {
+    console.error("Erro ao buscar níveis de treinos:", err);
+    res.status(500).json({ error: "Erro ao buscar níveis de treinos" });
   }
 });
 
@@ -6224,20 +6364,33 @@ app.get("/api/academias/:id_academia", verifyToken, async (req, res) => {
 // -------------------------------- DADOS DE CALORIAS ---------------------------- //
 
 // GET: Buscar dados de calorias
-app.get("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INá CIO DA ROTA GET /api/dados/calories ===");
-  console.log("Timestamp:", new Date().toISOString());
-  console.log("User ID:", req.userId);
-
+app.get("/api/dados/:metric", verifyToken, async (req, res) => {
+  const { metric } = req.params;
   const userId = req.userId;
   const { timeframe = "1d" } = req.query;
+
+  const metricsMap = {
+    calories: 'calories',
+    steps: 'steps',
+    water: 'water_intake_ml',
+    sleep: 'sleep_hours',
+    heartrate: 'heart_rate',
+    oxygen: 'oxygen_level',
+    pressure: 'blood_pressure'
+  };
+
+
+  if (!metricsMap[metric]) {
+    return res.status(400).json({ error: "Métrica inválida ou não suportada." });
+  }
+
+  const column = metricsMap[metric];
 
   try {
     let startDate = new Date();
     let endDate = new Date();
     let groupByFormat = "day";
 
-    // Define o intervalo de datas baseado no timeframe
     switch (timeframe) {
       case "1d":
         startDate.setHours(0, 0, 0, 0);
@@ -6263,128 +6416,118 @@ app.get("/api/dados/calories", verifyToken, async (req, res) => {
         startDate.setDate(startDate.getDate() - 7);
     }
 
-    console.log("Buscando dados de calorias de", startDate, "até", endDate);
-
-    // Busca os dados de calorias do usuário
-    const caloriesData = await sql`
+    const healthData = await sql`
       SELECT 
         id_dado,
-        calories,
+        ${sql(column)} as value,
         timestamp,
         DATE_TRUNC(${groupByFormat}, timestamp) as period
       FROM dados_saude
       WHERE id_us = ${userId}
         AND timestamp >= ${startDate}
         AND timestamp <= ${endDate}
-        AND calories IS NOT NULL
+        AND ${sql(column)} IS NOT NULL
       ORDER BY timestamp ASC
     `;
 
-    console.log(`✅ Encontrados ${caloriesData.length} registros de calorias`);
-
-    // Agrupa dados se necessário
     const groupedData = {};
-    caloriesData.forEach((item) => {
+    healthData.forEach((item) => {
       const key = item.period.toISOString();
       if (!groupedData[key]) {
         groupedData[key] = {
           date: item.period.toISOString(),
-          calories: 0,
+          value: 0,
           count: 0,
           timestamp: item.period.toISOString(),
         };
       }
-      groupedData[key].calories += item.calories;
+      groupedData[key].value += Number(item.value);
       groupedData[key].count += 1;
     });
 
-    // Calcula a média de calorias por período
     const processedData = Object.values(groupedData).map((item) => ({
       date: item.date,
-      calories: Math.round(item.calories / item.count),
+      value: Math.round(item.value / item.count), // Média se houver múltiplos no mesmo período
       timestamp: item.timestamp,
     }));
 
-    // Se não houver dados, gera dados mockados
-    const data =
-      processedData.length > 0
-        ? processedData
-        : generateMockCaloriesData(timeframe);
+    const totalValue = processedData.length > 0 ? processedData[processedData.length - 1].value : 0;
+    const dailyGoal = metric === 'calories' ? 2000 : (metric === 'steps' ? 10000 : 2000);
 
-    // Calcula estatísticas
-    const totalCalories = data[data.length - 1]?.calories || 0;
-    const dailyGoal = 2000;
-    const remainingCalories = Math.max(0, dailyGoal - totalCalories);
-
-    const response = {
-      totalCalories,
-      remainingCalories,
+    res.status(200).json({
+      metric,
+      totalValue,
       dailyGoal,
-      data,
-    };
-
-    console.log("--- RESPOSTA DE SUCESSO ---");
-    console.log("Total de calorias:", totalCalories);
-    console.log("Calorias restantes:", remainingCalories);
-    console.log("Total de pontos no gráfico:", data.length);
-    console.log("=== FIM DA ROTA GET /api/dados/calories (SUCESSO) ===");
-
-    res.status(200).json(response);
-  } catch (error) {
-    console.error("â Œ Erro ao buscar dados de calorias:", error);
-    console.log("=== FIM DA ROTA GET /api/dados/calories (ERRO 500) ===");
-    res.status(500).json({
-      error: "Erro interno do servidor ao buscar dados de calorias.",
-      details: error.message,
+      data: processedData,
     });
+  } catch (error) {
+    console.error(`Erro ao buscar dados de ${metric}:`, error);
+    res.status(500).json({ error: "Erro interno do servidor." });
   }
 });
 
+
 // POST: Salvar dados de calorias
-app.post("/api/dados/calories", verifyToken, async (req, res) => {
-  console.log("=== INá CIO DA ROTA POST /api/dados/calories ===");
-  console.log("Timestamp:", new Date().toISOString());
-  console.log("User ID:", req.userId);
-  console.log("Body:", req.body);
-
+app.post("/api/dados/:metric", verifyToken, async (req, res) => {
+  const { metric } = req.params;
   const userId = req.userId;
-  const { calories, timestamp } = req.body;
+  const { value, timestamp } = req.body;
 
-  if (!calories) {
-    console.log("â Œ Erro: Calorias não fornecidas");
-    return res.status(400).json({ error: "Calorias são obrigatórias." });
+  const metricsMap = {
+    calories: 'calories',
+    steps: 'steps',
+    water: 'water_intake_ml',
+    sleep: 'sleep_hours',
+    heartrate: 'heart_rate',
+    oxygen: 'oxygen_level',
+    pressure: 'blood_pressure'
+  };
+
+
+  if (!metricsMap[metric]) {
+    return res.status(400).json({ error: "Métrica inválida ou não suportada." });
   }
+
+  if (value === undefined || value === null) {
+    return res.status(400).json({ error: "O valor da métrica é obrigatório." });
+  }
+
+  const column = metricsMap[metric];
 
   try {
     const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
+    const dateStr = recordTimestamp.toISOString().split('T')[0];
 
     const [newRecord] = await sql`
       INSERT INTO dados_saude (
-        id_us, calories, timestamp, created_at, updated_at
+        id_us, 
+        ${sql(column)}, 
+        timestamp, 
+        date, 
+        calories, 
+        created_at
       )
       VALUES (
-        ${userId}, ${calories}, ${recordTimestamp}, ${new Date()}, ${new Date()}
+        ${userId}, 
+        ${value}, 
+        ${recordTimestamp}, 
+        ${dateStr}, 
+        ${column === 'calories' ? value : 0}, 
+        NOW()
       )
       RETURNING *;
     `;
 
-    console.log("✅ Registro de calorias criado com sucesso");
-    console.log("ID do registro:", newRecord.id_dado);
-    console.log("=== FIM DA ROTA POST /api/dados/calories (SUCESSO) ===");
-
     res.status(201).json({
-      message: "Dados de calorias salvos com sucesso!",
+      message: `Dados de ${metric} salvos com sucesso!`,
       data: newRecord,
     });
   } catch (error) {
-    console.error("â Œ Erro ao salvar dados de calorias:", error);
-    console.log("=== FIM DA ROTA POST /api/dados/calories (ERRO 500) ===");
-    res.status(500).json({
-      error: "Erro interno do servidor ao salvar dados de calorias.",
-      details: error.message,
-    });
+    console.error(`Erro ao salvar dados de ${metric}:`, error);
+    res.status(500).json({ error: "Erro interno do servidor." });
   }
 });
+
 
 // -------------------------------- WEAR OS DEVICES ---------------------------- //
 
@@ -8056,16 +8199,16 @@ app.post("/api/personal/appointments/:id/receipt", verifyToken, upload.single('r
   }
 });
 
-console.log("🛠️ Tentando iniciar servidor na porta 3000...");
-
-
-app.listen(3000, "0.0.0.0", () => {
-  console.log("------------------------------------------");
-  console.log("🚀 BACKEND MOVT RODANDO COM SUCESSO!");
-  console.log("📍 Base URL: http://localhost:3000");
-  console.log("------------------------------------------");
-}).on('error', (err) => {
-  console.error("❌ Erro ao iniciar servidor:", err);
+// Iniciar o banco de dados e depois o servidor
+initDb().then(() => {
+  app.listen(3000, "0.0.0.0", () => {
+    console.log("------------------------------------------");
+    console.log("🚀 BACKEND MOVT RODANDO COM SUCESSO!");
+    console.log("📍 Base URL: http://localhost:3000");
+    console.log("------------------------------------------");
+  }).on('error', (err) => {
+    console.error("❌ Erro ao iniciar servidor:", err);
+  });
 });
 
 module.exports = app;
