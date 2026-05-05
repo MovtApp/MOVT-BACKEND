@@ -1487,7 +1487,7 @@ app.delete("/api/admin/plans/:id", verifyToken, async (req, res) => {
 });
 
 app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
-  const { priceId, quantity } = req.body;
+  const { priceId, quantity, returnUrl } = req.body;
   const userId = req.userId;
 
   try {
@@ -1503,8 +1503,10 @@ app.post("/api/create-checkout-session", verifyToken, async (req, res) => {
         },
       ],
       customer_email: user.email,
-      success_url: 'https://movt.app/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: 'https://movt.app/cancel',
+      success_url: returnUrl 
+        ? `${returnUrl}${returnUrl.includes('?') ? '&' : '?'}session_id={CHECKOUT_SESSION_ID}`
+        : 'https://movt.app/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: returnUrl || 'https://movt.app/cancel',
       metadata: {
         userId: String(userId)
       }
