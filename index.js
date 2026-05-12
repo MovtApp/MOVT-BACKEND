@@ -6485,7 +6485,6 @@ app.post("/api/dados/:metric", verifyToken, async (req, res) => {
     pressure: 'blood_pressure'
   };
 
-
   if (!metricsMap[metric]) {
     return res.status(400).json({ error: "Métrica inválida ou não suportada." });
   }
@@ -6495,40 +6494,53 @@ app.post("/api/dados/:metric", verifyToken, async (req, res) => {
   }
 
   const column = metricsMap[metric];
+  const numericValue = Number(value);
+
+  if (isNaN(numericValue)) {
+    return res.status(400).json({ error: "O valor deve ser numérico." });
+  }
 
   try {
     const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
     const dateStr = recordTimestamp.toISOString().split('T')[0];
 
-    const [newRecord] = await sql`
-      INSERT INTO dados_saude (
-        id_us, 
-        ${sql(column)}, 
-        timestamp, 
-        date, 
-        calories, 
-        created_at
-      )
-      VALUES (
-        ${userId}, 
-        ${value}, 
-        ${recordTimestamp}, 
-        ${dateStr}, 
-        ${column === 'calories' ? value : 0}, 
-        NOW()
-      )
+    // UPSERT: se já existe um registro para o mesmo usuário e data, atualiza; caso contrário, insere.
+    const [record] = await sql`
+      INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, created_at)
+      VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, NOW())
+      ON CONFLICT (id_us, date)
+      DO UPDATE SET
+        ${sql(column)} = EXCLUDED.${sql(column)},
+        timestamp = EXCLUDED.timestamp
       RETURNING *;
     `;
 
     res.status(201).json({
       message: `Dados de ${metric} salvos com sucesso!`,
-      data: newRecord,
+      data: record,
     });
   } catch (error) {
-    console.error(`Erro ao salvar dados de ${metric}:`, error);
-    res.status(500).json({ error: "Erro interno do servidor." });
+    console.error(`Erro ao salvar dados de ${metric}:`, error.message);
+    // Fallback: tenta um INSERT simples sem ON CONFLICT (caso não haja unique constraint)
+    try {
+      const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
+      const dateStr = recordTimestamp.toISOString().split('T')[0];
+      const [newRecord] = await sql`
+        INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, created_at)
+        VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, NOW())
+        RETURNING *;
+      `;
+      res.status(201).json({
+        message: `Dados de ${metric} salvos com sucesso!`,
+        data: newRecord,
+      });
+    } catch (fallbackError) {
+      console.error(`Erro no fallback ao salvar dados de ${metric}:`, fallbackError.message);
+      res.status(500).json({ error: "Erro interno do servidor.", details: fallbackError.message });
+    }
   }
 });
+
 
 
 // -------------------------------- WEAR OS DEVICES ---------------------------- //
