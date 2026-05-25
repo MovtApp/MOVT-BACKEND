@@ -142,6 +142,9 @@ async function initDb() {
 
     // Garantir coluna de especialidades para usuários (principalmente personals)
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS especialidades TEXT[] DEFAULT '{}'`;
+    
+    // Garantir coluna de vínculo com Supabase (Login Social)
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS supabase_uid TEXT DEFAULT NULL`;
 
     // Garantir tabela de treinos (usando nome exclusivo para evitar conflito)
     await sql`CREATE TABLE IF NOT EXISTS conteudo_treinos (
@@ -315,6 +318,19 @@ async function initDb() {
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0`;
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS likes JSONB DEFAULT '[]'`;
     await sql`ALTER TABLE dietas ADD COLUMN IF NOT EXISTS comments JSONB DEFAULT '[]'`;
+    
+    // TABELA DE MISSÃO DO USUÁRIO
+    await sql`CREATE TABLE IF NOT EXISTS user_mission (
+      id_mission SERIAL PRIMARY KEY,
+      id_us INTEGER REFERENCES usuarios(id_us) UNIQUE,
+      peso_atual NUMERIC,
+      peso_meta NUMERIC,
+      altura NUMERIC,
+      idade INTEGER,
+      sexo VARCHAR(1),
+      nivel_atividade VARCHAR(20),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`;
     
     // TABELA DE DADOS DE SAÚDE (Métricas centrais)
     await sql`CREATE TABLE IF NOT EXISTS dados_saude (
@@ -1361,6 +1377,121 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
+// Endpoint de Sincronização de Login Social (Supabase -> Vercel)
+app.post("/api/auth/social-sync", async (req, res) => {
+  const { email, nome, supabase_uid, photo } = req.body;
+
+  if (!email || !supabase_uid) {
+    return res.status(400).json({ error: "E-mail e Supabase UID são obrigatórios para sincronização." });
+  }
+
+  try {
+    // 1. Tentar encontrar o usuário pelo Supabase UID ou pelo E-mail
+    const [existingUser] = await sql`
+      SELECT * FROM usuarios 
+      WHERE supabase_uid = ${supabase_uid} OR email = ${email}
+      LIMIT 1
+    `;
+
+    const newSessionId = uuidv4();
+
+    if (existingUser) {
+      console.log(`[SocialSync] Usuário encontrado: ${email}. Atualizando sessão...`);
+      
+      // 2. Se o usuário já existe, atualizamos o Supabase UID (caso ele tenha logado via email antes)
+      // e geramos um novo Session ID da Vercel para ele.
+      const [updatedUser] = await sql`
+        UPDATE usuarios 
+        SET 
+          supabase_uid = ${supabase_uid},
+          session_id = ${newSessionId},
+          avatar_url = COALESCE(avatar_url, ${photo || null}),
+          updated_at = NOW()
+        WHERE id_us = ${existingUser.id_us}
+        RETURNING *
+      `;
+
+      return res.json({
+        message: "Sincronização realizada com sucesso.",
+        user: updatedUser,
+        sessionId: newSessionId,
+        isNewUser: false
+      });
+    }
+
+    // 3. Se não existe, criamos um registro básico (Onboarding Pending)
+    console.log(`[SocialSync] Criando novo registro básico para: ${email}`);
+    
+    // Senha aleatória para usuários sociais (eles não usarão senha para logar)
+    const randomPassword = await bcrypt.hash(uuidv4(), 10);
+    
+    const [newUser] = await sql`
+      INSERT INTO usuarios (
+        nome, email, username, senha, supabase_uid, 
+        session_id, avatar_url, created_at, updated_at, 
+        email_verified, plan, ativo
+      ) VALUES (
+        ${nome || email.split('@')[0]}, ${email}, ${email}, ${randomPassword}, ${supabase_uid},
+        ${newSessionId}, ${photo || null}, NOW(), NOW(),
+        TRUE, 'free', TRUE
+      )
+      RETURNING *
+    `;
+
+    return res.status(201).json({
+      message: "Usuário social criado com sucesso.",
+      user: newUser,
+      sessionId: newSessionId,
+      isNewUser: true
+    });
+
+  } catch (error) {
+    console.error("[SocialSync] Erro crítico:", error);
+    res.status(500).json({ error: "Erro interno na sincronização social.", details: error.message });
+  }
+});
+
+// Endpoint para finalizar o onboarding (Atualiza dados biométricos)
+app.post("/api/user/complete-onboarding", async (req, res) => {
+  const { email, genero, idade, altura, peso, objetivo, nivel, nome } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "Email é obrigatório." });
+  }
+
+  try {
+    const [updatedUser] = await sql`
+      UPDATE usuarios 
+      SET 
+        nome = COALESCE(${nome || null}, nome),
+        genero = ${genero || 'Não informado'},
+        idade = ${Number(idade) || 25},
+        altura = ${Number(altura) || 170},
+        peso = ${Number(peso) || 70},
+        objetivo = ${objetivo || 'Manter peso'},
+        nivel = ${nivel || 'Iniciante'},
+        ativo = TRUE,
+        updated_at = NOW()
+      WHERE email = ${email}
+      RETURNING *
+    `;
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: "Usuário não encontrado para completar onboarding." });
+    }
+
+    res.json({
+      success: true,
+      message: "Perfil completado com sucesso!",
+      user: updatedUser,
+      sessionId: updatedUser.session_id
+    });
+  } catch (error) {
+    console.error("[CompleteOnboarding] Erro:", error);
+    res.status(500).json({ error: "Erro ao finalizar perfil.", details: error.message });
+  }
+});
+
 // --------------------- PLANOS E ASSINATURAS (STRIPE) --------------------- //
 
 app.get("/api/plans", async (req, res) => {
@@ -1811,7 +1942,7 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
     const ltv = churnNum > 0 ? (arpu / (churnNum / 100)) : (arpu * 24); // If churn 0, assume 24 months
 
     // 3. Coletar faturamento real do Stripe com suporte a período
-    const period = (req.query.period || 'month'); // 'day' | 'month' | 'year'
+    const period = (req.query.period || req.query.tab || 'month'); // 'day' | 'month' | 'year'
     let revenueData = [];
     let grossRevenueCurrent = 0;
     let revenueGrowth = "+0%";
@@ -1853,7 +1984,7 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
             const hourTotal = allPayments
               .filter(p => p.created >= Math.floor(hourStart.getTime() / 1000) && p.created < Math.floor(hourEnd.getTime() / 1000))
               .reduce((acc, p) => acc + (p.amount / 100), 0);
-            revenueData.push({ month: `${String(h).padStart(2, '0')}h`, total: parseFloat(hourTotal.toFixed(2)) });
+            revenueData.push({ label: `${String(h).padStart(2, '0')}h`, total: parseFloat(hourTotal.toFixed(2)) });
           }
           grossRevenueCurrent = allPayments.reduce((acc, p) => acc + (p.amount / 100), 0);
           revenueGrowth = "+0%"; // comparação intraday não disponível
@@ -1870,7 +2001,7 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
             const dayTotal = allPayments
               .filter(p => p.created >= Math.floor(dayStart.getTime() / 1000) && p.created < Math.floor(dayEnd.getTime() / 1000))
               .reduce((acc, p) => acc + (p.amount / 100), 0);
-            revenueData.push({ month: String(d), total: parseFloat(dayTotal.toFixed(2)) });
+            revenueData.push({ label: String(d), total: parseFloat(dayTotal.toFixed(2)) });
           }
 
           grossRevenueCurrent = allPayments.reduce((acc, p) => acc + (p.amount / 100), 0);
@@ -1911,7 +2042,7 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
             const mTotal = allPayments
               .filter(p => p.created >= Math.floor(mStart.getTime() / 1000) && p.created < Math.floor(mEnd.getTime() / 1000))
               .reduce((acc, p) => acc + (p.amount / 100), 0);
-            revenueData.push({ month: monthNames[m], total: parseFloat(mTotal.toFixed(2)) });
+            revenueData.push({ label: monthNames[m], total: parseFloat(mTotal.toFixed(2)) });
           }
           grossRevenueCurrent = allPayments.reduce((acc, p) => acc + (p.amount / 100), 0);
 
@@ -1949,11 +2080,11 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
     } else {
       // Sem Stripe: placeholder vazio condizente com o período
       if (period === 'day') {
-        for (let h = 0; h <= now.getHours(); h++) revenueData.push({ month: `${String(h).padStart(2,'0')}h`, total: 0 });
+        for (let h = 0; h <= now.getHours(); h++) revenueData.push({ label: `${String(h).padStart(2,'0')}h`, total: 0 });
       } else if (period === 'month') {
-        for (let d = 1; d <= now.getDate(); d++) revenueData.push({ month: String(d), total: 0 });
+        for (let d = 1; d <= now.getDate(); d++) revenueData.push({ label: String(d), total: 0 });
       } else {
-        for (let m = 0; m <= now.getMonth(); m++) revenueData.push({ month: monthNames[m], total: 0 });
+        for (let m = 0; m <= now.getMonth(); m++) revenueData.push({ label: monthNames[m], total: 0 });
       }
     }
 
@@ -1991,6 +2122,7 @@ app.get("/api/admin/dashboard-stats", verifyToken, async (req, res) => {
     res.json({
       success: true,
       receiptHistory: receiptHistory,
+      chartData: revenueData,
       kpis: [
         { id: 'plans', label: 'Planos ativos', value: String(premiumCount + familiaCount), grow: '+12%', color: '#6366F1' },
         { id: 'users', label: 'Total de usuários', value: String(totalUsers), grow: '+24%', color: '#8B5CF6' },
@@ -3130,6 +3262,48 @@ app.post("/api/trainers/follow-multiple", verifyToken, async (req, res) => {
 // --- ROTAS DE SEGUIMENTO (AVANÇADAS) ---
 
 // Seguir um usuário (com suporte a solicitação pendente)
+
+// GET: Recuperar missão do usuário
+app.get("/api/user/mission", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const [mission] = await sql`
+      SELECT * FROM user_mission WHERE id_us = ${userId}
+    `;
+    res.status(200).json({ mission: mission || null });
+  } catch (error) {
+    console.error("Erro ao buscar missão:", error.message);
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
+
+// POST: Salvar ou atualizar missão do usuário
+app.post("/api/user/mission", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { pesoAtual, pesoMeta, altura, idade, sexo, nivelAtividade } = req.body;
+
+  try {
+    const [mission] = await sql`
+      INSERT INTO user_mission (id_us, peso_atual, peso_meta, altura, idade, sexo, nivel_atividade, updated_at)
+      VALUES (${userId}, ${pesoAtual}, ${pesoMeta}, ${altura}, ${idade}, ${sexo}, ${nivelAtividade}, NOW())
+      ON CONFLICT (id_us)
+      DO UPDATE SET
+        peso_atual = EXCLUDED.peso_atual,
+        peso_meta = EXCLUDED.peso_meta,
+        altura = EXCLUDED.altura,
+        idade = EXCLUDED.idade,
+        sexo = EXCLUDED.sexo,
+        nivel_atividade = EXCLUDED.nivel_atividade,
+        updated_at = NOW()
+      RETURNING *;
+    `;
+    res.status(200).json({ message: "Missão salva com sucesso!", mission });
+  } catch (error) {
+    console.error("Erro ao salvar missão:", error.message);
+    res.status(500).json({ error: "Erro ao salvar os dados da missão." });
+  }
+});
+
 app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
   const followedUserId = await resolveUserId(req.params.id);
   const followerUserId = req.userId;
@@ -6133,14 +6307,35 @@ app.get("/api/academias", verifyToken, async (req, res) => {
 });
 
 // GET: Buscar academias próximas (usando fórmula Haversine)
-// IMPORTANTE: Esta rota deve vir ANTES de /academias/:id_academia
 app.get("/api/academias/nearby", verifyToken, async (req, res) => {
   const { lat, lng, raio = 10 } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: "Parâmetros 'lat' e 'lng' são obrigatórios." });
+  const latitude = parseFloat(lat);
+  const longitude = parseFloat(lng);
+  const raioKm = parseFloat(raio);
+  try {
+    const academias = await sql`
+      SELECT * FROM (
+        SELECT id_academia, nome, rating, total_avaliacoes, endereco_completo,
+               latitude, longitude, telefone, whatsapp, ativo, fotos,
+               (6371 * acos(LEAST(1, GREATEST(-1, cos(radians(${latitude})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${longitude})) + sin(radians(${latitude})) * sin(radians(latitude)))))) AS distancia_km
+        FROM academias WHERE ativo = TRUE
+      ) AS a WHERE distancia_km <= ${raioKm}
+      ORDER BY distancia_km ASC
+    `;
+    res.status(200).json({ data: academias });
+  } catch (error) {
+    console.error("Erro ao buscar academias próximas:", error);
+    res.status(500).json({ error: "Erro interno.", details: error.message });
+  }
+});
+
+// Versão "Smart" com Google Places Integrado
+app.get("/api/academias/v2/nearby", verifyToken, async (req, res) => {
+  const { lat, lng, raio = 5, useGoogle = "true" } = req.query;
 
   if (!lat || !lng) {
-    return res.status(400).json({
-      error: "Parâmetros 'lat' e 'lng' são obrigatórios."
-    });
+    return res.status(400).json({ error: "Parâmetros 'lat' e 'lng' são obrigatórios." });
   }
 
   const latitude = parseFloat(lat);
@@ -6148,102 +6343,58 @@ app.get("/api/academias/nearby", verifyToken, async (req, res) => {
   const raioKm = parseFloat(raio);
 
   try {
-    // Fórmula Haversine para calcular distância usando subquery
-    const specialty = req.query.specialty;
+    // 1. Buscar no Banco Local (Postgres)
+    const localGyms = await sql`
+      SELECT * FROM (
+        SELECT id_academia, nome, rating, total_avaliacoes, endereco_completo,
+               latitude, longitude, telefone, whatsapp, ativo, fotos,
+               (6371 * acos(LEAST(1, GREATEST(-1, cos(radians(${latitude})) * cos(radians(latitude)) * cos(radians(longitude) - radians(${longitude})) + sin(radians(${latitude})) * sin(radians(latitude)))))) AS distancia_km
+        FROM academias WHERE ativo = TRUE
+      ) AS a WHERE distancia_km <= ${raioKm}
+    `;
 
-    let academias;
-    if (specialty) {
-      // Filtrar por academias que possuem personais com a especialidade selecionada
-      academias = await sql`
-        SELECT * FROM (
-          SELECT DISTINCT
-            a.id_academia,
-            a.nome,
-            a.rating,
-            a.total_avaliacoes,
-            a.endereco_completo,
-            a.latitude,
-            a.longitude,
-            a.telefone,
-            a.whatsapp,
-            a.horarios_funcionamento,
-            a.ativo,
-            a.fotos,
-            (
-              6371 * acos(
-                LEAST(1, GREATEST(-1, 
-                  cos(radians(${latitude})) * 
-                  cos(radians(a.latitude)) * 
-                  cos(radians(a.longitude) - radians(${longitude})) + 
-                  sin(radians(${latitude})) * 
-                  sin(radians(a.latitude))
-                ))
-              )
-            ) AS distancia_km
-          FROM academias a
-          JOIN gym_trainers gt ON gt.gym_id = a.id_academia
-          JOIN usuarios u ON gt.personal_id = u.id_us
-          LEFT JOIN personal_profiles pp ON pp.id_trainer = u.id_us
-          WHERE a.ativo = TRUE 
-            AND gt.status = 'active'
-            AND (
-              ${specialty} = ANY(u.especialidades) 
-              OR ${specialty} = ANY(pp.especialidades)
-            )
-        ) AS academias_com_distancia
-        WHERE distancia_km <= ${raioKm}
-        ORDER BY distancia_km ASC
-      `;
-    } else {
-      academias = await sql`
-        SELECT * FROM (
-          SELECT 
-            id_academia,
-            nome,
-            rating,
-            total_avaliacoes,
-            endereco_completo,
-            rua,
-            numero,
-            bairro,
-            cidade,
-            estado,
-            cep,
-            latitude,
-            longitude,
-            telefone,
-            whatsapp,
-            horarios_funcionamento,
-            ativo,
-            fotos,
-            (
-              6371 * acos(
-                LEAST(1, GREATEST(-1, 
-                  cos(radians(${latitude})) * 
-                  cos(radians(latitude)) * 
-                  cos(radians(longitude) - radians(${longitude})) + 
-                  sin(radians(${latitude})) * 
-                  sin(radians(latitude))
-                ))
-              )
-            ) AS distancia_km
-          FROM academias
-          WHERE ativo = TRUE
-        ) AS academias_com_distancia
-        WHERE distancia_km <= ${raioKm}
-        ORDER BY distancia_km ASC
-      `;
+    let finalGyms = [...localGyms];
+
+    // 2. Se habilitado, buscar no Google Places para enriquecer
+    if (useGoogle === "true") {
+      const { searchNearbyGyms } = require("./services/googlePlaces");
+      const googleGyms = await searchNearbyGyms(latitude, longitude, raioKm * 1000);
+      
+      // Merge Simples: Evitar duplicados por nome próximo ou localização exata
+      googleGyms.forEach(gGym => {
+        const isAlreadyInLocal = localGyms.some(lGym => 
+          (lGym.nome.toLowerCase() === gGym.nome.toLowerCase()) ||
+          (Math.abs(lGym.latitude - gGym.latitude) < 0.0001 && Math.abs(lGym.longitude - gGym.longitude) < 0.0001)
+        );
+        
+        if (!isAlreadyInLocal) {
+          finalGyms.push({
+            ...gGym,
+            id_academia: `google_${gGym.google_place_id}`, // ID temporário
+            distancia_km: calculateDistance(latitude, longitude, gGym.latitude, gGym.longitude)
+          });
+        }
+      });
     }
 
-    res.status(200).json({ data: academias });
+    res.json({ data: finalGyms.sort((a, b) => a.distancia_km - b.distancia_km) });
   } catch (error) {
-    console.error("Erro ao buscar academias próximas:", error);
-    res.status(500).json({
-      error: "Erro interno do servidor ao buscar academias próximas.",
-      details: error.message,
-    });
+    console.error("[Nearby V2 Error]:", error);
+    res.status(500).json({ error: "Erro ao processar academias próximas." });
   }
 });
+
+// Função auxiliar de distância
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
 
 // Rota para obter treinos filtrados por especialidade
 app.get("/api/treinos", verifyToken, async (req, res) => {
@@ -6369,7 +6520,7 @@ app.get("/api/academias/:id_academia", verifyToken, async (req, res) => {
 app.get("/api/dados/:metric", verifyToken, async (req, res) => {
   const { metric } = req.params;
   const userId = req.userId;
-  const { timeframe = "1d" } = req.query;
+  const { timeframe = "1d", date } = req.query;
 
   const metricsMap = {
     calories: 'calories',
@@ -6381,79 +6532,114 @@ app.get("/api/dados/:metric", verifyToken, async (req, res) => {
     pressure: 'blood_pressure'
   };
 
-
-  if (!metricsMap[metric]) {
-    return res.status(400).json({ error: "Métrica inválida ou não suportada." });
-  }
-
   const column = metricsMap[metric];
+  console.log(`[DEBUG] Fetching ${metric} for user ${userId}, date=${date}, timeframe=${timeframe}`);
 
   try {
-    let startDate = new Date();
-    let endDate = new Date();
-    let groupByFormat = "day";
+    const isCumulative = ['calories', 'steps', 'water'].includes(metric);
+    let healthData = [];
 
-    switch (timeframe) {
-      case "1d":
-        startDate.setHours(0, 0, 0, 0);
-        groupByFormat = "hour";
-        break;
-      case "1s":
-        startDate.setDate(startDate.getDate() - 7);
-        groupByFormat = "day";
-        break;
-      case "1m":
-        startDate.setDate(startDate.getDate() - 30);
-        groupByFormat = "day";
-        break;
-      case "1a":
-        startDate.setFullYear(startDate.getFullYear() - 1);
-        groupByFormat = "month";
-        break;
-      case "Tudo":
-        startDate.setFullYear(startDate.getFullYear() - 10);
-        groupByFormat = "month";
-        break;
-      default:
-        startDate.setDate(startDate.getDate() - 7);
+    if (date) {
+      // Se houver uma data específica, usamos a coluna 'date' que já existe e é otimizada
+      healthData = await sql`
+        SELECT 
+          id_dado,
+          ${sql(column)} as value,
+          timestamp,
+          DATE_TRUNC('hour', timestamp) as period
+        FROM dados_saude
+        WHERE id_us = ${userId}
+          AND date = ${date}
+          AND ${sql(column)} IS NOT NULL
+        ORDER BY timestamp ASC
+      `;
+    } else {
+      let startDate = new Date();
+      let endDate = new Date();
+      let groupByFormat = "day";
+
+      switch (timeframe) {
+        case "1d":
+          startDate.setHours(0, 0, 0, 0);
+          groupByFormat = "hour";
+          break;
+        case "1s":
+          startDate.setDate(startDate.getDate() - 7);
+          groupByFormat = "day";
+          break;
+        case "1m":
+          startDate.setDate(startDate.getDate() - 30);
+          groupByFormat = "day";
+          break;
+        case "1a":
+          startDate.setFullYear(startDate.getFullYear() - 1);
+          groupByFormat = "month";
+          break;
+        case "Tudo":
+          startDate.setFullYear(startDate.getFullYear() - 10);
+          groupByFormat = "month";
+          break;
+        default:
+          startDate.setDate(startDate.getDate() - 7);
+      }
+
+      // Filtra sem data específica: usa a coluna 'date' para isolar o dia (fuso America/Sao_Paulo)
+      const todayStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+
+      healthData = await sql`
+        SELECT 
+          id_dado,
+          ${sql(column)} as value,
+          timestamp,
+          DATE_TRUNC(${groupByFormat}, timestamp) as period
+        FROM dados_saude
+        WHERE id_us = ${userId}
+          AND date = ${todayStr}
+          AND ${sql(column)} IS NOT NULL
+        ORDER BY timestamp ASC
+      `;
     }
 
-    const healthData = await sql`
-      SELECT 
-        id_dado,
-        ${sql(column)} as value,
-        timestamp,
-        DATE_TRUNC(${groupByFormat}, timestamp) as period
-      FROM dados_saude
-      WHERE id_us = ${userId}
-        AND timestamp >= ${startDate}
-        AND timestamp <= ${endDate}
-        AND ${sql(column)} IS NOT NULL
-      ORDER BY timestamp ASC
-    `;
-
     const groupedData = {};
+    
     healthData.forEach((item) => {
       const key = item.period.toISOString();
+      const val = Number(item.value);
       if (!groupedData[key]) {
         groupedData[key] = {
           date: item.period.toISOString(),
-          value: 0,
-          count: 0,
+          value: val,
+          count: 1,
           timestamp: item.period.toISOString(),
         };
+      } else {
+        if (isCumulative) {
+          // Para métricas acumulativas, pegamos o maior valor do período (ex: última leitura da hora)
+          groupedData[key].value = Math.max(groupedData[key].value, val);
+        } else {
+          // Para outras (batimento, etc), somamos para tirar a média depois
+          groupedData[key].value += val;
+        }
+        groupedData[key].count += 1;
       }
-      groupedData[key].value += Number(item.value);
-      groupedData[key].count += 1;
     });
 
-    const processedData = Object.values(groupedData).map((item) => ({
+    let processedData = Object.values(groupedData).map((item) => ({
       date: item.date,
-      value: Math.round(item.value / item.count), // Média se houver múltiplos no mesmo período
+      value: isCumulative ? Math.round(item.value) : Math.round(item.value / item.count),
       timestamp: item.timestamp,
     }));
 
-    const totalValue = processedData.length > 0 ? processedData[processedData.length - 1].value : 0;
+    let totalValue = 0;
+    if (isCumulative) {
+      totalValue = processedData.length > 0 ? Math.max(...processedData.map(d => d.value)) : 0;
+    } else {
+      totalValue = processedData.length > 0 ? processedData[processedData.length - 1].value : 0;
+    }
+
+
+    console.log(`[DEBUG] ${metric} results: count=${healthData.length}, totalValue=${totalValue}`);
+
     const dailyGoal = metric === 'calories' ? 2000 : (metric === 'steps' ? 10000 : 2000);
 
     res.status(200).json({
@@ -6502,29 +6688,29 @@ app.post("/api/dados/:metric", verifyToken, async (req, res) => {
 
   try {
     const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
-    const dateStr = recordTimestamp.toISOString().split('T')[0];
+    // Usa a data enviada pelo cliente (já no fuso correto), ou calcula no fuso de São Paulo
+    const { date: clientDate } = req.body;
+    const dateStr = clientDate || recordTimestamp.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
 
-    // UPSERT: se já existe um registro para o mesmo usuário e data, atualiza; caso contrário, insere.
+    // Simples INSERT para manter histórico de data e hora
     const [record] = await sql`
       INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, created_at)
       VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, NOW())
-      ON CONFLICT (id_us, date)
-      DO UPDATE SET
-        ${sql(column)} = EXCLUDED.${sql(column)},
-        timestamp = EXCLUDED.timestamp
       RETURNING *;
     `;
 
+
     res.status(201).json({
-      message: `Dados de ${metric} salvos com sucesso!`,
+      message: "Dado de saúde salvo com sucesso.",
       data: record,
     });
+
   } catch (error) {
     console.error(`Erro ao salvar dados de ${metric}:`, error.message);
     // Fallback: tenta um INSERT simples sem ON CONFLICT (caso não haja unique constraint)
     try {
       const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
-      const dateStr = recordTimestamp.toISOString().split('T')[0];
+      const dateStr = recordTimestamp.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
       const [newRecord] = await sql`
         INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, created_at)
         VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, NOW())
@@ -6541,7 +6727,196 @@ app.post("/api/dados/:metric", verifyToken, async (req, res) => {
   }
 });
 
+// -------------------------------- CENTRALIZADO HEALTH TRACKING ---------------- //
 
+// GET: Resumo diário de saúde
+app.get("/api/health/daily-summary", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { date } = req.query;
+  const dateStr = date || new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+
+  try {
+    const records = await sql`
+      SELECT 
+        MAX(steps) as steps,
+        MAX(calories) as calories,
+        MAX(sleep_hours) as sleep_hours,
+        MAX(water_intake_ml) as water_intake
+      FROM dados_saude
+      WHERE id_us = ${userId} AND date = ${dateStr}
+    `;
+
+    const summary = records[0] || {};
+    res.status(200).json({
+      success: true,
+      data: {
+        steps: Number(summary.steps) || 0,
+        calories: Number(summary.calories) || 0,
+        sleep_hours: Number(summary.sleep_hours) || 0,
+        water_intake: Number(summary.water_intake) || 0,
+      }
+    });
+  } catch (error) {
+    console.error("Erro em GET /api/health/daily-summary:", error);
+    res.status(500).json({ success: false, error: "Erro interno do servidor." });
+  }
+});
+
+// POST: Registrar consumo de água
+app.post("/api/health/water", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { amount, date } = req.body;
+  
+  if (amount === undefined || amount === null) {
+    return res.status(400).json({ error: "O valor da água é obrigatório." });
+  }
+
+  try {
+    const recordTimestamp = new Date();
+    const dateStr = date || recordTimestamp.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+
+    const [record] = await sql`
+      INSERT INTO dados_saude (id_us, water_intake_ml, timestamp, date, created_at)
+      VALUES (${userId}, ${Number(amount)}, ${recordTimestamp}, ${dateStr}, NOW())
+      RETURNING *;
+    `;
+
+    res.status(201).json({
+      success: true,
+      message: "Consumo de água salvo com sucesso.",
+      data: record,
+    });
+  } catch (error) {
+    console.error("Erro em POST /api/health/water:", error);
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
+
+// GET: Histórico e Estatísticas de Saúde
+app.get("/api/health/stats", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { period = "1s" } = req.query;
+
+  let startDate = new Date();
+  let daysCount = 7;
+
+  switch (period) {
+    case "1d":
+      startDate.setHours(0, 0, 0, 0);
+      daysCount = 1;
+      break;
+    case "1s":
+      startDate.setDate(startDate.getDate() - 7);
+      daysCount = 7;
+      break;
+    case "1m":
+      startDate.setDate(startDate.getDate() - 30);
+      daysCount = 30;
+      break;
+    case "1a":
+      startDate.setFullYear(startDate.getFullYear() - 1);
+      daysCount = 365;
+      break;
+    case "Tudo":
+    default:
+      startDate.setDate(startDate.getDate() - 60);
+      daysCount = 60;
+  }
+
+  try {
+    const healthRecords = await sql`
+      SELECT 
+        COALESCE(date::text, TO_CHAR(timestamp, 'YYYY-MM-DD')) as date,
+        MAX(steps) as steps,
+        MAX(calories) as calories,
+        MAX(sleep_hours) as sleep_hours,
+        MAX(water_intake_ml) as water_intake,
+        AVG(heart_rate) as heart_rate
+      FROM dados_saude
+      WHERE id_us = ${userId} AND timestamp >= ${startDate}
+      GROUP BY COALESCE(date::text, TO_CHAR(timestamp, 'YYYY-MM-DD'))
+      ORDER BY date ASC
+    `;
+
+    let totalSteps = 0;
+    let totalCalories = 0;
+    let totalWater = 0;
+    let totalSleepMinutes = 0;
+    let heartRateSum = 0;
+    let hrCount = 0;
+
+    let stepsScores = [];
+    let caloriesScores = [];
+    let sleepScores = [];
+    const dailyScores = [];
+
+    const recordsMap = {};
+    healthRecords.forEach(r => {
+      if (r.date) {
+        const dKey = r.date instanceof Date 
+          ? r.date.toISOString().slice(0, 10) 
+          : String(r.date).slice(0, 10);
+        recordsMap[dKey] = r;
+      }
+    });
+
+    for (let i = daysCount - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateKey = d.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+      const record = recordsMap[dateKey] || {};
+
+      const steps = Number(record.steps) || 0;
+      const calories = Number(record.calories) || 0;
+      const sleep = Number(record.sleep_hours) || 0;
+      const water = Number(record.water_intake) || 0;
+      const hr = Number(record.heart_rate) || 0;
+
+      totalSteps += steps;
+      totalCalories += calories;
+      totalWater += water;
+      totalSleepMinutes += sleep * 60;
+      if (hr > 0) {
+        heartRateSum += hr;
+        hrCount++;
+      }
+
+      const stepsScore = Math.min(100, (steps / 10000) * 100);
+      const caloriesScore = Math.min(100, (calories / 2000) * 100);
+      const sleepScore = Math.min(100, (sleep / 8) * 100);
+      const waterScore = Math.min(100, (water / 2000) * 100);
+      const hrScore = hr > 0 ? (hr >= 60 && hr <= 100 ? 100 : 70) : 80;
+
+      stepsScores.push(stepsScore);
+      caloriesScores.push(caloriesScore);
+      sleepScores.push(sleepScore);
+
+      const score = Math.round((stepsScore + caloriesScore + sleepScore + waterScore + hrScore) / 5);
+      dailyScores.push(score > 0 ? score : 50);
+    }
+
+    const avgStepsScore = stepsScores.reduce((a, b) => a + b, 0) / Math.max(1, stepsScores.length);
+    const avgCaloriesScore = caloriesScores.reduce((a, b) => a + b, 0) / Math.max(1, caloriesScores.length);
+    const avgSleepScore = sleepScores.reduce((a, b) => a + b, 0) / Math.max(1, sleepScores.length);
+
+    res.status(200).json({
+      dailyScores: dailyScores.length > 0 ? dailyScores : [75],
+      totalWater,
+      avgSleep: totalSleepMinutes / Math.max(1, daysCount),
+      avgHeartRate: hrCount > 0 ? Math.round(heartRateSum / hrCount) : 72,
+      totalSteps,
+      totalCalories,
+      radar: {
+        forca: Math.round(avgStepsScore) || 85,
+        agilidade: Math.round(avgCaloriesScore) || 80,
+        resistencia: Math.round(avgSleepScore) || 75
+      }
+    });
+  } catch (error) {
+    console.error("Erro em GET /api/health/stats:", error);
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
 
 // -------------------------------- WEAR OS DEVICES ---------------------------- //
 
@@ -7107,7 +7482,7 @@ app.get("/api/appointments", verifyToken, async (req, res) => {
     } else {
       // Agendamentos como cliente
       appointments = await sql`
-        SELECT 
+        SELECT DISTINCT ON (a.id_agendamento)
           a.id_agendamento, a.id_trainer, a.id_usuario, 
           a.data_agendamento, a.hora_inicio, a.hora_fim, 
           a.status, a.notas, a.created_at,
@@ -7117,7 +7492,7 @@ app.get("/api/appointments", verifyToken, async (req, res) => {
         JOIN usuarios u ON a.id_trainer = u.id_us
         LEFT JOIN avaliacoes_treinos r ON a.id_agendamento = r.id_agendamento
         WHERE a.id_usuario = ${userId}
-        ORDER BY a.data_agendamento DESC, a.hora_inicio DESC
+        ORDER BY a.id_agendamento, a.data_agendamento DESC, a.hora_inicio DESC
         LIMIT 50
       `;
     }
