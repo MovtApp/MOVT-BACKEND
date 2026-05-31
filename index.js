@@ -2435,8 +2435,13 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
     const userMapping = await getUserAuthId(user.id_us);
     const supabase_uid = userMapping ? userMapping.auth_user_id : null;
 
-    const isPremium = user.plan === 'premium' &&
+    // Plano REAL do banco (free | premium | familia). Se a assinatura paga
+    // expirou, rebaixa para 'free'. Antes colapsava tudo em premium/free e
+    // descartava 'familia', fazendo o app exibir o plano atual errado.
+    const isPaidActive =
+      (user.plan === 'premium' || user.plan === 'familia') &&
       (!user.plan_expires_at || new Date(user.plan_expires_at) > new Date());
+    const effectivePlan = isPaidActive ? user.plan : 'free';
 
     res.status(200).json({
       message: "Sessão ativa.",
@@ -2447,7 +2452,7 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         email: user.email,
         isVerified: user.email_verified,
         supabase_uid: supabase_uid,
-        plan: isPremium ? 'premium' : 'free',
+        plan: effectivePlan,
         plan_expires_at: user.plan_expires_at,
         role: user.role,
       },
