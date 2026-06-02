@@ -1,3 +1,5 @@
+// Sentry deve ser o primeiro require do app (antes de express e libs instrumentadas).
+const Sentry = require("./instrument");
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -1332,7 +1334,7 @@ app.post("/api/register", async (req, res) => {
     const formattedBirthDate = `${year}-${month}-${day} 00:00:00`;
 
     const [newUser] = await sql`
-      INSERT INTO usuarios (nome, username, email, senha, cpf, cnpj, data_nascimento, telefone, created_at, updated_at, session_id, verification_code, email_verified, verification_code_expires_at)
+      INSERT INTO usuarios (nome, username, email, senha, cpf, cnpj, data_nascimento, telefone, createdat, updated_at, session_id, verification_code, email_verified, verification_code_expires_at)
       VALUES (${nome}, ${email}, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
       RETURNING id_us, nome, username, email, cpf, cnpj, data_nascimento, telefone, session_id;
     `;
@@ -1355,6 +1357,10 @@ app.post("/api/register", async (req, res) => {
     });
   } catch (error) {
     console.error("Erro ao registrar usuário:", error);
+    Sentry.captureException(error, {
+      tags: { route: "POST /api/register", flow: "signup" },
+      extra: { pgCode: error.code, pgDetail: error.detail },
+    });
 
     // Verificar se é um erro de conexão com o banco de dados
     if (error.message && (error.message.includes('Tenant or user not found') || error.message.includes('FATAL'))) {
@@ -1427,8 +1433,8 @@ app.post("/api/auth/social-sync", async (req, res) => {
     
     const [newUser] = await sql`
       INSERT INTO usuarios (
-        nome, email, username, senha, supabase_uid, 
-        session_id, avatar_url, created_at, updated_at, 
+        nome, email, username, senha, supabase_uid,
+        session_id, avatar_url, createdat, updated_at,
         email_verified, plan, ativo
       ) VALUES (
         ${nome || email.split('@')[0]}, ${email}, ${email}, ${randomPassword}, ${supabase_uid},
@@ -1447,6 +1453,10 @@ app.post("/api/auth/social-sync", async (req, res) => {
 
   } catch (error) {
     console.error("[SocialSync] Erro crítico:", error);
+    Sentry.captureException(error, {
+      tags: { route: "POST /api/auth/social-sync", flow: "signup-social" },
+      extra: { pgCode: error.code, pgDetail: error.detail },
+    });
     res.status(500).json({ error: "Erro interno na sincronização social.", details: error.message });
   }
 });
@@ -8592,6 +8602,13 @@ app.post("/api/personal/appointments/:id/receipt", verifyToken, upload.single('r
     res.status(500).json({ error: "Erro ao processar comprovante." });
   }
 });
+
+// Handler de erro do Sentry — deve vir DEPOIS de todas as rotas/middlewares.
+// Captura automaticamente exceções não tratadas que cheguem ao Express.
+// No-op se o Sentry não estiver inicializado (sem SENTRY_DSN).
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
 
 // Iniciar o banco de dados e depois o servidor
 initDb().then(() => {
