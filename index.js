@@ -3540,6 +3540,100 @@ app.post("/api/user/mission", verifyToken, async (req, res) => {
   }
 });
 
+// ==================== ROTAS: Histórico de treinos (MOVT Performance) ==================== //
+
+// GET: lista os treinos do usuário logado (mais recentes primeiro)
+app.get("/api/user/workouts", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const workouts = await sql`
+      SELECT * FROM user_workouts WHERE id_us = ${userId} ORDER BY data DESC
+    `;
+    res.status(200).json({ workouts: workouts || [] });
+  } catch (error) {
+    console.error("Erro ao buscar treinos:", error.message);
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
+
+// POST: salva um treino. Idempotente por (id_us, client_id) para o sync nunca duplicar.
+app.post("/api/user/workouts", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const {
+    clientId,
+    tipo,
+    data,
+    duracaoSeg,
+    distanciaKm,
+    paceMedio,
+    velocidadeMediaKmh,
+    kcal,
+    rota,
+    splits,
+  } = req.body;
+
+  // Validação mínima
+  if (tipo !== "Corrida" && tipo !== "Ciclismo") {
+    return res.status(400).json({ error: "Tipo de treino inválido." });
+  }
+  if (typeof duracaoSeg !== "number" || typeof distanciaKm !== "number") {
+    return res.status(400).json({ error: "Dados de treino inválidos." });
+  }
+
+  try {
+    const [workout] = await sql`
+      INSERT INTO user_workouts
+        (id_us, client_id, tipo, data, duracao_seg, distancia_km, pace_medio, velocidade_media_kmh, kcal, rota, splits)
+      VALUES (
+        ${userId},
+        ${clientId || null},
+        ${tipo},
+        ${data ? new Date(data) : new Date()},
+        ${duracaoSeg},
+        ${distanciaKm},
+        ${paceMedio || null},
+        ${velocidadeMediaKmh ?? null},
+        ${kcal ?? null},
+        ${sql.json(Array.isArray(rota) ? rota : [])},
+        ${sql.json(Array.isArray(splits) ? splits : [])}
+      )
+      ON CONFLICT (id_us, client_id) DO NOTHING
+      RETURNING *;
+    `;
+
+    // Se houve conflito (já existia), busca o registro existente para devolver o id do servidor.
+    if (!workout && clientId) {
+      const [existing] = await sql`
+        SELECT * FROM user_workouts WHERE id_us = ${userId} AND client_id = ${clientId}
+      `;
+      return res.status(200).json({ message: "Treino já existente.", workout: existing || null });
+    }
+
+    res.status(201).json({ message: "Treino salvo com sucesso!", workout });
+  } catch (error) {
+    console.error("Erro ao salvar treino:", error.message);
+    res.status(500).json({ error: "Erro ao salvar o treino." });
+  }
+});
+
+// DELETE: remove um treino do usuário (por id do servidor)
+app.delete("/api/user/workouts/:id", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const workoutId = req.params.id;
+  try {
+    const deleted = await sql`
+      DELETE FROM user_workouts WHERE id = ${workoutId} AND id_us = ${userId} RETURNING id
+    `;
+    if (deleted.length === 0) {
+      return res.status(404).json({ error: "Treino não encontrado." });
+    }
+    res.status(200).json({ message: "Treino removido com sucesso." });
+  } catch (error) {
+    console.error("Erro ao remover treino:", error.message);
+    res.status(500).json({ error: "Erro ao remover o treino." });
+  }
+});
+
 app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
   const followedUserId = await resolveUserId(req.params.id);
   const followerUserId = req.userId;
