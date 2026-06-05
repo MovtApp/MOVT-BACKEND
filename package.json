@@ -26,6 +26,7 @@
     "multer": "^2.0.2",
     "nodemailer": "^7.0.6",
     "postgres": "^3.4.7",
+    "resend": "^6.12.4",
     "sharp": "^0.33.0",
     "stripe": "^20.2.0",
     "uuid": "^9.0.1"

@@ -6,7 +6,7 @@ const cors = require("cors");
 const postgres = require("postgres");
 const bcrypt = require("bcrypt");
 const { v4: uuidv4 } = require("uuid");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 const crypto = require("crypto");
 const multer = require("multer");
 const sharp = require("sharp");
@@ -80,6 +80,9 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS status_verificacao TEXT DEFAULT 'pendente'`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_url TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
+    // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code_expires_at TIMESTAMP DEFAULT NULL`;
 
     // Garantir tabela de posts
     await sql`CREATE TABLE IF NOT EXISTS posts (
@@ -440,18 +443,44 @@ async function analyzeReceiptDocument(fileBuffer, mimeType) {
 }
 
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  auth: {
-    user: emailUser,
-    pass: emailPass,
+// E-mail transacional via Resend (HTTPS) — confiável em serverless (Vercel), ao
+// contrário do SMTP do Gmail, que era bloqueado por IP de datacenter e fazia o
+// envio de código de verificação/reset falhar com 500.
+// Requer no ambiente: RESEND_API_KEY e EMAIL_FROM (remetente verificado no Resend,
+// ex.: "MOVT <nao-responda@seudominio.com>"). Sem domínio verificado, use o
+// remetente de teste do Resend ("onboarding@resend.dev") — entrega só para o
+// e-mail dono da conta Resend.
+const resend = new Resend(process.env.RESEND_API_KEY);
+const EMAIL_FROM = process.env.EMAIL_FROM || "MOVT <onboarding@resend.dev>";
+// O `from` é SEMPRE um remetente verificado (domínio próprio). Mas as respostas do
+// usuário devem cair na caixa do comercial — daí o reply-to apontar para o Gmail.
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "comercial.movtapp@gmail.com";
+
+// Mantém a mesma interface .sendMail() do nodemailer para não quebrar os callers
+// existentes (sendVerificationEmail e routes/family). O remetente é SEMPRE o
+// verificado no Resend (EMAIL_FROM); o `from` legado dos callers (uma conta
+// @gmail) é ignorado de propósito, pois o Resend só envia de remetentes próprios.
+const transporter = {
+  async sendMail({ to, subject, html, text }) {
+    if (!process.env.RESEND_API_KEY) {
+      throw new Error("RESEND_API_KEY não configurada no ambiente.");
+    }
+    const { data, error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: Array.isArray(to) ? to : [to],
+      ...(EMAIL_REPLY_TO ? { replyTo: EMAIL_REPLY_TO } : {}),
+      subject,
+      html,
+      ...(text ? { text } : {}),
+    });
+    if (error) {
+      // O SDK do Resend devolve { error } em vez de lançar; normaliza para throw
+      // para que os try/catch dos callers tratem como falha de envio.
+      throw new Error(`Resend: ${error.message || JSON.stringify(error)}`);
+    }
+    return data;
   },
-  tls: {
-    rejectUnauthorized: false,
-  },
-});
+};
 
 // Função auxiliar para resolver ID de usuário (pode ser INTEGER ou UUID)
 async function resolveUserId(id) {
@@ -645,14 +674,26 @@ async function sendVerificationEmail(toEmail, verificationCode) {
   const mailOptions = {
     from: emailUser,
     to: toEmail,
-    subject: "Verificação de E-mail para MOVT App",
+    subject: "Confirme seu e-mail — MOVT",
     html: `
-      <p>Olá,</p>
-      <p>Obrigado por se registrar no MOVT App!</p>
-      <p>Seu código de verificação é:</p>
-      <h3>${verificationCode}</h3>
-      <p>Este código expira em 15 minutos.</p>
-      <p>Se você não solicitou esta verificação, por favor, ignore este e-mail.</p>
+<div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+  <div style="text-align: center; padding: 20px 0;">
+    <img src="https://res.cloudinary.com/dgxavefbh/image/upload/v1778001003/Component_14_ukggby.png" alt="MOVT Logo" style="max-width: 150px; height: auto;">
+  </div>
+  <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+    <h2 style="color: #192126; text-align: center;">Confirme seu endereço de e-mail</h2>
+    <p style="text-align: center;">Olá!</p>
+    <p style="text-align: center;">Obrigado por se registrar no MOVT. Para ativar sua conta, use o código de verificação abaixo no aplicativo:</p>
+    <div style="text-align: center; margin: 30px 0;">
+      <span style="display: inline-block; background-color: #BBF246; color: #192126; padding: 14px 32px; border-radius: 5px; font-size: 30px; font-weight: bold; letter-spacing: 8px;">${verificationCode}</span>
+    </div>
+    <p style="text-align: center;">Este código expira em 15 minutos.</p>
+    <p style="text-align: center;">Se você não solicitou esta confirmação, por favor, ignore este e-mail.</p>
+    <p style="text-align: center; font-size: 0.9em; color: #666;">Atenciosamente,<br>A equipe MOVT</p>
+    <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+    <p style="text-align: center; font-size: 0.8em; color: #999;">Este é um e-mail automático, por favor, não responda.</p>
+  </div>
+</div>
     `,
   };
 
@@ -665,6 +706,51 @@ async function sendVerificationEmail(toEmail, verificationCode) {
       `Erro ao enviar e-mail de verificação para ${toEmail}:`,
       error,
     );
+    // Antes esse erro era engolido (só console) e o /send-verification devolvia um
+    // 500 genérico sem rastro no Sentry. Agora capturamos para o erro real do
+    // provedor (Resend) ficar visível no painel.
+    Sentry.captureException(error, { extra: { toEmail, scope: "sendVerificationEmail" } });
+    return false;
+  }
+}
+
+// E-mail de redefinição de senha ("Esqueci a senha"). Mesmo provedor (Resend) e
+// mesmo padrão de código de 6 dígitos do fluxo de verificação — o usuário digita
+// o código na RecoveryScreen (passo 2), então o e-mail mostra o CÓDIGO, não um link.
+async function sendPasswordResetEmail(toEmail, resetCode) {
+  const mailOptions = {
+    from: emailUser,
+    to: toEmail,
+    subject: "Redefinição de senha — MOVT",
+    html: `
+<div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+  <div style="text-align: center; padding: 20px 0;">
+    <img src="https://res.cloudinary.com/dgxavefbh/image/upload/v1778001003/Component_14_ukggby.png" alt="MOVT Logo" style="max-width: 150px; height: auto;">
+  </div>
+  <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+    <h2 style="color: #192126; text-align: center;">Redefinição de senha</h2>
+    <p style="text-align: center;">Olá!</p>
+    <p style="text-align: center;">Recebemos uma solicitação para redefinir a senha da sua conta MOVT. Use o código abaixo no aplicativo para criar uma nova senha:</p>
+    <div style="text-align: center; margin: 30px 0;">
+      <span style="display: inline-block; background-color: #BBF246; color: #192126; padding: 14px 32px; border-radius: 5px; font-size: 30px; font-weight: bold; letter-spacing: 8px;">${resetCode}</span>
+    </div>
+    <p style="text-align: center;">Este código expira em 15 minutos.</p>
+    <p style="text-align: center;">Se você não solicitou esta alteração, pode ignorar este e-mail com segurança. Sua senha atual permanecerá inalterada.</p>
+    <p style="text-align: center; font-size: 0.9em; color: #666;">Atenciosamente,<br>A equipe MOVT</p>
+    <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+    <p style="text-align: center; font-size: 0.8em; color: #999;">Este é um e-mail automático, por favor, não responda.</p>
+  </div>
+</div>
+    `,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`E-mail de redefinição de senha enviado para ${toEmail}`);
+    return true;
+  } catch (error) {
+    console.error(`Erro ao enviar e-mail de redefinição para ${toEmail}:`, error);
+    Sentry.captureException(error, { extra: { toEmail, scope: "sendPasswordResetEmail" } });
     return false;
   }
 }
@@ -880,7 +966,7 @@ const storage = multer.memoryStorage();
 // Middleware para upload de imagens de perfil
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
     const validTypes = ["image/jpeg", "image/png", "image/webp"];
     if (!validTypes.includes(file.mimetype)) {
@@ -1767,6 +1853,141 @@ app.post("/api/user/verify", verifyToken, async (req, res) => {
       error: "Erro interno do servidor ao verificar e-mail.",
       details: error.message,
     });
+  }
+});
+
+// ============================================================================
+// Recuperação de senha ("Esqueci a senha") — fluxo de 3 passos por código.
+// Endpoints públicos (usuário está deslogado). A RecoveryScreen chama, nesta
+// ordem: /request (envia código) -> /verify (confere código) -> /reset (troca a
+// senha). O reset revalida o código por segurança (não confia só no /verify).
+// ============================================================================
+
+// Passo 1: solicitar código de recuperação.
+app.post("/api/auth/recovery/request", async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "E-mail é obrigatório." });
+  }
+
+  try {
+    const [user] = await sql`
+      SELECT id_us, email FROM usuarios WHERE email = ${email} LIMIT 1;
+    `;
+
+    // Resposta genérica mesmo se o e-mail não existir: evita enumeração de contas
+    // (não revela quais e-mails estão cadastrados). Só envia o e-mail se houver user.
+    if (user) {
+      const resetCode = generateVerificationCode();
+      const resetCodeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+      await sql`
+        UPDATE usuarios
+        SET reset_code = ${resetCode},
+            reset_code_expires_at = ${resetCodeExpiresAt},
+            updated_at = NOW()
+        WHERE id_us = ${user.id_us};
+      `;
+
+      const emailSent = await sendPasswordResetEmail(user.email, resetCode);
+      if (!emailSent) {
+        return res
+          .status(500)
+          .json({ error: "Falha ao enviar o e-mail de recuperação." });
+      }
+      console.log(`✅ Código de recuperação enviado: ${user.email}`);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Se este e-mail estiver cadastrado, enviaremos um código.",
+    });
+  } catch (error) {
+    console.error("Erro ao solicitar recuperação de senha:", error);
+    Sentry.captureException(error, { extra: { scope: "recovery/request" } });
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
+
+// Passo 2: verificar o código (sem trocar a senha ainda).
+app.post("/api/auth/recovery/verify", async (req, res) => {
+  const { email, code } = req.body;
+
+  if (!email || !code) {
+    return res.status(400).json({ error: "E-mail e código são obrigatórios." });
+  }
+
+  try {
+    const [user] = await sql`
+      SELECT reset_code, reset_code_expires_at
+      FROM usuarios WHERE email = ${email} LIMIT 1;
+    `;
+
+    if (!user || !user.reset_code || user.reset_code !== code) {
+      return res.status(400).json({ error: "Código inválido." });
+    }
+    if (user.reset_code_expires_at && new Date() > user.reset_code_expires_at) {
+      return res
+        .status(400)
+        .json({ error: "Código expirado. Solicite um novo." });
+    }
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("Erro ao verificar código de recuperação:", error);
+    Sentry.captureException(error, { extra: { scope: "recovery/verify" } });
+    res.status(500).json({ error: "Erro interno do servidor." });
+  }
+});
+
+// Passo 3: redefinir a senha (revalida o código e grava o novo hash).
+app.post("/api/auth/recovery/reset", async (req, res) => {
+  const { email, code, newPassword } = req.body;
+
+  if (!email || !code || !newPassword) {
+    return res
+      .status(400)
+      .json({ error: "E-mail, código e nova senha são obrigatórios." });
+  }
+  if (newPassword.length < 6) {
+    return res
+      .status(400)
+      .json({ error: "A senha deve ter pelo menos 6 caracteres." });
+  }
+
+  try {
+    const [user] = await sql`
+      SELECT id_us, reset_code, reset_code_expires_at
+      FROM usuarios WHERE email = ${email} LIMIT 1;
+    `;
+
+    if (!user || !user.reset_code || user.reset_code !== code) {
+      return res.status(400).json({ error: "Código inválido." });
+    }
+    if (user.reset_code_expires_at && new Date() > user.reset_code_expires_at) {
+      return res
+        .status(400)
+        .json({ error: "Código expirado. Solicite um novo." });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Zera o código após o uso para impedir reaproveitamento do mesmo link/código.
+    await sql`
+      UPDATE usuarios
+      SET senha = ${hashedPassword},
+          reset_code = NULL,
+          reset_code_expires_at = NULL,
+          updated_at = NOW()
+      WHERE id_us = ${user.id_us};
+    `;
+
+    res.status(200).json({ success: true, message: "Senha redefinida com sucesso." });
+  } catch (error) {
+    console.error("Erro ao redefinir senha:", error);
+    Sentry.captureException(error, { extra: { scope: "recovery/reset" } });
+    res.status(500).json({ error: "Erro interno do servidor." });
   }
 });
 
@@ -8480,6 +8701,10 @@ app.use('/api/admin/gyms', adminGymRoutes);
 // Rotas Administrativas de Treinos
 const adminWorkoutRoutes = require('./routes/adminWorkouts')(sql, verifyToken, upload, supabase, AVATAR_BUCKET);
 app.use('/api/admin/workouts', adminWorkoutRoutes);
+
+// Rotas Administrativas do Catálogo Global de Exercícios
+const adminExerciseRoutes = require('./routes/adminExercises')(sql, verifyToken, upload, supabase, AVATAR_BUCKET);
+app.use('/api/admin/exercicios', adminExerciseRoutes);
 
 // ==================== ROTA DE RANKING (LEADERBOARD) ==================== //
 
