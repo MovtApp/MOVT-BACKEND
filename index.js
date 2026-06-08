@@ -6736,21 +6736,21 @@ app.get("/api/treinos", verifyToken, async (req, res) => {
 
     if (specialty) {
       treinos = await sql`
-        SELECT 
-          id as id_treino, title as nome, calories as calorias, minutes as duracao, 
-          image_url as imageurl, specialty as categoria, level as nivel, 
-          description as descricao, description, exercicios, created_at 
-        FROM conteudo_treinos 
+        SELECT
+          id as id_treino, title as nome, calories as calorias, minutes as duracao,
+          image_url as imageurl, specialty as categoria, level as nivel,
+          description as descricao, description, exercicios, secao_home, created_at
+        FROM conteudo_treinos
         WHERE specialty = ${specialty} AND (ativo = TRUE OR ativo IS NULL) ${filterDaily}
         ORDER BY created_at DESC
       `;
     } else {
       treinos = await sql`
-        SELECT 
-          id as id_treino, title as nome, calories as calorias, minutes as duracao, 
-          image_url as imageurl, specialty as categoria, level as nivel, 
-          description as descricao, description, exercicios, created_at 
-        FROM conteudo_treinos 
+        SELECT
+          id as id_treino, title as nome, calories as calorias, minutes as duracao,
+          image_url as imageurl, specialty as categoria, level as nivel,
+          description as descricao, description, exercicios, secao_home, created_at
+        FROM conteudo_treinos
         WHERE (ativo = TRUE OR ativo IS NULL) ${filterDaily}
         ORDER BY created_at DESC
       `;
