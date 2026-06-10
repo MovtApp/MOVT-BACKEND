@@ -1265,7 +1265,8 @@ app.post("/api/login", async (req, res) => {
     }
 
     const [user] = await sql`
-      SELECT id_us, email, senha, username, nome, session_id, email_verified, role, ativo
+      SELECT id_us, email, senha, username, nome, session_id, email_verified, role, ativo,
+             cnpj, cref_verified, cnpj_verified, status_verificacao
       FROM usuarios
       WHERE email = ${email};
     `;
@@ -1313,6 +1314,10 @@ app.post("/api/login", async (req, res) => {
         isVerified: user.email_verified,
         supabase_uid: supabase_uid,
         role: user.role,
+        documentType: user.cnpj ? "CNPJ" : "CPF",
+        cref_verified: user.cref_verified,
+        cnpj_verified: user.cnpj_verified,
+        status_verificacao: user.status_verificacao,
       },
       sessionId: user.session_id,
     });
@@ -1424,6 +1429,16 @@ app.post("/api/register", async (req, res) => {
       VALUES (${nome}, ${email}, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
       RETURNING id_us, nome, username, email, cpf, cnpj, data_nascimento, telefone, session_id;
     `;
+
+    // Conta com CNPJ é um personal trainer: marca o papel e inicia a verificação
+    // profissional pendente (CREF/CNPJ ainda não validados). Contas CPF não são tocadas.
+    if (userCnpj !== null) {
+      await sql`
+        UPDATE usuarios
+        SET role = 'trainer', status_verificacao = 'pendente'
+        WHERE id_us = ${newUser.id_us}
+      `;
+    }
 
     const emailSent = await sendVerificationEmail(
       newUser.email,
@@ -2651,7 +2666,8 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
     }
 
     const [user] = await sql`
-      SELECT id_us, email, username, nome, email_verified, plan, plan_expires_at, role
+      SELECT id_us, email, username, nome, email_verified, plan, plan_expires_at, role,
+             cnpj, cref_verified, cnpj_verified, status_verificacao
       FROM usuarios
       WHERE id_us = ${userId};
     `;
@@ -2686,6 +2702,10 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         plan: effectivePlan,
         plan_expires_at: user.plan_expires_at,
         role: user.role,
+        documentType: user.cnpj ? "CNPJ" : "CPF",
+        cref_verified: user.cref_verified,
+        cnpj_verified: user.cnpj_verified,
+        status_verificacao: user.status_verificacao,
       },
     });
   } catch (error) {
