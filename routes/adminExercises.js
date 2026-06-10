@@ -12,7 +12,7 @@ module.exports = (sql, verifyToken, upload, supabase, bucketName) => {
           return res.status(413).json({ error: 'Imagem muito grande. Tamanho máximo: 10MB.' });
         }
         if (err.code === 'LIMIT_UNEXPECTED_FILE') {
-          return res.status(400).json({ error: 'Formato de imagem inválido. Use JPG, PNG ou WEBP.' });
+          return res.status(400).json({ error: 'Formato de imagem inválido. Use JPG, PNG, GIF ou WEBP.' });
         }
         return res.status(400).json({ error: 'Erro ao processar a imagem.', details: err.message });
       }

@@ -968,7 +968,7 @@ const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
-    const validTypes = ["image/jpeg", "image/png", "image/webp"];
+    const validTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
     if (!validTypes.includes(file.mimetype)) {
       return cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "avatar"));
     }
@@ -2863,7 +2863,7 @@ app.put("/api/user/avatar", verifyToken, upload.single("avatar"), async (req, re
     if (err instanceof multer.MulterError) {
       // Limite de tamanho ou tipo inválido
       if (err.code === "LIMIT_FILE_SIZE")
-        return res.status(413).json({ error: "Arquivo excede 5MB." });
+        return res.status(413).json({ error: "Arquivo excede 10MB." });
       if (err.code === "LIMIT_UNEXPECTED_FILE")
         return res
           .status(422)
@@ -8920,6 +8920,21 @@ app.post("/api/personal/appointments/:id/receipt", verifyToken, upload.single('r
     console.error("[POST Receipt Upload]", err);
     res.status(500).json({ error: "Erro ao processar comprovante." });
   }
+});
+
+// Normaliza erros de upload (multer) em respostas JSON limpas.
+// Deve vir ANTES do handler do Sentry: ao responder aqui (sem chamar next(err)),
+// evitamos que "arquivo grande / formato inválido" — erros esperados do cliente —
+// poluam o Sentry e cheguem ao cliente como 500.
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE")
+      return res.status(413).json({ error: "Imagem muito grande. Tamanho máximo: 10MB." });
+    if (err.code === "LIMIT_UNEXPECTED_FILE")
+      return res.status(400).json({ error: "Formato de imagem inválido. Use JPG, PNG, GIF ou WEBP." });
+    return res.status(400).json({ error: "Erro ao processar o upload.", details: err.message });
+  }
+  next(err);
 });
 
 // Handler de erro do Sentry — deve vir DEPOIS de todas as rotas/middlewares.
