@@ -95,6 +95,12 @@ async function initDb() {
     await sql`UPDATE usuarios SET cnpj = regexp_replace(cnpj, '[^0-9]', '', 'g') WHERE cnpj ~ '[^0-9]'`;
     await sql`UPDATE usuarios SET cpf = regexp_replace(cpf, '[^0-9]', '', 'g') WHERE cpf ~ '[^0-9]'`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_url TEXT DEFAULT NULL`;
+    // Verificação CREF frente+verso: a frente fica em document_url (compat), o
+    // verso na nova coluna. CPF e validade são extraídos do verso pela IA — CPF é
+    // só registro (conta é CNPJ, sem CPF p/ cruzar); validade vira gate de aprovação.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_back_url TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_cpf TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_validade DATE DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
     // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code TEXT DEFAULT NULL`;
@@ -390,11 +396,28 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
 // substituto estável com suporte a visão (usado p/ ler documento CREF e comprovantes).
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-async function analyzeCrefDocument(fileBuffer, mimeType) {
+// Analisa um lado da carteira do CREF via Gemini.
+//  - side="front": extrai número do CREF, nome e UF (impresso na frente).
+//  - side="back":  extrai CPF e data de validade do registro (impresso no verso).
+// A validade vem normalizada em ISO (YYYY-MM-DD) para virar gate de aprovação.
+async function analyzeCrefDocument(fileBuffer, mimeType, side = "front") {
   try {
     const base64Image = fileBuffer.toString("base64");
-    
-    const prompt = `Analise este documento de identidade profissional (CREF). 
+
+    const prompt =
+      side === "back"
+        ? `Analise o VERSO de uma carteira de identidade profissional do CONFEF/CREF.
+    Procure pela DATA DE VALIDADE do registro e pelo CPF do titular.
+    Retorne APENAS um JSON válido no seguinte formato:
+    {
+      "is_valid_document": boolean,
+      "cpf": "string apenas dígitos ou null",
+      "data_validade": "data no formato YYYY-MM-DD ou null",
+      "confidence_score": number (0 a 100)
+    }
+    Considere 'is_valid_document' verdadeiro se for o verso de uma carteira do CONFEF/CREF legível.
+    Converta qualquer formato de data (ex: 31/12/2027) para YYYY-MM-DD.`
+        : `Analise a FRENTE de uma carteira de identidade profissional (CREF).
     Retorne APENAS um JSON válido no seguinte formato:
     {
       "is_valid_document": boolean,
@@ -1212,81 +1235,113 @@ app.get("/api/cnae/search", verifyToken, async (req, res) => {
   }
 });
 
-app.put("/api/user/document", verifyToken, documentUpload.single("document"), async (req, res) => {
-  const userId = req.userId;
-  const file = req.file;
+const crefDocumentUpload = documentUpload.fields([
+  { name: "document_front", maxCount: 1 },
+  { name: "document_back", maxCount: 1 },
+]);
 
-  if (!file) {
-    return res.status(400).json({ error: "Nenhum arquivo enviado." });
+app.put("/api/user/document", verifyToken, crefDocumentUpload, async (req, res) => {
+  const userId = req.userId;
+  const frontFile = req.files?.document_front?.[0];
+  const backFile = req.files?.document_back?.[0];
+
+  // Verso obrigatório: sem os dois lados não há como checar a validade do registro.
+  if (!frontFile || !backFile) {
+    return res.status(400).json({
+      error: "Envie os dois lados da carteira do CREF (frente e verso).",
+    });
   }
 
+  // Faz upload de um arquivo de documento para o Supabase e devolve a URL pública.
+  const uploadDoc = async (file, suffix) => {
+    const uuid = uuidv4();
+    const ext = file.mimetype.split("/")[1];
+    const path = `documents/${userId}/${uuid}_${suffix}.${ext}`;
+    const { error: uploadError } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(path, file.buffer, { contentType: file.mimetype, upsert: true });
+    if (uploadError) throw uploadError;
+    return supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path).data.publicUrl;
+  };
+
   try {
-    // 1. Validar com IA antes de fazer o upload
-    console.log(`[KYC] Iniciando análise de IA para usuário ${userId}...`);
-    const aiAnalysis = await analyzeCrefDocument(file.buffer, file.mimetype);
-    
+    // 1. Analisar os dois lados com IA antes de qualquer upload.
+    console.log(`[KYC] Iniciando análise de IA (frente+verso) para usuário ${userId}...`);
+    const [frontAI, backAI] = await Promise.all([
+      analyzeCrefDocument(frontFile.buffer, frontFile.mimetype, "front"),
+      analyzeCrefDocument(backFile.buffer, backFile.mimetype, "back"),
+    ]);
+
     // Buscar dados atuais do usuário para cruzar
     const [user] = await sql`SELECT nome, cref FROM usuarios WHERE id_us = ${userId}`;
-    
-    let aiStatus = 'pendente';
+
+    let aiStatus = "pendente";
     let aiVerified = false;
     let observation = "";
 
-    if (aiAnalysis && aiAnalysis.is_valid_document) {
-      // Cruzamento de dados: Verificar se o número do CREF na foto bate com o do banco
+    // Validade extraída do verso (YYYY-MM-DD) — vira gate e também é persistida.
+    const validadeRaw = backAI?.data_validade || null;
+    const validade = /^\d{4}-\d{2}-\d{2}$/.test(validadeRaw || "") ? validadeRaw : null;
+    const cpfExtraido = (backAI?.cpf || "").replace(/[^0-9]/g, "") || null;
+    const hoje = new Date().toISOString().slice(0, 10);
+    const vencido = validade !== null && validade < hoje;
+
+    if (!frontAI?.is_valid_document) {
+      observation = "IA não reconheceu a FRENTE como uma carteira do CREF válida.";
+    } else if (!backAI?.is_valid_document) {
+      observation = "IA não reconheceu o VERSO como uma carteira do CREF válida.";
+    } else {
+      // Cruzamento: o número do CREF da frente bate com o do banco?
       const dbCrefClean = (user.cref || "").replace(/[^0-9]/g, "");
-      const aiCrefClean = (aiAnalysis.cref_number || "").replace(/[^0-9]/g, "");
-      
-      const crefMatch = aiCrefClean.includes(dbCrefClean) || dbCrefClean.includes(aiCrefClean);
-      
-      if (crefMatch && aiAnalysis.confidence_score > 80) {
-        aiStatus = 'aprovado';
+      const aiCrefClean = (frontAI.cref_number || "").replace(/[^0-9]/g, "");
+      const crefMatch =
+        dbCrefClean.length > 0 &&
+        (aiCrefClean.includes(dbCrefClean) || dbCrefClean.includes(aiCrefClean));
+
+      if (vencido) {
+        observation = `Carteira do CREF vencida (validade ${validade}). Renove o registro no CREF.`;
+        console.log(`[KYC] ⛔ CREF vencido para usuário ${userId}`);
+      } else if (crefMatch && frontAI.confidence_score > 80) {
+        aiStatus = "aprovado";
         aiVerified = true;
         console.log(`[KYC] ✅ Auto-aprovação via IA para usuário ${userId}`);
       } else {
-        observation = `IA detectou divergência: CREF na foto (${aiAnalysis.cref_number}) vs Digitado (${user.cref})`;
+        observation = `IA detectou divergência: CREF na foto (${frontAI.cref_number}) vs Digitado (${user.cref})`;
         console.log(`[KYC] ⚠️ Divergência detectada para usuário ${userId}`);
       }
-    } else {
-      observation = "IA não conseguiu validar a autenticidade do documento.";
     }
 
-    // 2. Prosseguir com Upload para o Supabase
-    const uuid = uuidv4();
-    const ext = file.mimetype.split("/")[1];
-    const path = `documents/${userId}/${uuid}.${ext}`;
-
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from(AVATAR_BUCKET)
-      .upload(path, file.buffer, {
-        contentType: file.mimetype,
-        upsert: true,
-      });
-
-    if (uploadError) throw uploadError;
-
-    const { data: publicUrlData } = supabase.storage
-      .from(AVATAR_BUCKET)
-      .getPublicUrl(path);
+    // 2. Upload das duas imagens para o Supabase.
+    const [frontUrl, backUrl] = await Promise.all([
+      uploadDoc(frontFile, "front"),
+      uploadDoc(backFile, "back"),
+    ]);
 
     await sql`
-      UPDATE usuarios 
-      SET 
-        document_url = ${publicUrlData.publicUrl},
+      UPDATE usuarios
+      SET
+        document_url = ${frontUrl},
+        document_back_url = ${backUrl},
+        document_cpf = ${cpfExtraido},
+        cref_validade = ${validade},
         status_verificacao = ${aiStatus},
         cref_verified = ${aiVerified},
         updated_at = CURRENT_TIMESTAMP
       WHERE id_us = ${userId}
     `;
 
-    res.json({ 
-      success: true, 
-      message: aiVerified ? "Documento validado e aprovado instantaneamente!" : "Documento enviado para análise manual.",
-      url: publicUrlData.publicUrl,
+    res.json({
+      success: true,
+      message: aiVerified
+        ? "Documento validado e aprovado instantaneamente!"
+        : "Documento enviado para análise manual.",
+      url: frontUrl,
+      back_url: backUrl,
       ai_analysis: {
         status: aiStatus,
-        observation: observation
-      }
+        observation: observation,
+        validade: validade,
+      },
     });
   } catch (error) {
     console.error("Erro no upload de documento:", error);
