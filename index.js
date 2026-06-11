@@ -1,4 +1,4 @@
-// Sentry deve ser o primeiro require do app (antes de express e libs instrumentadas).
+﻿// Sentry deve ser o primeiro require do app (antes de express e libs instrumentadas).
 const Sentry = require("./instrument");
 require("dotenv").config();
 const express = require("express");
@@ -13,6 +13,12 @@ const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const Stripe = require('stripe');
+const {
+  isValidCNPJ,
+  cnaePermitido,
+  cnaePertenceAoCnpj,
+  lookupCNPJ,
+} = require("./cnpj");
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
 
@@ -78,6 +84,16 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_verified BOOLEAN DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_verified BOOLEAN DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS status_verificacao TEXT DEFAULT 'pendente'`;
+    // Snapshot auditável + cache da consulta de CNPJ na Receita.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_razao_social TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_situacao TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_cnae TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_data JSONB DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_verified_at TIMESTAMP DEFAULT NULL`;
+    // Normaliza CNPJs legados salvos com máscara ("00.000.000/0000-00") → só dígitos.
+    // Idempotente: só toca linhas que ainda têm caractere não-numérico.
+    await sql`UPDATE usuarios SET cnpj = regexp_replace(cnpj, '[^0-9]', '', 'g') WHERE cnpj ~ '[^0-9]'`;
+    await sql`UPDATE usuarios SET cpf = regexp_replace(cpf, '[^0-9]', '', 'g') WHERE cpf ~ '[^0-9]'`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_url TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
     // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
@@ -991,62 +1007,206 @@ const documentUpload = multer({
 
 // ==================== ROTAS DE VALIDAÇÃO PROFISSIONAL ==================== //
 
-// Rota para validar CNPJ via BrasilAPI
-app.get("/api/verify/cnpj/:cnpj", async (req, res) => {
-  const cnpj = req.params.cnpj.replace(/[^0-9]/g, "");
+// Consulta cadastral do CNPJ (Receita, via cadeia de provedores com fallback).
+// Bloqueia DV inválido e empresa não-ATIVA. Guarda o snapshot no usuário para
+// servir de cache e permitir o cross-check do CNAE no save (sem rebater a rede).
+app.get("/api/verify/cnpj/:cnpj", verifyToken, async (req, res) => {
+  const cnpj = req.params.cnpj.replace(/\D/g, "");
 
-  if (cnpj.length !== 14) {
-    return res.status(400).json({ error: "CNPJ inválido. Deve conter 14 dígitos." });
+  if (!isValidCNPJ(cnpj)) {
+    return res.status(400).json({ error: "CNPJ inválido (dígitos verificadores)." });
   }
 
   try {
-    const axios = require('axios');
-    const response = await axios.get(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`);
-    
-    const data = response.data;
-    
-    // Verifica se a empresa está ativa e se o CNAE é compatível (exemplo simples)
-    const isActive = data.descricao_situacao_cadastral === "ATIVA";
-    
+    const empresa = await lookupCNPJ(cnpj);
+
+    if (!empresa.ativa) {
+      return res.status(422).json({
+        error: `A empresa está com situação cadastral "${empresa.situacao}". É necessário um CNPJ ativo na Receita Federal.`,
+      });
+    }
+
+    // Snapshot/cache (ainda NÃO marca cnpj_verified — só a confirmação do CNAE faz isso).
+    await sql`
+      UPDATE usuarios
+      SET cnpj_razao_social = ${empresa.razaoSocial},
+          cnpj_situacao = ${empresa.situacao},
+          cnpj_data = ${sql.json(empresa)},
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id_us = ${req.userId}
+    `;
+
     res.json({
       success: true,
       data: {
-        razao_social: data.razao_social,
-        nome_fantasia: data.nome_fantasia,
-        situacao: data.descricao_situacao_cadastral,
-        cnae: data.cnae_fiscal,
-        cnae_descricao: data.cnae_fiscal_descricao,
-        isActive
-      }
+        razaoSocial: empresa.razaoSocial,
+        nomeFantasia: empresa.nomeFantasia,
+        situacao: empresa.situacao,
+        ativa: empresa.ativa,
+        cnaePrincipal: empresa.cnaePrincipal,
+        cnaesSecundarios: empresa.cnaesSecundarios,
+      },
     });
   } catch (error) {
-    console.error("Erro ao validar CNPJ:", error.response?.data || error.message);
-    const status = error.response?.status || 500;
-    const msg = error.response?.data?.message || "Erro ao consultar CNPJ na base da Receita Federal.";
-    res.status(status).json({ error: msg });
+    if (error.code === "NOT_FOUND") {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error.code === "UNAVAILABLE") {
+      return res.status(503).json({ error: error.message });
+    }
+    console.error("Erro ao validar CNPJ:", error.message);
+    Sentry.captureException(error, { tags: { route: "GET /api/verify/cnpj" } });
+    res.status(500).json({ error: "Erro ao consultar CNPJ na base da Receita Federal." });
   }
 });
 
-// Rota para salvar dados profissionais (CNPJ e CREF)
+// Salva os dados profissionais e CONFIRMA a verificação do CNPJ: exige DV válido,
+// empresa ativa e que o CNAE escolhido (a) seja de educação física e (b) conste
+// no próprio CNPJ. Se todos os provedores estiverem fora do ar, grava o que o
+// usuário declarou e marca 'pendente_revisao' para revisão manual no admin.
 app.put("/api/user/professional-data", verifyToken, async (req, res) => {
-  const { cnpj, cref, formacao } = req.body;
+  const { cnpj, cnae, cref, formacao } = req.body;
   const userId = req.userId;
 
+  const cnpjDigits = (cnpj || "").replace(/\D/g, "");
+  if (cnpj && !isValidCNPJ(cnpjDigits)) {
+    return res.status(400).json({ error: "CNPJ inválido (dígitos verificadores)." });
+  }
+
   try {
+    // Reaproveita o snapshot do GET /verify; se não houver, consulta de novo.
+    const [row] = await sql`SELECT cnpj_data FROM usuarios WHERE id_us = ${userId}`;
+    let empresa = row?.cnpj_data || null;
+
+    if (cnpj && (!empresa || empresa.cnaePrincipal == null)) {
+      try {
+        empresa = await lookupCNPJ(cnpjDigits);
+      } catch (err) {
+        if (err.code === "NOT_FOUND") {
+          return res.status(404).json({ error: err.message });
+        }
+        // UNAVAILABLE → degradação graciosa: grava declarado + pendente_revisao.
+        await sql`
+          UPDATE usuarios
+          SET cnpj = ${cnpjDigits || null},
+              cnpj_cnae = ${cnae ? String(cnae).replace(/\D/g, "").slice(0, 7) : null},
+              cref = ${cref || null},
+              formacao = ${formacao || null},
+              cnpj_verified = FALSE,
+              status_verificacao = 'pendente_revisao',
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id_us = ${userId}
+        `;
+        return res.json({
+          success: true,
+          pending: true,
+          message:
+            "Não conseguimos validar o CNPJ na Receita agora. Seus dados foram salvos e passarão por revisão manual.",
+        });
+      }
+    }
+
+    // Quando há CNPJ, impõe as regras de negócio.
+    if (cnpj) {
+      if (!empresa.ativa) {
+        return res.status(422).json({
+          error: `A empresa está com situação "${empresa.situacao}". É necessário um CNPJ ativo.`,
+        });
+      }
+      if (!cnae) {
+        return res.status(400).json({ error: "Selecione o CNAE da sua atividade." });
+      }
+      if (!cnaePermitido(cnae)) {
+        return res.status(422).json({
+          error: "O CNAE selecionado não corresponde a uma atividade de educação física / treinamento.",
+        });
+      }
+      if (!cnaePertenceAoCnpj(cnae, empresa)) {
+        return res.status(422).json({
+          error: "O CNAE selecionado não consta no CNPJ informado. Escolha um CNAE registrado na sua empresa.",
+        });
+      }
+    }
+
+    const cnaeNorm = cnae ? String(cnae).replace(/\D/g, "").slice(0, 7) : null;
     await sql`
-      UPDATE usuarios 
-      SET 
-        cnpj = ${cnpj || null},
-        cref = ${cref || null},
-        formacao = ${formacao || null},
-        updated_at = CURRENT_TIMESTAMP
+      UPDATE usuarios
+      SET cnpj = ${cnpjDigits || null},
+          cnpj_cnae = ${cnaeNorm},
+          cref = ${cref || null},
+          formacao = ${formacao || null},
+          cnpj_verified = ${cnpj ? true : sql`cnpj_verified`},
+          cnpj_verified_at = ${cnpj ? sql`NOW()` : sql`cnpj_verified_at`},
+          cnpj_razao_social = ${cnpj ? empresa.razaoSocial : sql`cnpj_razao_social`},
+          cnpj_situacao = ${cnpj ? empresa.situacao : sql`cnpj_situacao`},
+          updated_at = CURRENT_TIMESTAMP
       WHERE id_us = ${userId}
     `;
 
     res.json({ success: true, message: "Dados profissionais atualizados com sucesso." });
   } catch (error) {
     console.error("Erro ao atualizar dados profissionais:", error);
+    Sentry.captureException(error, { tags: { route: "PUT /api/user/professional-data" } });
     res.status(500).json({ error: "Erro ao salvar dados profissionais." });
+  }
+});
+
+// Busca de CNAE por número ou nome. Proxy da base oficial do IBGE (subclasses),
+// cacheada em memória por deploy (a lista é estável). Cada resultado vem com a
+// flag `permitido` (se está na allowlist de educação física aceita na validação).
+let _cnaeCache = null;
+let _cnaeCacheTs = 0;
+const CNAE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function getCnaeCatalogo() {
+  const now = Date.now();
+  if (_cnaeCache && now - _cnaeCacheTs < CNAE_CACHE_TTL_MS) return _cnaeCache;
+  const axios = require("axios");
+  const { data } = await axios.get(
+    "https://servicodados.ibge.gov.br/api/v2/cnae/subclasses",
+    { timeout: 8000 }
+  );
+  _cnaeCache = (data || []).map((s) => ({
+    codigo: String(s.id || "").replace(/\D/g, ""),
+    descricao: s.descricao || "",
+  }));
+  _cnaeCacheTs = now;
+  return _cnaeCache;
+}
+
+app.get("/api/cnae/search", verifyToken, async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (q.length < 2) {
+    return res.status(400).json({ error: "Digite ao menos 2 caracteres para buscar." });
+  }
+
+  try {
+    const catalogo = await getCnaeCatalogo();
+    const digits = q.replace(/\D/g, "");
+    const termo = q
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+    const matches = catalogo
+      .filter((c) => {
+        const porNumero = digits.length >= 2 && c.codigo.startsWith(digits);
+        const descNorm = c.descricao
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "");
+        const porNome = termo.length >= 2 && descNorm.includes(termo);
+        return porNumero || porNome;
+      })
+      .slice(0, 30)
+      .map((c) => ({ ...c, permitido: cnaePermitido(c.codigo) }));
+
+    // Lista os permitidos primeiro para guiar a escolha do usuário.
+    matches.sort((a, b) => Number(b.permitido) - Number(a.permitido));
+    res.json({ success: true, results: matches });
+  } catch (error) {
+    console.error("Erro ao buscar CNAE:", error.message);
+    res.status(503).json({ error: "Não foi possível buscar CNAEs no momento. Tente novamente." });
   }
 });
 
@@ -1373,7 +1533,12 @@ app.post("/api/register", async (req, res) => {
     if (tipo_documento === "CPF") {
       userCpf = cpf_cnpj;
     } else if (tipo_documento === "CNPJ") {
-      userCnpj = cpf_cnpj;
+      // Defense-in-depth: revalida os dígitos verificadores no servidor; nunca
+      // confiar só na validação do app.
+      if (!isValidCNPJ(cpf_cnpj)) {
+        return res.status(400).json({ error: "CNPJ inválido (dígitos verificadores)." });
+      }
+      userCnpj = cpf_cnpj.replace(/\D/g, "");
     }
 
     const conditions = [];
@@ -2703,6 +2868,10 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         plan_expires_at: user.plan_expires_at,
         role: user.role,
         documentType: user.cnpj ? "CNPJ" : "CPF",
+        // Sempre devolve só dígitos — o app aplica a máscara. Evita divergência
+        // entre o CNPJ digitado no signup e o exibido na validação (dados legados
+        // podiam estar salvos com a máscara "00.000.000/0000-00").
+        cnpj: user.cnpj ? String(user.cnpj).replace(/\D/g, "") : null,
         cref_verified: user.cref_verified,
         cnpj_verified: user.cnpj_verified,
         status_verificacao: user.status_verificacao,
