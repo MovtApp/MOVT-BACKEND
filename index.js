@@ -386,7 +386,9 @@ async function initDb() {
 
 // Configuração Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// gemini-1.5-flash foi aposentado pelo Google (404 na API). gemini-2.5-flash é o
+// substituto estável com suporte a visão (usado p/ ler documento CREF e comprovantes).
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 async function analyzeCrefDocument(fileBuffer, mimeType) {
   try {
