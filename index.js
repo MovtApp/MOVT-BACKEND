@@ -101,6 +101,9 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_back_url TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_cpf TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_validade DATE DEFAULT NULL`;
+    // Motivo da reprovação manual do CREF (preenchido pelo admin) — exibido ao
+    // personal na tela de status para que ele saiba o que corrigir ao reenviar.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_rejeicao_motivo TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
     // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code TEXT DEFAULT NULL`;
@@ -1326,6 +1329,7 @@ app.put("/api/user/document", verifyToken, crefDocumentUpload, async (req, res) 
         cref_validade = ${validade},
         status_verificacao = ${aiStatus},
         cref_verified = ${aiVerified},
+        cref_rejeicao_motivo = NULL,
         updated_at = CURRENT_TIMESTAMP
       WHERE id_us = ${userId}
     `;
@@ -1483,7 +1487,8 @@ app.post("/api/login", async (req, res) => {
 
     const [user] = await sql`
       SELECT id_us, email, senha, username, nome, session_id, email_verified, role, ativo,
-             cnpj, cref_verified, cnpj_verified, status_verificacao
+             cnpj, cref_verified, cnpj_verified, status_verificacao,
+             document_url, cref_rejeicao_motivo
       FROM usuarios
       WHERE email = ${email};
     `;
@@ -1535,6 +1540,8 @@ app.post("/api/login", async (req, res) => {
         cref_verified: user.cref_verified,
         cnpj_verified: user.cnpj_verified,
         status_verificacao: user.status_verificacao,
+        cref_submitted: !!user.document_url,
+        cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
       },
       sessionId: user.session_id,
     });
@@ -2868,6 +2875,87 @@ app.get("/api/admin/trainers", verifyToken, async (req, res) => {
   }
 });
 
+// ── Verificação manual de CREF (fallback quando a IA não auto-aprova) ──────────
+// Lista os personais que enviaram a carteira do CREF e estão no status pedido
+// (default "pendente"). Só entram quem de fato subiu documento (document_url).
+app.get("/api/admin/cref-verifications", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${userId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+    const status = (req.query.status || "pendente").toString();
+    const users = await sql`
+      SELECT id_us, nome, email, avatar_url as foto_url, cref, cref_validade,
+             document_url, document_back_url, status_verificacao,
+             cref_rejeicao_motivo, updated_at
+      FROM usuarios
+      WHERE status_verificacao = ${status}
+        AND document_url IS NOT NULL
+      ORDER BY updated_at DESC
+    `;
+    res.json({ success: true, users });
+  } catch (err) {
+    console.error('[cref-verifications]', err);
+    res.status(500).json({ error: "Erro ao listar verificações de CREF." });
+  }
+});
+
+// Aprova manualmente: libera o personal (cref_verified=true, status aprovado).
+app.post("/api/admin/cref-verifications/:id/approve", verifyToken, async (req, res) => {
+  const adminId = req.userId;
+  const { id } = req.params;
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+    const [updated] = await sql`
+      UPDATE usuarios
+      SET cref_verified = TRUE,
+          status_verificacao = 'aprovado',
+          cref_rejeicao_motivo = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id_us = ${id}
+      RETURNING id_us, cref_verified, status_verificacao
+    `;
+    if (!updated) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json({ success: true, user: updated });
+  } catch (err) {
+    console.error('[cref-approve]', err);
+    res.status(500).json({ error: "Erro ao aprovar CREF." });
+  }
+});
+
+// Reprova manualmente: guarda o motivo e permite o reenvio pelo personal.
+app.post("/api/admin/cref-verifications/:id/reject", verifyToken, async (req, res) => {
+  const adminId = req.userId;
+  const { id } = req.params;
+  const motivo = (req.body?.motivo || "").toString().trim();
+  if (!motivo) return res.status(400).json({ error: "Informe o motivo da reprovação." });
+  try {
+    const [adminCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${adminId}`;
+    if (!adminCheck || (adminCheck.role || "").trim().toLowerCase() !== 'admin') {
+      return res.status(403).json({ error: "Acesso negado." });
+    }
+    const [updated] = await sql`
+      UPDATE usuarios
+      SET cref_verified = FALSE,
+          status_verificacao = 'reprovado',
+          cref_rejeicao_motivo = ${motivo},
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id_us = ${id}
+      RETURNING id_us, status_verificacao
+    `;
+    if (!updated) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json({ success: true, user: updated });
+  } catch (err) {
+    console.error('[cref-reject]', err);
+    res.status(500).json({ error: "Erro ao reprovar CREF." });
+  }
+});
+
 // Listagem de academias
     // Nota: Rota administrativa de academias deve ser centralizada no adminGyms.js
 
@@ -2889,7 +2977,8 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
 
     const [user] = await sql`
       SELECT id_us, email, username, nome, email_verified, plan, plan_expires_at, role,
-             cnpj, cref_verified, cnpj_verified, status_verificacao
+             cnpj, cref_verified, cnpj_verified, status_verificacao,
+             document_url, cref_rejeicao_motivo
       FROM usuarios
       WHERE id_us = ${userId};
     `;
@@ -2932,6 +3021,9 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         cref_verified: user.cref_verified,
         cnpj_verified: user.cnpj_verified,
         status_verificacao: user.status_verificacao,
+        // Estado do CREF para a tela de status: já enviou documento? motivo da recusa?
+        cref_submitted: !!user.document_url,
+        cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
       },
     });
   } catch (error) {
