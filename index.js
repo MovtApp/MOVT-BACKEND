@@ -111,6 +111,11 @@ async function initDb() {
     // cadastros NOVOS precisem validar. Idempotente: o ADD só roda uma vez.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT TRUE`;
     await sql`ALTER TABLE usuarios ALTER COLUMN phone_verified SET DEFAULT FALSE`;
+    // Onboarding de dados pessoais (altura/peso/objetivo/etc). Mesma estratégia de
+    // grandfather do telefone: contas existentes viram TRUE; só cadastros novos
+    // precisam preencher. complete-onboarding grava TRUE ao finalizar.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT TRUE`;
+    await sql`ALTER TABLE usuarios ALTER COLUMN onboarding_completed SET DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
     // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code TEXT DEFAULT NULL`;
@@ -1512,7 +1517,7 @@ app.post("/api/login", async (req, res) => {
     const [user] = await sql`
       SELECT id_us, email, senha, username, nome, session_id, email_verified, role, ativo,
              cnpj, cref_verified, cnpj_verified, status_verificacao,
-             document_url, cref_rejeicao_motivo, phone_verified
+             document_url, cref_rejeicao_motivo, phone_verified, onboarding_completed
       FROM usuarios
       WHERE email = ${email};
     `;
@@ -1567,6 +1572,7 @@ app.post("/api/login", async (req, res) => {
         cref_submitted: !!user.document_url,
         cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
         phone_verified: user.phone_verified,
+        onboarding_completed: user.onboarding_completed,
       },
       sessionId: user.session_id,
     });
@@ -1835,6 +1841,7 @@ app.post("/api/user/complete-onboarding", async (req, res) => {
         peso = ${Number(peso) || 70},
         objetivo = ${objetivo || 'Manter peso'},
         nivel = ${nivel || 'Iniciante'},
+        onboarding_completed = TRUE,
         ativo = TRUE,
         updated_at = NOW()
       WHERE email = ${email}
@@ -3067,7 +3074,7 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
     const [user] = await sql`
       SELECT id_us, email, username, nome, email_verified, plan, plan_expires_at, role,
              cnpj, cref_verified, cnpj_verified, status_verificacao,
-             document_url, cref_rejeicao_motivo, phone_verified
+             document_url, cref_rejeicao_motivo, phone_verified, onboarding_completed
       FROM usuarios
       WHERE id_us = ${userId};
     `;
@@ -3114,6 +3121,7 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         cref_submitted: !!user.document_url,
         cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
         phone_verified: user.phone_verified,
+        onboarding_completed: user.onboarding_completed,
       },
     });
   } catch (error) {
