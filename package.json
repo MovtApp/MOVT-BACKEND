@@ -29,6 +29,7 @@
     "resend": "^6.12.4",
     "sharp": "^0.33.0",
     "stripe": "^20.2.0",
+    "twilio": "^6.0.2",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

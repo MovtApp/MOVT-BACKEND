@@ -12,6 +12,7 @@ const multer = require("multer");
 const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const twilio = require("twilio");
 const Stripe = require('stripe');
 const {
   isValidCNPJ,
@@ -104,6 +105,12 @@ async function initDb() {
     // Motivo da reprovação manual do CREF (preenchido pelo admin) — exibido ao
     // personal na tela de status para que ele saiba o que corrigir ao reenviar.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_rejeicao_motivo TEXT DEFAULT NULL`;
+    // Verificação de telefone (Twilio Verify / SMS). Universal para todas as contas.
+    // Estratégia de "grandfather": ao criar a coluna, as contas EXISTENTES recebem
+    // TRUE (DEFAULT TRUE no ADD); em seguida o default vira FALSE para que apenas
+    // cadastros NOVOS precisem validar. Idempotente: o ADD só roda uma vez.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT TRUE`;
+    await sql`ALTER TABLE usuarios ALTER COLUMN phone_verified SET DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE`;
     // Recuperação de senha ("Esqueci a senha"): código de 6 dígitos + expiração.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_code TEXT DEFAULT NULL`;
@@ -398,6 +405,23 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
 // gemini-1.5-flash foi aposentado pelo Google (404 na API). gemini-2.5-flash é o
 // substituto estável com suporte a visão (usado p/ ler documento CREF e comprovantes).
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+// Twilio Verify (validação de telefone por SMS). Só ativo quando as credenciais
+// existem no ambiente — assim o servidor sobe mesmo sem Twilio configurado.
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
+const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID;
+
+// Normaliza o telefone salvo (com máscara "(11) 99999-9999") para E.164 BR (+55...).
+function toE164BR(telefone) {
+  const digits = (telefone || "").replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.startsWith("55") && digits.length >= 12) return `+${digits}`;
+  if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
+  return `+${digits}`;
+}
 
 // Analisa um lado da carteira do CREF via Gemini.
 //  - side="front": extrai número do CREF, nome e UF (impresso na frente).
@@ -1488,7 +1512,7 @@ app.post("/api/login", async (req, res) => {
     const [user] = await sql`
       SELECT id_us, email, senha, username, nome, session_id, email_verified, role, ativo,
              cnpj, cref_verified, cnpj_verified, status_verificacao,
-             document_url, cref_rejeicao_motivo
+             document_url, cref_rejeicao_motivo, phone_verified
       FROM usuarios
       WHERE email = ${email};
     `;
@@ -1542,6 +1566,7 @@ app.post("/api/login", async (req, res) => {
         status_verificacao: user.status_verificacao,
         cref_submitted: !!user.document_url,
         cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
+        phone_verified: user.phone_verified,
       },
       sessionId: user.session_id,
     });
@@ -2887,7 +2912,10 @@ app.get("/api/admin/cref-verifications", verifyToken, async (req, res) => {
     }
     const status = (req.query.status || "pendente").toString();
     const users = await sql`
-      SELECT id_us, nome, email, avatar_url as foto_url, cref, cref_validade,
+      SELECT id_us, nome, email, avatar_url as foto_url, role, plan, ativo,
+             createdat as created_at,
+             cnpj, cnpj_razao_social, cnpj_cnae, cnpj_verified,
+             cref, cref_validade, document_cpf,
              document_url, document_back_url, status_verificacao,
              cref_rejeicao_motivo, updated_at
       FROM usuarios
@@ -2956,6 +2984,67 @@ app.post("/api/admin/cref-verifications/:id/reject", verifyToken, async (req, re
   }
 });
 
+// ── Validação de telefone (Twilio Verify / SMS) ─────────────────────────────
+// Envia um código por SMS para o telefone do cadastro.
+app.post("/api/user/send-phone-code", verifyToken, async (req, res) => {
+  try {
+    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
+      return res.status(503).json({ error: "Serviço de SMS não configurado." });
+    }
+    const [u] = await sql`SELECT telefone, phone_verified FROM usuarios WHERE id_us = ${req.userId}`;
+    if (!u) return res.status(404).json({ error: "Usuário não encontrado." });
+    if (u.phone_verified) return res.json({ success: true, alreadyVerified: true });
+
+    const phone = toE164BR(u.telefone);
+    if (!phone) return res.status(400).json({ error: "Telefone inválido no cadastro." });
+
+    await twilioClient.verify.v2
+      .services(TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({ to: phone, channel: "sms" });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[send-phone-code]", error?.message);
+    Sentry.captureException(error, { tags: { route: "POST /api/user/send-phone-code" } });
+    res.status(500).json({ error: "Não foi possível enviar o código por SMS." });
+  }
+});
+
+// Confere o código informado pelo usuário e marca phone_verified.
+app.post("/api/user/verify-phone", verifyToken, async (req, res) => {
+  const code = (req.body?.code || "").toString().trim();
+  if (!code) return res.status(400).json({ error: "Informe o código recebido por SMS." });
+  try {
+    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
+      return res.status(503).json({ error: "Serviço de SMS não configurado." });
+    }
+    const [u] = await sql`SELECT telefone, phone_verified FROM usuarios WHERE id_us = ${req.userId}`;
+    if (!u) return res.status(404).json({ error: "Usuário não encontrado." });
+    if (u.phone_verified) return res.json({ success: true, phone_verified: true });
+
+    const phone = toE164BR(u.telefone);
+    if (!phone) return res.status(400).json({ error: "Telefone inválido no cadastro." });
+
+    const check = await twilioClient.verify.v2
+      .services(TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({ to: phone, code });
+
+    if (check.status !== "approved") {
+      return res.status(400).json({ error: "Código inválido ou expirado." });
+    }
+
+    await sql`
+      UPDATE usuarios SET phone_verified = TRUE, updated_at = CURRENT_TIMESTAMP
+      WHERE id_us = ${req.userId}
+    `;
+    res.json({ success: true, phone_verified: true });
+  } catch (error) {
+    console.error("[verify-phone]", error?.message);
+    Sentry.captureException(error, { tags: { route: "POST /api/user/verify-phone" } });
+    res.status(500).json({ error: "Não foi possível validar o código." });
+  }
+});
+
 // Listagem de academias
     // Nota: Rota administrativa de academias deve ser centralizada no adminGyms.js
 
@@ -2978,7 +3067,7 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
     const [user] = await sql`
       SELECT id_us, email, username, nome, email_verified, plan, plan_expires_at, role,
              cnpj, cref_verified, cnpj_verified, status_verificacao,
-             document_url, cref_rejeicao_motivo
+             document_url, cref_rejeicao_motivo, phone_verified
       FROM usuarios
       WHERE id_us = ${userId};
     `;
@@ -3024,6 +3113,7 @@ app.get("/api/user/session-status", verifyToken, async (req, res) => {
         // Estado do CREF para a tela de status: já enviou documento? motivo da recusa?
         cref_submitted: !!user.document_url,
         cref_rejeicao_motivo: user.cref_rejeicao_motivo || null,
+        phone_verified: user.phone_verified,
       },
     });
   } catch (error) {
