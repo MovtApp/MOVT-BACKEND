@@ -85,6 +85,14 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_verified BOOLEAN DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_verified BOOLEAN DEFAULT FALSE`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS status_verificacao TEXT DEFAULT 'pendente'`;
+    // Dados pessoais (onboarding Info): o endpoint complete-onboarding faz UPDATE
+    // nestas colunas — precisavam existir na tabela usuarios.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS genero TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS idade INTEGER DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS altura NUMERIC DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS peso NUMERIC DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS objetivo TEXT DEFAULT NULL`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nivel TEXT DEFAULT NULL`;
     // Snapshot auditável + cache da consulta de CNPJ na Receita.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_razao_social TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnpj_situacao TEXT DEFAULT NULL`;
