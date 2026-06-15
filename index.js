@@ -634,31 +634,34 @@ async function ensureUserInSupabaseAuth(user) {
     return existingUser;
   }
 
-  // Tenta encontrar o usuário no Supabase Auth pelo email
-  const { data: supabaseUsers, error: authError } = await supabase
-    .from('auth.users')
-    .select('id')
-    .eq('email', user.email)
-    .limit(1);
+  // Procura o usuário existente no Supabase Auth lendo auth.users DIRETO via SQL.
+  // ATENÇÃO: supabase.from('auth.users') NÃO funciona — o PostgREST só expõe o
+  // schema 'public', então essa busca sempre falhava e o mapeamento nunca era
+  // criado (a conta JÁ existia no Auth, mas o vínculo ficava null).
+  let existingAuthId = null;
+  try {
+    const [row] = await sql`SELECT id FROM auth.users WHERE email = ${user.email} LIMIT 1`;
+    existingAuthId = row?.id || null;
+  } catch (e) {
+    console.error("[ensureUserInSupabaseAuth] Erro ao ler auth.users:", e.message);
+  }
 
-  if (!authError && supabaseUsers && supabaseUsers.length > 0) {
-    // usuário encontrado no Supabase Auth, criar mapeamento
-    const authUserId = supabaseUsers[0].id;
-
-    const { error: insertError } = await supabase
-      .from('user_id_mapping')
-      .insert({
-        id_us: user.id_us,
-        auth_user_id: authUserId
-      });
-
-    if (insertError) {
-      console.error("Erro ao inserir mapeamento de usuário:", insertError);
-    } else {
-      console.log(`Mapeamento criado para usuário ${user.id_us} -> ${authUserId}`);
+  if (existingAuthId) {
+    try {
+      await sql`
+        INSERT INTO user_id_mapping (id_us, auth_user_id)
+        SELECT ${user.id_us}, ${existingAuthId}
+        WHERE NOT EXISTS (SELECT 1 FROM user_id_mapping WHERE id_us = ${user.id_us})
+      `;
+      await sql`
+        UPDATE usuarios SET supabase_uid = ${existingAuthId}, auth_user_id = ${existingAuthId}
+        WHERE id_us = ${user.id_us} AND supabase_uid IS NULL
+      `;
+      console.log(`Mapeamento criado para usuário ${user.id_us} -> ${existingAuthId}`);
+    } catch (e) {
+      console.error("Erro ao inserir mapeamento de usuário:", e.message);
     }
-
-    return { auth_user_id: authUserId };
+    return { auth_user_id: existingAuthId };
   }
 
   // Se o usuário não existe no Supabase Auth, precisamos criá-lo
@@ -694,16 +697,19 @@ async function ensureUserInSupabaseAuth(user) {
       return { auth_user_id: generatedUuid };
     }
 
-    // Usuário criado com sucesso, criar o mapeamento
-    const { error: insertError } = await supabase
-      .from('user_id_mapping')
-      .insert({
-        id_us: user.id_us,
-        auth_user_id: userData.user.id
-      });
-
-    if (insertError) {
-      console.error("Erro ao inserir mapeamento de usuário:", insertError);
+    // Usuário criado com sucesso, criar o mapeamento (via SQL, idempotente)
+    try {
+      await sql`
+        INSERT INTO user_id_mapping (id_us, auth_user_id)
+        SELECT ${user.id_us}, ${userData.user.id}
+        WHERE NOT EXISTS (SELECT 1 FROM user_id_mapping WHERE id_us = ${user.id_us})
+      `;
+      await sql`
+        UPDATE usuarios SET supabase_uid = ${userData.user.id}, auth_user_id = ${userData.user.id}
+        WHERE id_us = ${user.id_us} AND supabase_uid IS NULL
+      `;
+    } catch (e) {
+      console.error("Erro ao inserir mapeamento de usuário:", e.message);
       return null;
     }
 
@@ -1706,6 +1712,16 @@ app.post("/api/register", async (req, res) => {
         SET role = 'trainer', status_verificacao = 'pendente'
         WHERE id_us = ${newUser.id_us}
       `;
+    }
+
+    // Vincula a conta ao Supabase Auth já no cadastro (cria/acha o auth user e
+    // grava o user_id_mapping). Sem isso, contas de e-mail/senha nasciam sem
+    // supabase_uid e o chat (baseado em UUID do Supabase) falhava com 404.
+    // Não bloqueia o cadastro se falhar — o getUserAuthId tenta de novo depois.
+    try {
+      await ensureUserInSupabaseAuth({ id_us: newUser.id_us, email: newUser.email });
+    } catch (linkErr) {
+      console.warn("[register] Falha ao vincular Supabase Auth (segue mesmo assim):", linkErr.message);
     }
 
     const emailSent = await sendVerificationEmail(
@@ -4287,7 +4303,8 @@ app.get("/api/search", verifyToken, async (req, res) => {
       SELECT u.id_us AS id, u.nome AS title, u.username AS subtitle, u.avatar_url AS image, u.role, u.banner_url,
              Coalesce(u.location, 'São Paulo') as location,
              Coalesce(u.job_title, 'Entusiasta Fitness') as job_title,
-             EXISTS(SELECT 1 FROM follows f WHERE f.follower_user_id = ${req.userId} AND f.followed_user_id = u.id_us) as is_following
+             EXISTS(SELECT 1 FROM follows f WHERE f.follower_user_id = ${req.userId} AND f.followed_user_id = u.id_us) as is_following,
+             (SELECT f.status FROM follows f WHERE f.follower_user_id = ${req.userId} AND f.followed_user_id = u.id_us LIMIT 1) as follow_status
       FROM usuarios u
       WHERE u.nome ILIKE ${pattern} OR u.username ILIKE ${pattern}
       LIMIT ${limit}
@@ -4334,7 +4351,10 @@ app.get("/api/search", verifyToken, async (req, res) => {
             username: t.subtitle,
             photo: t.image,
             banner: t.banner_url,
-            isFollowing: t.is_following
+            isFollowing: t.is_following,
+            // 'pending' | 'accepted' | null — usado pelo app para mostrar
+            // Seguir / Solicitado / Conversar no sheet de nova conversa.
+            followStatus: t.follow_status || 'none'
           }
         };
       }),
