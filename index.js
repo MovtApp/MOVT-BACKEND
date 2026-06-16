@@ -12,7 +12,7 @@ const multer = require("multer");
 const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const twilio = require("twilio");
+const admin = require("firebase-admin");
 const Stripe = require('stripe');
 const {
   isValidCNPJ,
@@ -322,6 +322,9 @@ async function initDb() {
     // Contador mensal de comunidades ingressadas (reiniciado todo mês pelo backend ao checar)
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS community_joins_month INTEGER DEFAULT 0`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS community_joins_month_reset TIMESTAMP DEFAULT NOW()`;
+    // Contador semanal de treinos iniciados (limite do plano gratuito: 2/semana).
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS treino_week_count INTEGER DEFAULT 0`;
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS treino_week_reset TIMESTAMP DEFAULT NOW()`;
 
     // Tabela de membros de comunidades (tracking real de adesões)
     await sql`CREATE TABLE IF NOT EXISTS community_members (
@@ -419,13 +422,24 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
 // substituto estável com suporte a visão (usado p/ ler documento CREF e comprovantes).
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// Twilio Verify (validação de telefone por SMS). Só ativo quando as credenciais
-// existem no ambiente — assim o servidor sobe mesmo sem Twilio configurado.
-const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
-const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID;
+// Firebase Admin — usado SÓ para validar o ID token do Firebase Phone Auth
+// (o app verifica o número via SDK nativo e manda o token; aqui conferimos a
+// assinatura e que o telefone do token bate com o do cadastro). Só inicializa
+// quando o service account existe no ambiente — assim o servidor sobe mesmo sem
+// Firebase configurado.
+let firebaseReady = false;
+try {
+  if (!admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT) {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
+    });
+    firebaseReady = true;
+  } else if (admin.apps.length) {
+    firebaseReady = true;
+  }
+} catch (e) {
+  console.error("[firebase-admin] init falhou:", e?.message);
+}
 
 // Normaliza o telefone salvo (com máscara "(11) 99999-9999") para E.164 BR (+55...).
 function toE164BR(telefone) {
@@ -434,6 +448,13 @@ function toE164BR(telefone) {
   if (digits.startsWith("55") && digits.length >= 12) return `+${digits}`;
   if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
   return `+${digits}`;
+}
+
+// Mascara um E.164 para exibição (+55 11 *****-1234), sem revelar o número todo.
+function maskPhoneE164(e164) {
+  if (!e164) return "";
+  const tail = e164.slice(-4);
+  return `${e164.slice(0, 5)} *****-${tail}`;
 }
 
 // Analisa um lado da carteira do CREF via Gemini.
@@ -928,21 +949,65 @@ function checkFreePlanLimit(feature) {
 
     try {
       const [user] = await sql`
-        SELECT plan, plan_expires_at, community_joins_month, community_joins_month_reset
+        SELECT plan, plan_expires_at, community_joins_month, community_joins_month_reset,
+               treino_week_count, treino_week_reset
         FROM usuarios WHERE id_us = ${userId}
       `;
 
       if (!user) return next();
 
-      // Premium sem expiração OU premium ainda válido → acesso total
-      const isPremium = user.plan === 'premium' &&
+      // Premium OU família, sem expiração ou ainda válido → acesso total
+      const hasFullAccess = (user.plan === 'premium' || user.plan === 'familia') &&
         (!user.plan_expires_at || new Date(user.plan_expires_at) > new Date());
 
-      if (isPremium) return next();
+      if (hasFullAccess) return next();
 
       // ---- Usuário FREE: aplicar restrições ----
+      // Limites do plano gratuito (alinhados com o frontend em src/config/planLimits.ts).
+      const FREE_AGENDAMENTOS = 2; // por mês
+      const FREE_COMUNIDADES = 2;  // por mês
+      const FREE_TREINOS = 2;      // por semana
 
-      // dietas: sem restrição de plano — todos os usuários podem criar dietas
+      if (feature === 'treinos') {
+        const now = new Date();
+        // Início da semana (segunda-feira 00:00)
+        const startOfWeek = new Date(now);
+        const dow = (startOfWeek.getDay() + 6) % 7; // 0 = segunda
+        startOfWeek.setHours(0, 0, 0, 0);
+        startOfWeek.setDate(startOfWeek.getDate() - dow);
+
+        let weekCount = user.treino_week_count || 0;
+        const resetAt = user.treino_week_reset ? new Date(user.treino_week_reset) : null;
+        if (!resetAt || resetAt < startOfWeek) {
+          weekCount = 0; // nova semana → zera
+        }
+        if (weekCount >= FREE_TREINOS) {
+          return res.status(403).json({
+            error: 'FREE_LIMIT_REACHED',
+            message: `Você atingiu o limite de ${FREE_TREINOS} treinos por semana no plano gratuito.`,
+            feature: 'treinos',
+            used: weekCount,
+            limit: FREE_TREINOS,
+          });
+        }
+        // Incrementa (registra o início do treino) e reinicia a janela se virou a semana.
+        await sql`
+          UPDATE usuarios
+          SET treino_week_count = ${weekCount + 1},
+              treino_week_reset = ${!resetAt || resetAt < startOfWeek ? sql`NOW()` : sql`treino_week_reset`}
+          WHERE id_us = ${userId}
+        `;
+        return next();
+      }
+
+      // dietas: plano gratuito NÃO cria planos de dieta (exclusivo premium/família).
+      if (feature === 'dietas') {
+        return res.status(403).json({
+          error: 'PREMIUM_ONLY',
+          message: 'Os planos de dieta são exclusivos do plano Premium.',
+          feature: 'dietas',
+        });
+      }
 
       if (feature === 'agendamentos') {
         const now = new Date();
@@ -953,13 +1018,13 @@ function checkFreePlanLimit(feature) {
             AND created_at >= ${startOfMonth}
         `;
         const used = parseInt(count, 10);
-        if (used >= 50) {
+        if (used >= FREE_AGENDAMENTOS) {
           return res.status(403).json({
             error: 'FREE_LIMIT_REACHED',
-            message: 'Você atingiu o limite de 50 agendamentos por mês no plano gratuito.',
+            message: `Você atingiu o limite de ${FREE_AGENDAMENTOS} agendamentos por mês no plano gratuito.`,
             feature: 'agendamentos',
             used,
-            limit: 50
+            limit: FREE_AGENDAMENTOS
           });
         }
         return next();
@@ -975,13 +1040,13 @@ function checkFreePlanLimit(feature) {
             user.community_joins_month = 0;
           }
         }
-        if (user.community_joins_month >= 50) {
+        if (user.community_joins_month >= FREE_COMUNIDADES) {
           return res.status(403).json({
             error: 'FREE_LIMIT_REACHED',
-            message: 'Você atingiu o limite de 50 comunidades por mês no plano gratuito.',
+            message: `Você atingiu o limite de ${FREE_COMUNIDADES} comunidades por mês no plano gratuito.`,
             feature: 'comunidades',
             used: user.community_joins_month,
-            limit: 50
+            limit: FREE_COMUNIDADES
           });
         }
         return next();
@@ -2291,21 +2356,33 @@ app.post("/api/auth/recovery/reset", async (req, res) => {
   }
 });
 
-// GET: Retorna dados do plano do usuário logado
+// POST: Registra o início de um treino (conta para o limite semanal do free).
+// O middleware faz o gate + incremento; se free e já no limite, devolve 403.
+app.post("/api/user/treino-start", verifyToken, checkFreePlanLimit('treinos'), async (req, res) => {
+  res.json({ success: true });
+});
+
+// GET: Retorna dados do plano do usuário logado (uso e limites por feature).
 app.get("/api/user/plan-status", verifyToken, async (req, res) => {
   const userId = req.userId;
   try {
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfWeek = new Date(now);
+    const dow = (startOfWeek.getDay() + 6) % 7; // 0 = segunda
+    startOfWeek.setHours(0, 0, 0, 0);
+    startOfWeek.setDate(startOfWeek.getDate() - dow);
 
     const [user] = await sql`
-      SELECT plan, plan_expires_at, community_joins_month, community_joins_month_reset
+      SELECT plan, plan_expires_at, community_joins_month, community_joins_month_reset,
+             treino_week_count, treino_week_reset
       FROM usuarios WHERE id_us = ${userId}
     `;
 
     if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
 
-    const isPremium = user.plan === 'premium' &&
+    // Premium OU família com assinatura válida → acesso total.
+    const hasFullAccess = (user.plan === 'premium' || user.plan === 'familia') &&
       (!user.plan_expires_at || new Date(user.plan_expires_at) > now);
 
     // Agendamentos usados no mês
@@ -2324,13 +2401,22 @@ app.get("/api/user/plan-status", verifyToken, async (req, res) => {
       }
     }
 
+    // Treinos usados na semana (zera se virou a semana)
+    let treinoCount = user.treino_week_count || 0;
+    const treinoReset = user.treino_week_reset ? new Date(user.treino_week_reset) : null;
+    if (!treinoReset || treinoReset < startOfWeek) treinoCount = 0;
+
     return res.status(200).json({
-      plan: isPremium ? 'premium' : 'free',
+      plan: hasFullAccess ? (user.plan || 'premium') : 'free',
       plan_expires_at: user.plan_expires_at,
+      hasFullAccess,
       limits: {
-        agendamentos: { used: parseInt(apptCount, 10), limit: isPremium ? null : 2 },
-        comunidades: { used: communityJoins, limit: isPremium ? null : 2 },
-        dietas: { canCreate: isPremium }
+        treinos: { used: treinoCount, limit: hasFullAccess ? null : 2 },
+        agendamentos: { used: parseInt(apptCount, 10), limit: hasFullAccess ? null : 2 },
+        comunidades: { used: communityJoins, limit: hasFullAccess ? null : 2 },
+        dietas: { canAccess: hasFullAccess },
+        desafios: { canAccess: hasFullAccess },
+        dadosAvancados: { canAccess: hasFullAccess },
       }
     });
   } catch (err) {
@@ -3015,53 +3101,61 @@ app.post("/api/admin/cref-verifications/:id/reject", verifyToken, async (req, re
   }
 });
 
-// ── Validação de telefone (Twilio Verify / SMS) ─────────────────────────────
-// Envia um código por SMS para o telefone do cadastro.
-app.post("/api/user/send-phone-code", verifyToken, async (req, res) => {
+// ── Validação de telefone (Firebase Phone Auth) ─────────────────────────────
+// Devolve o telefone do cadastro em E.164 para o app disparar o SMS pelo SDK
+// nativo do Firebase. O número NÃO é editável: o app só verifica, e o backend
+// confere (em /verify-phone-firebase) que o número do token bate com este.
+app.get("/api/user/phone", verifyToken, async (req, res) => {
   try {
-    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
-      return res.status(503).json({ error: "Serviço de SMS não configurado." });
-    }
     const [u] = await sql`SELECT telefone, phone_verified FROM usuarios WHERE id_us = ${req.userId}`;
     if (!u) return res.status(404).json({ error: "Usuário não encontrado." });
-    if (u.phone_verified) return res.json({ success: true, alreadyVerified: true });
+    if (u.phone_verified) return res.json({ alreadyVerified: true });
 
     const phone = toE164BR(u.telefone);
     if (!phone) return res.status(400).json({ error: "Telefone inválido no cadastro." });
 
-    await twilioClient.verify.v2
-      .services(TWILIO_VERIFY_SERVICE_SID)
-      .verifications.create({ to: phone, channel: "sms" });
-
-    res.json({ success: true });
+    res.json({ phone, masked: maskPhoneE164(phone), alreadyVerified: false });
   } catch (error) {
-    console.error("[send-phone-code]", error?.message);
-    Sentry.captureException(error, { tags: { route: "POST /api/user/send-phone-code" } });
-    res.status(500).json({ error: "Não foi possível enviar o código por SMS." });
+    console.error("[user/phone]", error?.message);
+    Sentry.captureException(error, { tags: { route: "GET /api/user/phone" } });
+    res.status(500).json({ error: "Não foi possível obter o telefone do cadastro." });
   }
 });
 
-// Confere o código informado pelo usuário e marca phone_verified.
-app.post("/api/user/verify-phone", verifyToken, async (req, res) => {
-  const code = (req.body?.code || "").toString().trim();
-  if (!code) return res.status(400).json({ error: "Informe o código recebido por SMS." });
+// Recebe o ID token do Firebase (gerado após o usuário confirmar o código SMS),
+// valida a assinatura com firebase-admin e confere que o telefone do token é o
+// mesmo do cadastro antes de marcar phone_verified. Isso impede que alguém
+// verifique um número diferente do que está registrado.
+app.post("/api/user/verify-phone-firebase", verifyToken, async (req, res) => {
+  const idToken = (req.body?.idToken || "").toString();
+  if (!idToken) return res.status(400).json({ error: "Token de verificação ausente." });
   try {
-    if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
-      return res.status(503).json({ error: "Serviço de SMS não configurado." });
+    if (!firebaseReady) {
+      return res.status(503).json({ error: "Serviço de verificação não configurado." });
     }
     const [u] = await sql`SELECT telefone, phone_verified FROM usuarios WHERE id_us = ${req.userId}`;
     if (!u) return res.status(404).json({ error: "Usuário não encontrado." });
     if (u.phone_verified) return res.json({ success: true, phone_verified: true });
 
-    const phone = toE164BR(u.telefone);
-    if (!phone) return res.status(400).json({ error: "Telefone inválido no cadastro." });
+    const expected = toE164BR(u.telefone);
+    if (!expected) return res.status(400).json({ error: "Telefone inválido no cadastro." });
 
-    const check = await twilioClient.verify.v2
-      .services(TWILIO_VERIFY_SERVICE_SID)
-      .verificationChecks.create({ to: phone, code });
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (e) {
+      console.error("[verify-phone-firebase] token inválido:", e?.message);
+      return res.status(401).json({ error: "Verificação inválida ou expirada." });
+    }
 
-    if (check.status !== "approved") {
-      return res.status(400).json({ error: "Código inválido ou expirado." });
+    const tokenPhone = decoded?.phone_number || null;
+    if (!tokenPhone) {
+      return res.status(400).json({ error: "Token sem telefone verificado." });
+    }
+    if (tokenPhone !== expected) {
+      return res.status(400).json({
+        error: "O número verificado não corresponde ao do seu cadastro.",
+      });
     }
 
     await sql`
@@ -3070,9 +3164,9 @@ app.post("/api/user/verify-phone", verifyToken, async (req, res) => {
     `;
     res.json({ success: true, phone_verified: true });
   } catch (error) {
-    console.error("[verify-phone]", error?.message);
-    Sentry.captureException(error, { tags: { route: "POST /api/user/verify-phone" } });
-    res.status(500).json({ error: "Não foi possível validar o código." });
+    console.error("[verify-phone-firebase]", error?.message);
+    Sentry.captureException(error, { tags: { route: "POST /api/user/verify-phone-firebase" } });
+    res.status(500).json({ error: "Não foi possível validar o telefone." });
   }
 });
 
