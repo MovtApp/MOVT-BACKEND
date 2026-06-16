@@ -12,7 +12,7 @@ const multer = require("multer");
 const sharp = require("sharp");
 const { createClient } = require("@supabase/supabase-js");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const admin = require("firebase-admin");
+const jwt = require("jsonwebtoken");
 const Stripe = require('stripe');
 const {
   isValidCNPJ,
@@ -422,23 +422,46 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_KEY);
 // substituto estável com suporte a visão (usado p/ ler documento CREF e comprovantes).
 const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// Firebase Admin — usado SÓ para validar o ID token do Firebase Phone Auth
-// (o app verifica o número via SDK nativo e manda o token; aqui conferimos a
-// assinatura e que o telefone do token bate com o do cadastro). Só inicializa
-// quando o service account existe no ambiente — assim o servidor sobe mesmo sem
-// Firebase configurado.
-let firebaseReady = false;
-try {
-  if (!admin.apps.length && process.env.FIREBASE_SERVICE_ACCOUNT) {
-    admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-    });
-    firebaseReady = true;
-  } else if (admin.apps.length) {
-    firebaseReady = true;
+// Validação do ID token do Firebase Phone Auth SEM service account key.
+// O ID token é um JWT (RS256) assinado pelo Google; conferimos a assinatura
+// contra as chaves públicas do Google e validamos aud/iss/exp com o Project ID
+// (que é público — não é segredo). Assim não precisamos de FIREBASE_SERVICE_ACCOUNT,
+// evitando a política que bloqueia criação de chaves de conta de serviço.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || null;
+const FIREBASE_CERTS_URL =
+  "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
+
+// Cache das chaves públicas (o Google manda um max-age no header).
+let _firebaseCerts = { keys: null, exp: 0 };
+async function getFirebaseCerts() {
+  const axios = require("axios");
+  if (_firebaseCerts.keys && Date.now() < _firebaseCerts.exp) return _firebaseCerts.keys;
+  const res = await axios.get(FIREBASE_CERTS_URL);
+  const cacheControl = res.headers?.["cache-control"] || "";
+  const m = cacheControl.match(/max-age=(\d+)/);
+  const ttlMs = (m ? parseInt(m[1], 10) : 3600) * 1000;
+  _firebaseCerts = { keys: res.data, exp: Date.now() + ttlMs };
+  return res.data;
+}
+
+// Verifica o ID token e devolve o payload (inclui phone_number). Lança em caso
+// de assinatura/aud/iss/exp inválidos.
+async function verifyFirebaseIdToken(idToken) {
+  if (!FIREBASE_PROJECT_ID) throw new Error("FIREBASE_PROJECT_ID não configurado.");
+  const decoded = jwt.decode(idToken, { complete: true });
+  if (!decoded || decoded.header?.alg !== "RS256" || !decoded.header?.kid) {
+    throw new Error("Token mal formado.");
   }
-} catch (e) {
-  console.error("[firebase-admin] init falhou:", e?.message);
+  const certs = await getFirebaseCerts();
+  const cert = certs[decoded.header.kid];
+  if (!cert) throw new Error("Chave de assinatura desconhecida.");
+  const payload = jwt.verify(idToken, cert, {
+    algorithms: ["RS256"],
+    audience: FIREBASE_PROJECT_ID,
+    issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
+  });
+  if (!payload.sub) throw new Error("Token sem subject.");
+  return payload;
 }
 
 // Normaliza o telefone salvo (com máscara "(11) 99999-9999") para E.164 BR (+55...).
@@ -3123,14 +3146,15 @@ app.get("/api/user/phone", verifyToken, async (req, res) => {
 });
 
 // Recebe o ID token do Firebase (gerado após o usuário confirmar o código SMS),
-// valida a assinatura com firebase-admin e confere que o telefone do token é o
-// mesmo do cadastro antes de marcar phone_verified. Isso impede que alguém
-// verifique um número diferente do que está registrado.
+// valida a assinatura contra as chaves públicas do Google (verifyFirebaseIdToken)
+// e confere que o telefone do token é o mesmo do cadastro antes de marcar
+// phone_verified. Isso impede que alguém verifique um número diferente do que
+// está registrado.
 app.post("/api/user/verify-phone-firebase", verifyToken, async (req, res) => {
   const idToken = (req.body?.idToken || "").toString();
   if (!idToken) return res.status(400).json({ error: "Token de verificação ausente." });
   try {
-    if (!firebaseReady) {
+    if (!FIREBASE_PROJECT_ID) {
       return res.status(503).json({ error: "Serviço de verificação não configurado." });
     }
     const [u] = await sql`SELECT telefone, phone_verified FROM usuarios WHERE id_us = ${req.userId}`;
@@ -3142,7 +3166,7 @@ app.post("/api/user/verify-phone-firebase", verifyToken, async (req, res) => {
 
     let decoded;
     try {
-      decoded = await admin.auth().verifyIdToken(idToken);
+      decoded = await verifyFirebaseIdToken(idToken);
     } catch (e) {
       console.error("[verify-phone-firebase] token inválido:", e?.message);
       return res.status(401).json({ error: "Verificação inválida ou expirada." });
