@@ -69,7 +69,7 @@ async function postToExpo(messages) {
  * @param {string} [payload.channelId]  canal Android ('messages' | 'social' | 'reminders')
  * @param {number} [payload.badge]  contador do ícone (iOS)
  */
-async function sendPushToUser(sql, userId, { title, body, data, channelId, badge } = {}) {
+async function sendPushToUser(sql, userId, { title, body, data, channelId, threadId, badge } = {}) {
   try {
     if (!userId) return;
     const tokens = await getUserTokens(sql, userId);
@@ -82,6 +82,9 @@ async function sendPushToUser(sql, userId, { title, body, data, channelId, badge
       sound: "default",
       data: data || {},
       ...(channelId ? { channelId } : {}),
+      // threadId agrupa as notificações por conversa/categoria (iOS thread; no
+      // Android o agrupamento é por canal).
+      ...(threadId ? { threadId } : {}),
       ...(typeof badge === "number" ? { badge } : {}),
     }));
 
@@ -138,25 +141,77 @@ const CATEGORY_COLUMN = {
 };
 
 /**
- * Diz se o usuário permite push de uma categoria. Política opt-out: o padrão é
- * PERMITIDO — sem linha de preferências, tabela ausente ou qualquer erro, libera
- * (um problema de leitura nunca deve silenciar uma notificação legítima).
+ * Lê a linha de preferências do usuário (ou null). Nunca lança — qualquer erro
+ * vira null, que os checadores tratam como "tudo liberado" (opt-out).
  */
-async function isCategoryAllowed(sql, userId, category) {
-  const column = CATEGORY_COLUMN[category];
-  if (!column) return true;
+async function getNotificationPrefs(sql, userId) {
   try {
-    const rows = await sql`
-      SELECT ${sql(column)} AS allowed FROM notification_prefs WHERE user_id = ${userId}
+    const [row] = await sql`
+      SELECT push_chat, push_likes, push_comments, push_follows,
+             hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
+      FROM notification_prefs WHERE user_id = ${userId}
     `;
-    if (rows.length === 0) return true;
-    return rows[0].allowed !== false;
+    return row || null;
   } catch (err) {
     if (process.env.NODE_ENV !== "production") {
-      console.warn("[pushService] isCategoryAllowed fallback (libera):", err?.message || err);
+      console.warn("[pushService] getNotificationPrefs fallback (null):", err?.message || err);
     }
-    return true;
+    return null;
   }
+}
+
+/**
+ * Diz se o usuário permite push de uma categoria. Política opt-out: padrão
+ * PERMITIDO (prefs null ou coluna ausente liberam).
+ */
+function isCategoryAllowed(prefs, category) {
+  const column = CATEGORY_COLUMN[category];
+  if (!column) return true;
+  if (!prefs) return true;
+  return prefs[column] !== false;
+}
+
+// "HH:MM" -> minutos do dia (0..1439). null se inválido.
+function hhmmToMinutes(value) {
+  if (typeof value !== "string") return null;
+  const m = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+// Minutos do dia "agora" no fuso do usuário (default America/Sao_Paulo). null se erro.
+function nowMinutesInTz(timezone, now = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone || "America/Sao_Paulo",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(now);
+    const h = parseInt(parts.find((p) => p.type === "hour").value, 10) % 24;
+    const min = parseInt(parts.find((p) => p.type === "minute").value, 10);
+    return h * 60 + min;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Está dentro do horário silencioso do usuário? Suporta janela que cruza a
+ * meia-noite (ex.: 22:00–07:00). Default = false (não silencia) se desligado,
+ * inválido ou sem fuso.
+ */
+function isQuietNow(prefs, now = new Date()) {
+  if (!prefs || prefs.quiet_hours_enabled !== true) return false;
+  const start = hhmmToMinutes(prefs.quiet_start);
+  const end = hhmmToMinutes(prefs.quiet_end);
+  const cur = nowMinutesInTz(prefs.timezone, now);
+  if (start == null || end == null || cur == null || start === end) return false;
+  if (start < end) return cur >= start && cur < end;
+  return cur >= start || cur < end; // cruza meia-noite
 }
 
 /**
@@ -175,21 +230,25 @@ async function isCategoryAllowed(sql, userId, category) {
 async function notifySocialPush(sql, { recipientId, senderId, type, message, referenceId }) {
   try {
     if (!recipientId) return;
+    const prefs = await getNotificationPrefs(sql, recipientId);
     const category = categoryForType(type);
-    if (category && !(await isCategoryAllowed(sql, recipientId, category))) return;
+    if (category && !isCategoryAllowed(prefs, category)) return;
+    if (isQuietNow(prefs)) return;
 
-    const [sender] = await sql`SELECT username FROM usuarios WHERE id_us = ${senderId}`;
+    const [sender] = await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${senderId}`;
     const senderName = (sender && sender.username) || "MOVT";
 
     await sendPushToUser(sql, recipientId, {
       title: senderName,
       body: message,
       channelId: "social",
+      threadId: "social",
       data: {
         type,
         reference_id: referenceId != null ? String(referenceId) : null,
         senderId: String(senderId),
         senderName,
+        senderAvatar: (sender && sender.avatar_url) || null,
       },
     });
   } catch (err) {
@@ -197,4 +256,10 @@ async function notifySocialPush(sql, { recipientId, senderId, type, message, ref
   }
 }
 
-module.exports = { sendPushToUser, isCategoryAllowed, notifySocialPush };
+module.exports = {
+  sendPushToUser,
+  getNotificationPrefs,
+  isCategoryAllowed,
+  isQuietNow,
+  notifySocialPush,
+};

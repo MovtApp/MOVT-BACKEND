@@ -20,7 +20,13 @@ const {
   cnaePertenceAoCnpj,
   lookupCNPJ,
 } = require("./cnpj");
-const { sendPushToUser, isCategoryAllowed, notifySocialPush } = require("./services/pushService");
+const {
+  sendPushToUser,
+  getNotificationPrefs,
+  isCategoryAllowed,
+  isQuietNow,
+  notifySocialPush,
+} = require("./services/pushService");
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
 
@@ -2462,6 +2468,31 @@ app.get("/api/user/plan-status", verifyToken, async (req, res) => {
     const treinoReset = user.treino_week_reset ? new Date(user.treino_week_reset) : null;
     if (!treinoReset || treinoReset < startOfWeek) treinoCount = 0;
 
+    // Dietas/desafios viraram contagem MENSAL com teto por plano (free 2, premium 8,
+    // família ilimitado) — ver ADR-0013. Dados avançados (Batimentos/Sono/Ciclismo)
+    // são livres; só Expectativa × Realidade segue Premium.
+    const effectivePlan = hasFullAccess ? (user.plan || 'premium') : 'free';
+    const CAP = { free: 2, premium: 8, familia: null };
+    const dietasCap = CAP[effectivePlan] ?? null;
+    const desafiosCap = CAP[effectivePlan] ?? null;
+
+    const [{ count: dietasCount }] = await sql`
+      SELECT COUNT(*) as count FROM dietas
+      WHERE id_us = ${userId} AND createdat >= ${startOfMonth}
+    `;
+
+    // A tabela desafio_participacoes só existe após a migration 006 → tolera ausência.
+    let desafiosUsed = 0;
+    try {
+      const [{ count: dCount }] = await sql`
+        SELECT COUNT(*) as count FROM desafio_participacoes
+        WHERE id_us = ${userId} AND created_at >= ${startOfMonth}
+      `;
+      desafiosUsed = parseInt(dCount, 10);
+    } catch (e) {
+      // migration 006 ainda não aplicada — trata como 0.
+    }
+
     return res.status(200).json({
       plan: hasFullAccess ? (user.plan || 'premium') : 'free',
       plan_expires_at: user.plan_expires_at,
@@ -2470,9 +2501,9 @@ app.get("/api/user/plan-status", verifyToken, async (req, res) => {
         treinos: { used: treinoCount, limit: hasFullAccess ? null : 2 },
         agendamentos: { used: parseInt(apptCount, 10), limit: hasFullAccess ? null : 2 },
         comunidades: { used: communityJoins, limit: hasFullAccess ? null : 2 },
-        dietas: { canAccess: hasFullAccess },
-        desafios: { canAccess: hasFullAccess },
-        dadosAvancados: { canAccess: hasFullAccess },
+        dietas: { used: parseInt(dietasCount, 10), limit: dietasCap },
+        desafios: { used: desafiosUsed, limit: desafiosCap },
+        expectativaRealidade: { canAccess: hasFullAccess },
       }
     });
   } catch (err) {
@@ -5517,14 +5548,16 @@ app.get("/api/notifications/preferences", verifyToken, async (req, res) => {
   const userId = req.userId;
   try {
     let [prefs] = await sql`
-      SELECT push_chat, push_likes, push_comments, push_follows
+      SELECT push_chat, push_likes, push_comments, push_follows,
+             hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
       FROM notification_prefs WHERE user_id = ${userId}
     `;
     if (!prefs) {
       [prefs] = await sql`
         INSERT INTO notification_prefs (user_id) VALUES (${userId})
         ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
-        RETURNING push_chat, push_likes, push_comments, push_follows
+        RETURNING push_chat, push_likes, push_comments, push_follows,
+                  hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
       `;
     }
     return res.status(200).json({ success: true, data: prefs });
@@ -5538,28 +5571,45 @@ app.get("/api/notifications/preferences", verifyToken, async (req, res) => {
 app.put("/api/notifications/preferences", verifyToken, async (req, res) => {
   const userId = req.userId;
   const b = req.body || {};
-  const chat = typeof b.push_chat === "boolean" ? b.push_chat : null;
-  const likes = typeof b.push_likes === "boolean" ? b.push_likes : null;
-  const comments = typeof b.push_comments === "boolean" ? b.push_comments : null;
-  const follows = typeof b.push_follows === "boolean" ? b.push_follows : null;
+  const asBool = (v) => (typeof v === "boolean" ? v : null);
+  const asTime = (v) => (typeof v === "string" && /^\d{1,2}:\d{2}$/.test(v) ? v : null);
+  const asTz = (v) => (typeof v === "string" && v.length > 0 && v.length <= 64 ? v : null);
+
+  const chat = asBool(b.push_chat);
+  const likes = asBool(b.push_likes);
+  const comments = asBool(b.push_comments);
+  const follows = asBool(b.push_follows);
+  const hidePreview = asBool(b.hide_message_preview);
+  const quietEnabled = asBool(b.quiet_hours_enabled);
+  const quietStart = asTime(b.quiet_start);
+  const quietEnd = asTime(b.quiet_end);
+  const timezone = asTz(b.timezone);
+
   try {
     const [prefs] = await sql`
-      INSERT INTO notification_prefs (user_id, push_chat, push_likes, push_comments, push_follows, updated_at)
+      INSERT INTO notification_prefs (
+        user_id, push_chat, push_likes, push_comments, push_follows,
+        hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone, updated_at
+      )
       VALUES (
         ${userId},
-        ${chat ?? true},
-        ${likes ?? true},
-        ${comments ?? true},
-        ${follows ?? true},
+        ${chat ?? true}, ${likes ?? true}, ${comments ?? true}, ${follows ?? true},
+        ${hidePreview ?? false}, ${quietEnabled ?? false}, ${quietStart}, ${quietEnd}, ${timezone},
         NOW()
       )
       ON CONFLICT (user_id) DO UPDATE SET
-        push_chat     = COALESCE(${chat}, notification_prefs.push_chat),
-        push_likes    = COALESCE(${likes}, notification_prefs.push_likes),
-        push_comments = COALESCE(${comments}, notification_prefs.push_comments),
-        push_follows  = COALESCE(${follows}, notification_prefs.push_follows),
-        updated_at    = NOW()
-      RETURNING push_chat, push_likes, push_comments, push_follows
+        push_chat            = COALESCE(${chat}, notification_prefs.push_chat),
+        push_likes           = COALESCE(${likes}, notification_prefs.push_likes),
+        push_comments        = COALESCE(${comments}, notification_prefs.push_comments),
+        push_follows         = COALESCE(${follows}, notification_prefs.push_follows),
+        hide_message_preview = COALESCE(${hidePreview}, notification_prefs.hide_message_preview),
+        quiet_hours_enabled  = COALESCE(${quietEnabled}, notification_prefs.quiet_hours_enabled),
+        quiet_start          = COALESCE(${quietStart}, notification_prefs.quiet_start),
+        quiet_end            = COALESCE(${quietEnd}, notification_prefs.quiet_end),
+        timezone             = COALESCE(${timezone}, notification_prefs.timezone),
+        updated_at           = NOW()
+      RETURNING push_chat, push_likes, push_comments, push_follows,
+                hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
     `;
     return res.status(200).json({ success: true, data: prefs });
   } catch (err) {
@@ -6764,22 +6814,34 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
         chat.participant1_id === supabaseUserId ? chat.participant2_id : chat.participant1_id;
       const [recipient] =
         await sql`SELECT id_us FROM usuarios WHERE auth_user_id = ${recipientAuthId}`;
-      if (recipient && recipient.id_us && (await isCategoryAllowed(sql, recipient.id_us, "chat"))) {
-        const [sender] =
-          await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${userId}`;
-        const senderName = (sender && sender.username) || "Nova mensagem";
-        await sendPushToUser(sql, recipient.id_us, {
-          title: senderName,
-          body: text ? text : "enviou uma imagem",
-          channelId: "messages",
-          data: {
-            type: "chat",
-            chatId: String(id_chat),
-            senderId: String(userId),
-            senderName,
-            senderAvatar: (sender && sender.avatar_url) || null,
-          },
-        });
+      if (recipient && recipient.id_us) {
+        const prefs = await getNotificationPrefs(sql, recipient.id_us);
+        if (isCategoryAllowed(prefs, "chat") && !isQuietNow(prefs)) {
+          const [sender] =
+            await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${userId}`;
+          const senderName = (sender && sender.username) || "Nova mensagem";
+          // "Ocultar prévia da mensagem": mantém QUEM mandou no título, mas
+          // esconde o conteúdo no corpo (igual ao "hide preview" do WhatsApp).
+          const hidePreview = !!(prefs && prefs.hide_message_preview === true);
+          const body = hidePreview
+            ? "enviou uma mensagem"
+            : text
+              ? text
+              : "enviou uma imagem";
+          await sendPushToUser(sql, recipient.id_us, {
+            title: senderName,
+            body,
+            channelId: "messages",
+            threadId: "chat-" + String(id_chat),
+            data: {
+              type: "chat",
+              chatId: String(id_chat),
+              senderId: String(userId),
+              senderName,
+              senderAvatar: (sender && sender.avatar_url) || null,
+            },
+          });
+        }
       }
     } catch (pushErr) {
       console.error("Erro ao enviar push de chat:", pushErr?.message || pushErr);
