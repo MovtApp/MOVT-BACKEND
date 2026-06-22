@@ -20,6 +20,7 @@ const {
   cnaePertenceAoCnpj,
   lookupCNPJ,
 } = require("./cnpj");
+const { sendPushToUser } = require("./services/pushService");
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
 
@@ -982,6 +983,33 @@ function checkFreePlanLimit(feature) {
       // Premium OU família, sem expiração ou ainda válido → acesso total
       const hasFullAccess = (user.plan === 'premium' || user.plan === 'familia') &&
         (!user.plan_expires_at || new Date(user.plan_expires_at) > new Date());
+      // Plano efetivo (premium/família expirado conta como free).
+      const effectivePlan = hasFullAccess ? user.plan : 'free';
+
+      // DIETAS: limite MENSAL por plano (free 2, premium 8, família ilimitado).
+      // Roda ANTES do atalho de acesso total porque o premium agora tem teto.
+      if (feature === 'dietas') {
+        const DIETAS_LIMIT = { free: 2, premium: 8, familia: null };
+        const cap = DIETAS_LIMIT[effectivePlan];
+        if (cap === null || cap === undefined) return next(); // ilimitado (família)
+        const now = new Date();
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const [{ count }] = await sql`
+          SELECT COUNT(*) as count FROM dietas
+          WHERE id_us = ${userId} AND createdat >= ${startOfMonth}
+        `;
+        const used = parseInt(count, 10);
+        if (used >= cap) {
+          return res.status(403).json({
+            error: 'FREE_LIMIT_REACHED',
+            message: `Você atingiu o limite de ${cap} dietas por mês no seu plano.`,
+            feature: 'dietas',
+            used,
+            limit: cap,
+          });
+        }
+        return next();
+      }
 
       if (hasFullAccess) return next();
 
@@ -1021,15 +1049,6 @@ function checkFreePlanLimit(feature) {
           WHERE id_us = ${userId}
         `;
         return next();
-      }
-
-      // dietas: plano gratuito NÃO cria planos de dieta (exclusivo premium/família).
-      if (feature === 'dietas') {
-        return res.status(403).json({
-          error: 'PREMIUM_ONLY',
-          message: 'Os planos de dieta são exclusivos do plano Premium.',
-          feature: 'dietas',
-        });
       }
 
       if (feature === 'agendamentos') {
@@ -5431,6 +5450,47 @@ app.put("/api/notifications/:id/read", verifyToken, async (req, res) => {
   }
 });
 
+// ==================== PUSH TOKENS (notificações de SO) ==================== //
+
+// Registra/atualiza o Expo Push Token deste dispositivo. Idempotente por token:
+// se o mesmo device trocar de dono (re-login com outra conta), o token migra
+// para o novo usuário (ON CONFLICT). A tabela push_tokens é RLS deny-all
+// (migration 005) — só o backend escreve aqui.
+app.post("/api/notifications/register-token", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { token, platform } = req.body || {};
+  if (!token || typeof token !== "string") {
+    return res.status(400).json({ error: "token é obrigatório." });
+  }
+  try {
+    await sql`
+      INSERT INTO push_tokens (user_id, token, platform, updated_at)
+      VALUES (${userId}, ${token}, ${platform || null}, NOW())
+      ON CONFLICT (token) DO UPDATE
+        SET user_id = EXCLUDED.user_id,
+            platform = EXCLUDED.platform,
+            updated_at = NOW()
+    `;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro em POST /api/notifications/register-token", err);
+    return res.status(500).json({ error: "Erro ao registrar token de push." });
+  }
+});
+
+// Remove um token (logout neste device ou usuário desativou notificações).
+app.delete("/api/notifications/token", verifyToken, async (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: "token é obrigatório." });
+  try {
+    await sql`DELETE FROM push_tokens WHERE token = ${token}`;
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Erro em DELETE /api/notifications/token", err);
+    return res.status(500).json({ error: "Erro ao remover token de push." });
+  }
+});
+
 // Endpoint para gerar signed upload (placeholder quando não houver S3 direto)
 app.post("/api/uploads/sign", verifyToken, async (req, res) => {
   // Este endpoint pode ser implementado para S3/GCS, aqui oferecemos comportamento mínimo
@@ -6527,6 +6587,40 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
         WHERE id = ${id_chat}
       `;
     }
+
+    // Notificação de SO para o destinatário (fire-and-forget: não bloqueia a
+    // resposta e nunca derruba o envio da mensagem). O app do destinatário
+    // decide se exibe banner in-app (foreground) ou deixa o SO mostrar
+    // (background/tela bloqueada). Supressão de "chat aberto" é no cliente.
+    (async () => {
+      try {
+        const recipientAuthId =
+          chat.participant1_id === supabaseUserId
+            ? chat.participant2_id
+            : chat.participant1_id;
+        const [recipient] =
+          await sql`SELECT id_us FROM usuarios WHERE auth_user_id = ${recipientAuthId}`;
+        if (recipient && recipient.id_us) {
+          const [sender] =
+            await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${userId}`;
+          const senderName = (sender && sender.username) || "Nova mensagem";
+          await sendPushToUser(sql, recipient.id_us, {
+            title: senderName,
+            body: text ? text : "enviou uma imagem",
+            channelId: "messages",
+            data: {
+              type: "chat",
+              chatId: String(id_chat),
+              senderId: String(userId),
+              senderName,
+              senderAvatar: (sender && sender.avatar_url) || null,
+            },
+          });
+        }
+      } catch (pushErr) {
+        console.error("Erro ao enviar push de chat:", pushErr?.message || pushErr);
+      }
+    })();
 
     res.status(201).json({ data: newMessage });
   } catch (error) {
