@@ -1763,18 +1763,24 @@ app.post("/api/register", async (req, res) => {
     `;
 
     if (existingUser.length > 0) {
+      // `field` indica ao app qual input destacar ("email" ou "cpf_cnpj", que é
+      // o nome do campo no formulário de cadastro).
       if (existingUser[0].email === email) {
         return res
           .status(409)
-          .json({ error: "Este e-mail já está cadastrado." });
+          .json({ field: "email", error: "Este e-mail já está cadastrado." });
       } else if (existingUser[0].cpf === userCpf && userCpf !== null) {
-        return res.status(409).json({ error: "Este CPF já está cadastrado." });
+        return res
+          .status(409)
+          .json({ field: "cpf_cnpj", error: "Este CPF já está cadastrado." });
       } else if (existingUser[0].cnpj === userCnpj && userCnpj !== null) {
-        return res.status(409).json({ error: "Este CNPJ já está cadastrado." });
+        return res
+          .status(409)
+          .json({ field: "cpf_cnpj", error: "Este CNPJ já está cadastrado." });
       } else {
         return res
           .status(409)
-          .json({ error: "Erro de unicidade no banco de dados." });
+          .json({ field: "cpf_cnpj", error: "Erro de unicidade no banco de dados." });
       }
     }
 
@@ -1843,10 +1849,18 @@ app.post("/api/register", async (req, res) => {
       });
     }
 
+    // Rede de segurança contra corrida: dois cadastros simultâneos passam pelo
+    // SELECT acima e só colidem no índice único do banco (violation 23505).
+    // Identifica o campo pela constraint/detalhe para o app destacar o input.
     if (error.code === "23505") {
+      const detail = `${error.constraint || ""} ${error.detail || ""}`.toLowerCase();
+      const field = detail.includes("email") ? "email" : "cpf_cnpj";
       return res.status(409).json({
+        field,
         error:
-          "Erro de unicidade no banco de dados (e.g., email, CPF ou CNPJ).",
+          field === "email"
+            ? "Este e-mail já está cadastrado."
+            : "Este documento já está cadastrado.",
       });
     }
     res.status(500).json({
