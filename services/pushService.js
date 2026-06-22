@@ -107,4 +107,94 @@ async function sendPushToUser(sql, userId, { title, body, data, channelId, badge
   }
 }
 
-module.exports = { sendPushToUser };
+// ─── Preferências por categoria ──────────────────────────────────────────────
+
+// Mapeia o `type` da notificação (mesmo vocabulário da tabela `notifications`)
+// para a categoria de preferência do usuário.
+function categoryForType(type) {
+  switch (type) {
+    case "chat":
+      return "chat";
+    case "like":
+    case "like_diet":
+      return "likes";
+    case "comment":
+    case "comment_diet":
+      return "comments";
+    case "follow":
+    case "follow_request":
+    case "follow_accepted":
+      return "follows";
+    default:
+      return null;
+  }
+}
+
+const CATEGORY_COLUMN = {
+  chat: "push_chat",
+  likes: "push_likes",
+  comments: "push_comments",
+  follows: "push_follows",
+};
+
+/**
+ * Diz se o usuário permite push de uma categoria. Política opt-out: o padrão é
+ * PERMITIDO — sem linha de preferências, tabela ausente ou qualquer erro, libera
+ * (um problema de leitura nunca deve silenciar uma notificação legítima).
+ */
+async function isCategoryAllowed(sql, userId, category) {
+  const column = CATEGORY_COLUMN[category];
+  if (!column) return true;
+  try {
+    const rows = await sql`
+      SELECT ${sql(column)} AS allowed FROM notification_prefs WHERE user_id = ${userId}
+    `;
+    if (rows.length === 0) return true;
+    return rows[0].allowed !== false;
+  } catch (err) {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn("[pushService] isCategoryAllowed fallback (libera):", err?.message || err);
+    }
+    return true;
+  }
+}
+
+/**
+ * Push de notificação SOCIAL (curtida/comentário/seguidor). Resolve o nome de
+ * quem interagiu, respeita as preferências do destinatário e manda no canal
+ * 'social'. Silencioso por design (nunca lança).
+ *
+ * @param {object} sql
+ * @param {object} args
+ * @param {number} args.recipientId  id_us de quem recebe a notificação
+ * @param {number} args.senderId     id_us de quem interagiu
+ * @param {string} args.type         'like' | 'comment' | 'like_diet' | 'comment_diet' | 'follow_accepted' ...
+ * @param {string} args.message      texto pronto (ex.: 'curtiu sua publicação.')
+ * @param {number|string} [args.referenceId]  id do post/dieta para o deep-link
+ */
+async function notifySocialPush(sql, { recipientId, senderId, type, message, referenceId }) {
+  try {
+    if (!recipientId) return;
+    const category = categoryForType(type);
+    if (category && !(await isCategoryAllowed(sql, recipientId, category))) return;
+
+    const [sender] = await sql`SELECT username FROM usuarios WHERE id_us = ${senderId}`;
+    const senderName = (sender && sender.username) || "MOVT";
+
+    await sendPushToUser(sql, recipientId, {
+      title: senderName,
+      body: message,
+      channelId: "social",
+      data: {
+        type,
+        reference_id: referenceId != null ? String(referenceId) : null,
+        senderId: String(senderId),
+        senderName,
+      },
+    });
+  } catch (err) {
+    console.error("[pushService] notifySocialPush falhou:", err?.message || err);
+  }
+}
+
+module.exports = { sendPushToUser, isCategoryAllowed, notifySocialPush };

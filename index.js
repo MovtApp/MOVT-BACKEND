@@ -20,7 +20,7 @@ const {
   cnaePertenceAoCnpj,
   lookupCNPJ,
 } = require("./cnpj");
-const { sendPushToUser } = require("./services/pushService");
+const { sendPushToUser, isCategoryAllowed, notifySocialPush } = require("./services/pushService");
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
 
@@ -4648,6 +4648,12 @@ app.post("/api/user/follow-requests/:senderId/respond", verifyToken, async (req,
         INSERT INTO notifications (user_id, type, sender_id, message)
         VALUES (${senderId}, 'follow_accepted', ${userId}, 'aceitou sua solicitação de amizade.')
       `;
+      await notifySocialPush(sql, {
+        recipientId: senderId,
+        senderId: userId,
+        type: "follow_accepted",
+        message: "aceitou sua solicitação de amizade.",
+      });
 
       // Criar notificação para quem recebeu e aceitou a solicitação (User B)
       // Assim fica o registro em Atividade: "@UserA agora vocês se seguem"
@@ -5228,6 +5234,13 @@ app.post("/api/user/posts/:id/comment", verifyToken, async (req, res) => {
         INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
         VALUES (${post.id_us}, 'comment', ${userId}, ${parseInt(postId, 10)}, 'comentou na sua publicação.')
       `;
+      await notifySocialPush(sql, {
+        recipientId: post.id_us,
+        senderId: userId,
+        type: "comment",
+        message: "comentou na sua publicação.",
+        referenceId: parseInt(postId, 10),
+      });
     }
 
     return res.status(201).json({ success: true, data: newComment });
@@ -5264,6 +5277,13 @@ app.post("/api/user/posts/:id/like", verifyToken, async (req, res) => {
           INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
           VALUES (${post.id_us}, 'like', ${userId}, ${parseInt(postId, 10)}, 'curtiu sua publicação.')
         `;
+        await notifySocialPush(sql, {
+          recipientId: post.id_us,
+          senderId: userId,
+          type: "like",
+          message: "curtiu sua publicação.",
+          referenceId: parseInt(postId, 10),
+        });
       }
       
       return res.status(200).json({ success: true, isLiked: true });
@@ -5491,6 +5511,63 @@ app.delete("/api/notifications/token", verifyToken, async (req, res) => {
   }
 });
 
+// Preferências de notificação por categoria (opt-out: tudo ligado por padrão).
+// Cria a linha default na primeira leitura, para o app sempre receber 4 booleans.
+app.get("/api/notifications/preferences", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    let [prefs] = await sql`
+      SELECT push_chat, push_likes, push_comments, push_follows
+      FROM notification_prefs WHERE user_id = ${userId}
+    `;
+    if (!prefs) {
+      [prefs] = await sql`
+        INSERT INTO notification_prefs (user_id) VALUES (${userId})
+        ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
+        RETURNING push_chat, push_likes, push_comments, push_follows
+      `;
+    }
+    return res.status(200).json({ success: true, data: prefs });
+  } catch (err) {
+    console.error("Erro em GET /api/notifications/preferences", err);
+    return res.status(500).json({ error: "Erro ao buscar preferências." });
+  }
+});
+
+// Upsert parcial: só sobrescreve os campos enviados (COALESCE preserva o resto).
+app.put("/api/notifications/preferences", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const b = req.body || {};
+  const chat = typeof b.push_chat === "boolean" ? b.push_chat : null;
+  const likes = typeof b.push_likes === "boolean" ? b.push_likes : null;
+  const comments = typeof b.push_comments === "boolean" ? b.push_comments : null;
+  const follows = typeof b.push_follows === "boolean" ? b.push_follows : null;
+  try {
+    const [prefs] = await sql`
+      INSERT INTO notification_prefs (user_id, push_chat, push_likes, push_comments, push_follows, updated_at)
+      VALUES (
+        ${userId},
+        ${chat ?? true},
+        ${likes ?? true},
+        ${comments ?? true},
+        ${follows ?? true},
+        NOW()
+      )
+      ON CONFLICT (user_id) DO UPDATE SET
+        push_chat     = COALESCE(${chat}, notification_prefs.push_chat),
+        push_likes    = COALESCE(${likes}, notification_prefs.push_likes),
+        push_comments = COALESCE(${comments}, notification_prefs.push_comments),
+        push_follows  = COALESCE(${follows}, notification_prefs.push_follows),
+        updated_at    = NOW()
+      RETURNING push_chat, push_likes, push_comments, push_follows
+    `;
+    return res.status(200).json({ success: true, data: prefs });
+  } catch (err) {
+    console.error("Erro em PUT /api/notifications/preferences", err);
+    return res.status(500).json({ error: "Erro ao salvar preferências." });
+  }
+});
+
 // Endpoint para gerar signed upload (placeholder quando não houver S3 direto)
 app.post("/api/uploads/sign", verifyToken, async (req, res) => {
   // Este endpoint pode ser implementado para S3/GCS, aqui oferecemos comportamento mínimo
@@ -5500,6 +5577,80 @@ app.post("/api/uploads/sign", verifyToken, async (req, res) => {
   // Como fallback retornamos um suggested public path e instruções
   const suggestedKey = `${purpose || 'uploads'}/${uuidv4()}_${filename}`;
   return res.status(200).json({ uploadUrl: null, publicUrl: `supabase://${AVATAR_BUCKET}/${suggestedKey}`, message: "Presigned upload não implementado no servidor; faça upload via backend ou configure S3." });
+});
+
+// ----------------------------- DESAFIOS ----------------------------- //
+// Desafios = treinos com secao_home='desafio'. "Aceitar/participar" registra a
+// participação. Limite MENSAL por plano: free 2, premium 8, família ilimitado
+// (ver ADR-0013). Idempotente: reaceitar um desafio que já participa NÃO consome
+// novo slot. Tabela desafio_participacoes (RLS deny-all, acesso via service_role).
+app.post("/api/desafios/:id/participar", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const idDesafio = String(req.params.id || "").trim();
+  if (!idDesafio) return res.status(400).json({ error: "id do desafio é obrigatório." });
+  try {
+    // Já participa deste desafio? → idempotente, não conta no limite.
+    const [existing] = await sql`
+      SELECT 1 FROM desafio_participacoes
+      WHERE id_us = ${userId} AND id_desafio = ${idDesafio}
+    `;
+    if (existing) {
+      return res.status(200).json({ participando: true, alreadyParticipating: true });
+    }
+
+    // Plano efetivo (premium/família expirado conta como free).
+    const [user] = await sql`SELECT plan, plan_expires_at FROM usuarios WHERE id_us = ${userId}`;
+    const planValid = user && (user.plan === 'premium' || user.plan === 'familia') &&
+      (!user.plan_expires_at || new Date(user.plan_expires_at) > new Date());
+    const effectivePlan = planValid ? user.plan : 'free';
+    const DESAFIOS_LIMIT = { free: 2, premium: 8, familia: null };
+    const cap = DESAFIOS_LIMIT[effectivePlan];
+
+    if (cap !== null && cap !== undefined) {
+      const now = new Date();
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+      const [{ count }] = await sql`
+        SELECT COUNT(*) as count FROM desafio_participacoes
+        WHERE id_us = ${userId} AND created_at >= ${startOfMonth}
+      `;
+      const used = parseInt(count, 10);
+      if (used >= cap) {
+        return res.status(403).json({
+          error: 'FREE_LIMIT_REACHED',
+          message: `Você atingiu o limite de ${cap} desafios por mês no seu plano.`,
+          feature: 'desafios',
+          used,
+          limit: cap,
+        });
+      }
+    }
+
+    await sql`
+      INSERT INTO desafio_participacoes (id_us, id_desafio)
+      VALUES (${userId}, ${idDesafio})
+      ON CONFLICT (id_us, id_desafio) DO NOTHING
+    `;
+    return res.status(201).json({ participando: true });
+  } catch (err) {
+    console.error("Erro em POST /api/desafios/:id/participar", err);
+    return res.status(500).json({ error: "Erro ao participar do desafio." });
+  }
+});
+
+// Estado de participação do usuário num desafio (para a UI mostrar "Participando").
+app.get("/api/desafios/:id/participacao", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const idDesafio = String(req.params.id || "").trim();
+  try {
+    const [row] = await sql`
+      SELECT 1 FROM desafio_participacoes
+      WHERE id_us = ${userId} AND id_desafio = ${idDesafio}
+    `;
+    return res.status(200).json({ participando: !!row });
+  } catch (err) {
+    console.error("Erro em GET /api/desafios/:id/participacao", err);
+    return res.status(500).json({ error: "Erro ao consultar participação." });
+  }
 });
 
 // -------------------------------- DIETAS ---------------------------- //
@@ -5900,6 +6051,13 @@ app.post("/api/dietas/:id/like", verifyToken, async (req, res) => {
         INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
         VALUES (${dietaData.id_us}, 'like_diet', ${userId}, ${parseInt(id)}, 'curtiu sua dieta.')
       `;
+      await notifySocialPush(sql, {
+        recipientId: dietaData.id_us,
+        senderId: userId,
+        type: "like_diet",
+        message: "curtiu sua dieta.",
+        referenceId: parseInt(id),
+      });
       console.log(`[LIKE DIETA] Notificação enviada para autor ${dietaData.id_us}`);
     } else if (!isLiked && dietaData) {
       // Remove a notificação se descurtir
@@ -5978,6 +6136,13 @@ app.post("/api/dietas/:id/comment", verifyToken, async (req, res) => {
         INSERT INTO notifications (user_id, type, sender_id, reference_id, message)
         VALUES (${authorIdFromDb}, 'comment_diet', ${userId}, ${parseInt(id)}, 'comentou na sua dieta.')
       `;
+      await notifySocialPush(sql, {
+        recipientId: authorIdFromDb,
+        senderId: userId,
+        type: "comment_diet",
+        message: "comentou na sua dieta.",
+        referenceId: parseInt(id),
+      });
       console.log(`[POST COMMENT] Notificação enviada para autor ${authorIdFromDb}`);
     }
 
@@ -6588,39 +6753,37 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
       `;
     }
 
-    // Notificação de SO para o destinatário (fire-and-forget: não bloqueia a
-    // resposta e nunca derruba o envio da mensagem). O app do destinatário
-    // decide se exibe banner in-app (foreground) ou deixa o SO mostrar
-    // (background/tela bloqueada). Supressão de "chat aberto" é no cliente.
-    (async () => {
-      try {
-        const recipientAuthId =
-          chat.participant1_id === supabaseUserId
-            ? chat.participant2_id
-            : chat.participant1_id;
-        const [recipient] =
-          await sql`SELECT id_us FROM usuarios WHERE auth_user_id = ${recipientAuthId}`;
-        if (recipient && recipient.id_us) {
-          const [sender] =
-            await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${userId}`;
-          const senderName = (sender && sender.username) || "Nova mensagem";
-          await sendPushToUser(sql, recipient.id_us, {
-            title: senderName,
-            body: text ? text : "enviou uma imagem",
-            channelId: "messages",
-            data: {
-              type: "chat",
-              chatId: String(id_chat),
-              senderId: String(userId),
-              senderName,
-              senderAvatar: (sender && sender.avatar_url) || null,
-            },
-          });
-        }
-      } catch (pushErr) {
-        console.error("Erro ao enviar push de chat:", pushErr?.message || pushErr);
+    // Notificação de SO para o destinatário. AGUARDADA de propósito: no ambiente
+    // serverless da Vercel o processo congela após o res, então um push
+    // "fire-and-forget" não completaria. O helper trata o próprio erro e nunca
+    // lança, então isto não derruba o envio da mensagem. O app do destinatário
+    // decide entre banner in-app (foreground) ou notificação do SO
+    // (background/tela bloqueada); a supressão de "chat aberto" é no cliente.
+    try {
+      const recipientAuthId =
+        chat.participant1_id === supabaseUserId ? chat.participant2_id : chat.participant1_id;
+      const [recipient] =
+        await sql`SELECT id_us FROM usuarios WHERE auth_user_id = ${recipientAuthId}`;
+      if (recipient && recipient.id_us && (await isCategoryAllowed(sql, recipient.id_us, "chat"))) {
+        const [sender] =
+          await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${userId}`;
+        const senderName = (sender && sender.username) || "Nova mensagem";
+        await sendPushToUser(sql, recipient.id_us, {
+          title: senderName,
+          body: text ? text : "enviou uma imagem",
+          channelId: "messages",
+          data: {
+            type: "chat",
+            chatId: String(id_chat),
+            senderId: String(userId),
+            senderName,
+            senderAvatar: (sender && sender.avatar_url) || null,
+          },
+        });
       }
-    })();
+    } catch (pushErr) {
+      console.error("Erro ao enviar push de chat:", pushErr?.message || pushErr);
+    }
 
     res.status(201).json({ data: newMessage });
   } catch (error) {
