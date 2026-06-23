@@ -7934,20 +7934,23 @@ app.post("/api/dados/:metric", verifyToken, async (req, res) => {
   try {
     const recordTimestamp = timestamp ? new Date(timestamp) : new Date();
     // Usa a data enviada pelo cliente (já no fuso correto), ou calcula no fuso de São Paulo
-    const { date: clientDate } = req.body;
+    const { date: clientDate, clientId } = req.body;
     const dateStr = clientDate || recordTimestamp.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
 
-    // Simples INSERT para manter histórico de data e hora
+    // INSERT mantendo histórico. clientId (offline-first / syncQueue) deduplica
+    // reenvios: ON CONFLICT no índice parcial (id_us, client_id) evita linha
+    // duplicada. Sem clientId, mantém o comportamento antigo (sempre insere).
     const [record] = await sql`
-      INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, created_at)
-      VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, NOW())
+      INSERT INTO dados_saude (id_us, ${sql(column)}, timestamp, date, client_id, created_at)
+      VALUES (${userId}, ${numericValue}, ${recordTimestamp}, ${dateStr}, ${clientId || null}, NOW())
+      ON CONFLICT (id_us, client_id) WHERE client_id IS NOT NULL DO NOTHING
       RETURNING *;
     `;
 
-
+    // record indefinido = reenvio já gravado antes (conflito). Resposta idempotente.
     res.status(201).json({
-      message: "Dado de saúde salvo com sucesso.",
-      data: record,
+      message: record ? "Dado de saúde salvo com sucesso." : "Dado já sincronizado.",
+      data: record || null,
     });
 
   } catch (error) {
