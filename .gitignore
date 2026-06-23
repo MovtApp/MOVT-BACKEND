@@ -30,6 +30,9 @@ logs/
 
 # Vercel
 .vercel
+# Token de deploy local (conta dona) — NUNCA commitar
+.env.deploy
+.env.deploy.example
 
 # Testing
 coverage/
