@@ -4211,6 +4211,7 @@ app.post("/api/user/workouts", verifyToken, async (req, res) => {
     velocidadeMediaKmh,
     kcal,
     rota,
+    rotaSnapped,
     splits,
   } = req.body;
 
@@ -4225,7 +4226,7 @@ app.post("/api/user/workouts", verifyToken, async (req, res) => {
   try {
     const [workout] = await sql`
       INSERT INTO user_workouts
-        (id_us, client_id, tipo, data, duracao_seg, distancia_km, pace_medio, velocidade_media_kmh, kcal, rota, splits)
+        (id_us, client_id, tipo, data, duracao_seg, distancia_km, pace_medio, velocidade_media_kmh, kcal, rota, rota_snapped, splits)
       VALUES (
         ${userId},
         ${clientId || null},
@@ -4237,6 +4238,7 @@ app.post("/api/user/workouts", verifyToken, async (req, res) => {
         ${velocidadeMediaKmh ?? null},
         ${kcal ?? null},
         ${sql.json(Array.isArray(rota) ? rota : [])},
+        ${sql.json(Array.isArray(rotaSnapped) ? rotaSnapped : [])},
         ${sql.json(Array.isArray(splits) ? splits : [])}
       )
       ON CONFLICT (id_us, client_id) DO NOTHING
@@ -4273,6 +4275,34 @@ app.delete("/api/user/workouts/:id", verifyToken, async (req, res) => {
   } catch (error) {
     console.error("Erro ao remover treino:", error.message);
     res.status(500).json({ error: "Erro ao remover o treino." });
+  }
+});
+
+// POST: encaixa uma sequência de pontos GPS na malha viária real (map-matching
+// via Mapbox). Usado AO VIVO (janela incremental durante o treino) e no SAVE
+// (rota inteira). A chave da Mapbox fica só no servidor. Falha graciosa: em erro,
+// o cliente mantém a linha suavizada crua. A distância NÃO é alterada aqui.
+app.post("/api/route/snap", verifyToken, async (req, res) => {
+  const { points, kind } = req.body || {};
+  if (!Array.isArray(points) || points.length < 2) {
+    return res.status(400).json({ error: "Pontos insuficientes para o map-matching." });
+  }
+  // Teto defensivo de tamanho (custo/latência por requisição).
+  if (points.length > 1500) {
+    return res.status(400).json({ error: "Rota muito grande para uma requisição." });
+  }
+  try {
+    const { snapRoute } = require("./services/mapMatchingService");
+    const result = await snapRoute(points, kind === "Ciclismo" ? "Ciclismo" : "Corrida");
+    return res.status(200).json({
+      ok: true,
+      snapped: result.snapped,
+      confidence: result.confidence,
+    });
+  } catch (error) {
+    console.error("Erro no map-matching:", error.message);
+    // 502: falha do serviço externo. O cliente trata como "sem snap" e segue.
+    return res.status(502).json({ ok: false, error: "Falha no serviço de map-matching." });
   }
 });
 
