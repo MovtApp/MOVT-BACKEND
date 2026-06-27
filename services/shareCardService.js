@@ -141,9 +141,10 @@ function buildMapUrl(points, routeColor, mapW, mapH) {
   const end = points[points.length - 1];
   const fix = (n) => n.toFixed(5);
 
+  // Pinos grandes e rotulados p/ identificar largada (A, verde) e chegada (B, vermelho).
   const pathLayer = `path-6+${routeColor}-1(${encodeURIComponent(poly)})`;
-  const startPin = `pin-s+10b981(${fix(start.longitude)},${fix(start.latitude)})`;
-  const endPin = `pin-s+1e293b(${fix(end.longitude)},${fix(end.latitude)})`;
+  const startPin = `pin-l-a+16a34a(${fix(start.longitude)},${fix(start.latitude)})`;
+  const endPin = `pin-l-b+ef4444(${fix(end.longitude)},${fix(end.latitude)})`;
   const overlay = `${pathLayer},${startPin},${endPin}`;
 
   // padding: topo,direita,baixo,esquerda — folga maior embaixo p/ a faixa de stats.
