@@ -52,6 +52,10 @@ const supabase = supabaseUrl && supabaseServiceKey
 
 // Bucket de avatares no Supabase Storage
 const AVATAR_BUCKET = process.env.SUPABASE_AVATAR_BUCKET || "avatars";
+// Bucket das imagens de post (mesmo usado pelo feed). O upload do card de treino
+// é feito pelo SERVIDOR (service_role) porque a RLS do Storage barra uploads
+// client-side de usuários sem sessão Supabase (login por e-mail/senha).
+const POST_BUCKET = process.env.SUPABASE_POST_BUCKET || "diet-images";
 
 const sql = postgres(databaseUrl, {
   ssl: {
@@ -4399,6 +4403,26 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
       stats: sanitizeStats(stats),
       format: safeFormat,
     });
+
+    // Modo publicar no feed: sobe a imagem pelo servidor (service_role contorna a
+    // RLS do Storage) e devolve a URL pública, em vez do base64. O app passa essa
+    // URL direto pro POST /user/posts (sem upload client-side, que era barrado).
+    if (req.body?.upload) {
+      if (!supabase) {
+        return res.status(500).json({ ok: false, error: "Storage indisponível no servidor." });
+      }
+      const path = `workout-cards/${req.userId}/${Date.now()}.png`;
+      const { error: upErr } = await supabase.storage
+        .from(POST_BUCKET)
+        .upload(path, png, { contentType: "image/png", upsert: true });
+      if (upErr) {
+        console.error("Erro ao subir card pro storage:", upErr.message);
+        return res.status(502).json({ ok: false, error: "Falha ao salvar a imagem do treino." });
+      }
+      const url = supabase.storage.from(POST_BUCKET).getPublicUrl(path).data.publicUrl;
+      return res.status(200).json({ ok: true, url });
+    }
+
     return res.status(200).json({ ok: true, image: png.toString("base64") });
   } catch (error) {
     console.error("Erro ao gerar share-card:", error.message);
