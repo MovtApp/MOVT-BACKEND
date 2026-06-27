@@ -24,8 +24,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { Resvg } = require("@resvg/resvg-js");
-// Fonte embutida em base64 (require → o bundler do Vercel sempre inclui).
+// Fonte e logo embutidos em base64 (require → o bundler do Vercel sempre inclui).
 const OSWALD_BASE64 = require("./oswaldFontBase64");
+const LOGO_BASE64 = require("./logoBase64");
 
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
 
@@ -67,6 +68,40 @@ const FONT_FILE = (() => {
     return null;
   }
 })();
+
+// Logo MOVT (lime, transparente). Compomos com sharp (não no SVG) — confiável no
+// Linux do Vercel. Posicionado onde ficava o texto "MOVT" em cada layout.
+const LOGO_BUFFER = (() => {
+  try {
+    const b = Buffer.from(LOGO_BASE64, "base64");
+    return b.length > 0 ? b : null;
+  } catch {
+    return null;
+  }
+})();
+const LOGO_RATIO = 386 / 75; // proporção do logo (largura/altura)
+// Por layout: altura do logo + onde sua borda direita e centro vertical ficam.
+const LOGO_PLACEMENT = {
+  classic: { h: 46, rightX: OUT_W - 64, centerY: 1090 },
+  overlay: { h: 40, rightX: 44 + (OUT_W - 88) - 40, centerY: 1052 },
+  minimal: { h: 42, rightX: OUT_W - 64, centerY: 1100 },
+};
+const logoCache = {};
+
+/** Camada (composite) do logo para um layout: redimensiona e posiciona à direita. */
+async function logoLayerFor(layout) {
+  if (!LOGO_BUFFER) return null;
+  const place = LOGO_PLACEMENT[layout] || LOGO_PLACEMENT.classic;
+  if (!logoCache[layout]) {
+    logoCache[layout] = await sharp(LOGO_BUFFER).resize({ height: place.h }).png().toBuffer();
+  }
+  const w = Math.round(place.h * LOGO_RATIO);
+  return {
+    input: logoCache[layout],
+    top: Math.round(place.centerY - place.h / 2),
+    left: place.rightX - w,
+  };
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────────
 
@@ -175,7 +210,6 @@ function overlayClassic({ title, subtitle, stats, accent }) {
       `<rect x="64" y="1038" width="54" height="6" rx="3" fill="${accent}"/>` +
       `<text x="64" y="1108" font-family="Oswald" font-weight="700" font-size="58" letter-spacing="3" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
       `<text x="64" y="1150" font-family="Oswald" font-weight="400" font-size="31" fill="#CBD5E1">${esc(subtitle)}</text>` +
-      `<text x="${OUT_W - 64}" y="1108" text-anchor="end" font-family="Oswald" font-weight="700" font-size="44" letter-spacing="4" fill="${accent}">MOVT</text>` +
       tilesSvg
   );
 }
@@ -205,7 +239,6 @@ function overlayCard({ title, subtitle, stats, accent }) {
       `<rect x="${inX}" y="1006" width="50" height="6" rx="3" fill="${accent}"/>` +
       `<text x="${inX}" y="1068" font-family="Oswald" font-weight="700" font-size="50" letter-spacing="2" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
       `<text x="${inX}" y="1106" font-family="Oswald" font-weight="400" font-size="28" fill="#CBD5E1">${esc(subtitle)}</text>` +
-      `<text x="${cardX + cardW - 40}" y="1068" text-anchor="end" font-family="Oswald" font-weight="700" font-size="38" letter-spacing="3" fill="${accent}">MOVT</text>` +
       tilesSvg
   );
 }
@@ -222,8 +255,7 @@ function overlayMinimal({ title, subtitle, stats, accent }) {
       `<text x="64" y="1118" font-family="Oswald" font-weight="500" font-size="32" letter-spacing="2" fill="${accent}">${eyebrow}</text>` +
       `<text x="60" y="1248" font-family="Oswald" font-weight="700" font-size="150" fill="#FFFFFF">${esc(hero.value)}` +
       `<tspan font-size="50" letter-spacing="2" fill="${accent}" dx="16">${esc(String(hero.label).toUpperCase())}</tspan></text>` +
-      `<text x="64" y="1306" font-family="Oswald" font-weight="400" font-size="38" fill="#CBD5E1">${summary}</text>` +
-      `<text x="${OUT_W - 64}" y="1118" text-anchor="end" font-family="Oswald" font-weight="700" font-size="40" letter-spacing="3" fill="${accent}">MOVT</text>`
+      `<text x="64" y="1306" font-family="Oswald" font-weight="400" font-size="38" fill="#CBD5E1">${summary}</text>`
   );
 }
 
@@ -263,15 +295,15 @@ async function fetchRouteMap({ route, type }) {
   return { mapBuffer: Buffer.from(resp.data), accentHex };
 }
 
-/** Compõe UM card (overlay sobre o mapa já baixado). */
-function composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }) {
+/** Compõe UM card (overlay + logo sobre o mapa já baixado). */
+async function composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }) {
   const overlayPng = renderOverlayPng(
     buildOverlaySvg({ layout, title, subtitle, stats, accent: `#${accentHex}` })
   );
-  return sharp(mapBuffer)
-    .composite([{ input: overlayPng, top: 0, left: 0 }])
-    .png()
-    .toBuffer();
+  const composites = [{ input: overlayPng, top: 0, left: 0 }];
+  const logo = await logoLayerFor(layout);
+  if (logo) composites.push(logo);
+  return sharp(mapBuffer).composite(composites).png().toBuffer();
 }
 
 // ─── API pública ─────────────────────────────────────────────────────────────────
