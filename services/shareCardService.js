@@ -20,6 +20,9 @@
  */
 const axios = require("axios");
 const sharp = require("sharp");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const { Resvg } = require("@resvg/resvg-js");
 // Fonte embutida em base64 (require → o bundler do Vercel sempre inclui).
 const OSWALD_BASE64 = require("./oswaldFontBase64");
@@ -46,6 +49,21 @@ const FONT_BUFFER = (() => {
     return buf.length > 0 ? buf : null;
   } catch {
     console.warn("[shareCard] fonte Oswald indisponível — usando fontes do sistema.");
+    return null;
+  }
+})();
+
+// IMPORTANTE: o @resvg/resvg-js no Linux do Vercel IGNORA `fontBuffers` (texto não
+// renderiza), mas respeita `fontFiles` (caminho). Então escrevemos a fonte em /tmp
+// uma vez e usamos o caminho. (Confirmado por sonda em produção.)
+const FONT_FILE = (() => {
+  if (!FONT_BUFFER) return null;
+  try {
+    const p = path.join(os.tmpdir(), "movt-oswald.ttf");
+    if (!fs.existsSync(p)) fs.writeFileSync(p, FONT_BUFFER);
+    return p;
+  } catch (e) {
+    console.warn("[shareCard] não consegui gravar a fonte em tmp:", e.message);
     return null;
   }
 })();
@@ -221,8 +239,8 @@ function buildOverlaySvg({ layout, title, subtitle, stats, accent }) {
 function renderOverlayPng(svg) {
   const resvg = new Resvg(svg, {
     background: "rgba(0,0,0,0)",
-    font: FONT_BUFFER
-      ? { fontBuffers: [FONT_BUFFER], defaultFontFamily: "Oswald", loadSystemFonts: false }
+    font: FONT_FILE
+      ? { fontFiles: [FONT_FILE], defaultFontFamily: "Oswald", loadSystemFonts: false }
       : { loadSystemFonts: true },
   });
   return resvg.render().asPng();
