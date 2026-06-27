@@ -4311,7 +4311,7 @@ app.post("/api/route/snap", verifyToken, async (req, res) => {
 // "queimados" na imagem. O app baixa o PNG (base64) e abre o menu nativo de
 // compartilhamento. A chave da Mapbox fica só no servidor.
 app.post("/api/route/share-card", verifyToken, async (req, res) => {
-  const { route, type, title, subtitle, stats, layout } = req.body || {};
+  const { route, type, title, subtitle, stats, layout, variants } = req.body || {};
   if (!Array.isArray(route) || route.length < 2) {
     return res.status(400).json({ error: "Rota insuficiente para gerar o card." });
   }
@@ -4319,22 +4319,45 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
     return res.status(400).json({ error: "Rota muito grande para uma requisição." });
   }
   try {
-    const { buildShareCard } = require("./services/shareCardService");
+    const { buildShareCard, buildShareCards } = require("./services/shareCardService");
     const kind = type === "Ciclismo" ? "Ciclismo" : "Corrida";
     const allowedLayouts = ["classic", "overlay", "minimal"];
-    // Sanitiza os textos (vão "queimados" na imagem): limita tamanho e tipo.
+    const safeTitle =
+      typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind;
+    const safeSubtitle = typeof subtitle === "string" ? subtitle.slice(0, 60) : "";
+    // Sanitiza um array de stats (textos "queimados" na imagem).
+    const sanitizeStats = (arr) =>
+      Array.isArray(arr)
+        ? arr.slice(0, 4).map((s) => ({
+            label: String(s?.label ?? "").slice(0, 16),
+            value: String(s?.value ?? "").slice(0, 16),
+          }))
+        : [];
+
+    // Modo carrossel: várias variantes (layout + stats) num único request.
+    if (Array.isArray(variants) && variants.length > 0) {
+      const safeVariants = variants.slice(0, 6).map((v) => ({
+        layout: allowedLayouts.includes(v?.layout) ? v.layout : "classic",
+        stats: sanitizeStats(v?.stats),
+      }));
+      const pngs = await buildShareCards({
+        route,
+        type: kind,
+        title: safeTitle,
+        subtitle: safeSubtitle,
+        variants: safeVariants,
+      });
+      return res.status(200).json({ ok: true, images: pngs.map((p) => p.toString("base64")) });
+    }
+
+    // Modo único (retrocompatível).
     const png = await buildShareCard({
       route,
       type: kind,
       layout: allowedLayouts.includes(layout) ? layout : "classic",
-      title: typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind,
-      subtitle: typeof subtitle === "string" ? subtitle.slice(0, 60) : "",
-      stats: Array.isArray(stats)
-        ? stats.slice(0, 4).map((s) => ({
-            label: String(s?.label ?? "").slice(0, 16),
-            value: String(s?.value ?? "").slice(0, 16),
-          }))
-        : [],
+      title: safeTitle,
+      subtitle: safeSubtitle,
+      stats: sanitizeStats(stats),
     });
     return res.status(200).json({ ok: true, image: png.toString("base64") });
   } catch (error) {

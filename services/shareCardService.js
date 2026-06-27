@@ -227,20 +227,10 @@ function renderOverlayPng(svg) {
   return resvg.render().asPng();
 }
 
-// ─── API pública ─────────────────────────────────────────────────────────────────
+// ─── Núcleo: baixa o mapa uma vez, compõe cada card ──────────────────────────────
 
-/**
- * Gera o PNG do card de compartilhamento.
- * @param {Object} input
- * @param {Array<{latitude:number,longitude:number}>} input.route
- * @param {"Corrida"|"Ciclismo"} input.type
- * @param {string} input.title
- * @param {string} input.subtitle
- * @param {Array<{label:string,value:string}>} input.stats
- * @param {"classic"|"overlay"|"minimal"} [input.layout]
- * @returns {Promise<Buffer>} PNG
- */
-async function buildShareCard({ route, type, title, subtitle, stats, layout }) {
+/** Baixa o mapa da Mapbox (com a rota) uma única vez. Retorna o buffer + accent. */
+async function fetchRouteMap({ route, type }) {
   if (!MAPBOX_TOKEN) throw new Error("MAPBOX_TOKEN ausente no ambiente.");
 
   const clean = (Array.isArray(route) ? route : []).filter(isValidPoint);
@@ -251,16 +241,55 @@ async function buildShareCard({ route, type, title, subtitle, stats, layout }) {
 
   const url = buildMapUrl(points, accentHex);
   const resp = await axios.get(url, { responseType: "arraybuffer", timeout: 12000 });
-  const mapBuffer = Buffer.from(resp.data);
+  return { mapBuffer: Buffer.from(resp.data), accentHex };
+}
 
+/** Compõe UM card (overlay sobre o mapa já baixado). */
+function composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }) {
   const overlayPng = renderOverlayPng(
     buildOverlaySvg({ layout, title, subtitle, stats, accent: `#${accentHex}` })
   );
-
   return sharp(mapBuffer)
     .composite([{ input: overlayPng, top: 0, left: 0 }])
     .png()
     .toBuffer();
 }
 
-module.exports = { buildShareCard };
+// ─── API pública ─────────────────────────────────────────────────────────────────
+
+/**
+ * Gera UM PNG do card de compartilhamento.
+ * @returns {Promise<Buffer>} PNG
+ */
+async function buildShareCard({ route, type, title, subtitle, stats, layout }) {
+  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type });
+  return composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats });
+}
+
+/**
+ * Gera VÁRIOS cards de uma vez (carrossel): baixa o mapa só uma vez e compõe
+ * cada variante (layout + stats) sobre ele. title/subtitle são comuns.
+ * @param {Object} input
+ * @param {Array<{latitude:number,longitude:number}>} input.route
+ * @param {"Corrida"|"Ciclismo"} input.type
+ * @param {string} input.title
+ * @param {string} input.subtitle
+ * @param {Array<{layout?:string, stats:Array<{label:string,value:string}>}>} input.variants
+ * @returns {Promise<Buffer[]>} PNGs na mesma ordem das variantes
+ */
+async function buildShareCards({ route, type, title, subtitle, variants }) {
+  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type });
+  const list = Array.isArray(variants) ? variants : [];
+  return Promise.all(
+    list.map((v) =>
+      composeCard(mapBuffer, accentHex, {
+        layout: v.layout,
+        title,
+        subtitle,
+        stats: v.stats,
+      })
+    )
+  );
+}
+
+module.exports = { buildShareCard, buildShareCards };
