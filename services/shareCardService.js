@@ -20,9 +20,9 @@
  */
 const axios = require("axios");
 const sharp = require("sharp");
-const fs = require("fs");
-const path = require("path");
 const { Resvg } = require("@resvg/resvg-js");
+// Fonte embutida em base64 (require → o bundler do Vercel sempre inclui).
+const OSWALD_BASE64 = require("./oswaldFontBase64");
 
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
 
@@ -37,14 +37,15 @@ const MAP_H = OUT_H / 2; // 675
 // no zoom do card esse nível de detalhe é mais que suficiente).
 const MAX_PATH_POINTS = 280;
 
-// Fonte empacotada (carregada uma vez). Se faltar, o resvg cai nas fontes do
-// sistema — pode mudar o visual, mas não quebra a geração.
-const FONT_PATH = path.join(__dirname, "..", "assets", "fonts", "Oswald.ttf");
+// Fonte empacotada (decodificada uma vez). Vem de um módulo base64 para o
+// bundler do Vercel garantir que a fonte vá no pacote da função serverless —
+// um fs.readFileSync do .ttf NÃO é incluído pelo bundler (texto sumia em prod).
 const FONT_BUFFER = (() => {
   try {
-    return fs.readFileSync(FONT_PATH);
+    const buf = Buffer.from(OSWALD_BASE64, "base64");
+    return buf.length > 0 ? buf : null;
   } catch {
-    console.warn("[shareCard] Oswald.ttf ausente — usando fontes do sistema.");
+    console.warn("[shareCard] fonte Oswald indisponível — usando fontes do sistema.");
     return null;
   }
 })();
