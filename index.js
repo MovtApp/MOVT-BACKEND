@@ -4311,7 +4311,7 @@ app.post("/api/route/snap", verifyToken, async (req, res) => {
 // "queimados" na imagem. O app baixa o PNG (base64) e abre o menu nativo de
 // compartilhamento. A chave da Mapbox fica só no servidor.
 app.post("/api/route/share-card", verifyToken, async (req, res) => {
-  const { route, type, title, subtitle, stats, layout, variants } = req.body || {};
+  const { route, type, title, subtitle, stats, layout, variants, format } = req.body || {};
   if (!Array.isArray(route) || route.length < 2) {
     return res.status(400).json({ error: "Rota insuficiente para gerar o card." });
   }
@@ -4321,6 +4321,7 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
   try {
     const { buildShareCard, buildShareCards } = require("./services/shareCardService");
     const kind = type === "Ciclismo" ? "Ciclismo" : "Corrida";
+    const safeFormat = format === "stories" ? "stories" : "feed";
     const allowedLayouts = ["classic", "overlay", "minimal"];
     const safeTitle =
       typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind;
@@ -4346,6 +4347,7 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
         title: safeTitle,
         subtitle: safeSubtitle,
         variants: safeVariants,
+        format: safeFormat,
       });
       return res.status(200).json({ ok: true, images: pngs.map((p) => p.toString("base64")) });
     }
@@ -4358,6 +4360,7 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
       title: safeTitle,
       subtitle: safeSubtitle,
       stats: sanitizeStats(stats),
+      format: safeFormat,
     });
     return res.status(200).json({ ok: true, image: png.toString("base64") });
   } catch (error) {

@@ -1,22 +1,15 @@
 /**
  * shareCardService — gera um CARD compartilhável (estilo Strava) de um treino de
  * corrida/ciclismo: o mapa real (Mapbox Static Images) com a rota desenhada por
- * cima + os números do treino e a marca MOVT "queimados" na imagem.
+ * cima + os números do treino e o logo MOVT "queimados" na imagem.
  *
- * POR QUE NO BACKEND: a chave da Mapbox (MAPBOX_TOKEN) vive só aqui, e gerar a
- * imagem no servidor evita um rebuild nativo do app (nada de capturar o MapView,
- * que sai preto no Android). O app só baixa o PNG pronto e abre o menu nativo de
- * compartilhamento (Instagram, WhatsApp, etc.).
+ * FORMATOS: `feed` (1080x1350, 4:5) e `stories` (1080x1920, 9:16). A largura é
+ * fixa; a faixa de stats fica ancorada na BASE (y = H - offset), então o mesmo
+ * layout serve para os dois formatos — no stories o mapa só ocupa mais altura.
  *
- * PIPELINE: rota → (downsample p/ caber na URL) → polyline codificada → URL da
- * Mapbox Static Images (path + pins) → baixa o PNG do mapa → renderiza um overlay
- * SVG (gradiente + título + data + 4 métricas + "MOVT") e compõe sobre o mapa.
- *
- * TEXTO/FONTE: usamos @resvg/resvg-js passando o BUFFER da fonte Oswald
- * (assets/fonts/Oswald.ttf) direto no render. É determinístico e idêntico em
- * Windows (dev) e Linux (Vercel) — ao contrário do fontconfig do librsvg do
- * sharp, que ignora fontes fora do sistema e cai em fallback. O sharp entra só
- * na composição final (imagem sobre imagem, sem texto).
+ * TEXTO/FONTE: @resvg/resvg-js. ⚠️ No Linux do Vercel o resvg IGNORA `fontBuffers`
+ * (texto não renderiza) mas respeita `fontFiles` → gravamos a fonte (do módulo
+ * base64) em /tmp e passamos o caminho. O sharp compõe overlay + logo sobre o mapa.
  */
 const axios = require("axios");
 const sharp = require("sharp");
@@ -30,33 +23,28 @@ const LOGO_BASE64 = require("./logoBase64");
 
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
 
-// Saída final (retrato 4:5 — bom para feed e stories). O Mapbox renderiza em
-// metade da dimensão com @2x (540x675 @2x = 1080x1350).
-const OUT_W = 1080;
-const OUT_H = 1350;
-const MAP_W = OUT_W / 2; // 540 — dentro do teto de 1280 da Static Images API
-const MAP_H = OUT_H / 2; // 675
+const OUT_W = 1080; // largura fixa
+const FEED_H = 1350; // 4:5
+const STORIES_H = 1920; // 9:16
 
-// Teto de pontos enviados à Static Images API (a URL tem limite de tamanho;
-// no zoom do card esse nível de detalhe é mais que suficiente).
+/** Dimensões por formato. O Mapbox renderiza em metade (@2x dobra). */
+function dimsFor(format) {
+  const H = format === "stories" ? STORIES_H : FEED_H;
+  return { W: OUT_W, H, mapW: OUT_W / 2, mapH: Math.round(H / 2) };
+}
+
+// Teto de pontos enviados à Static Images API (limite de tamanho da URL).
 const MAX_PATH_POINTS = 280;
 
-// Fonte empacotada (decodificada uma vez). Vem de um módulo base64 para o
-// bundler do Vercel garantir que a fonte vá no pacote da função serverless —
-// um fs.readFileSync do .ttf NÃO é incluído pelo bundler (texto sumia em prod).
+// Fonte empacotada (base64 → /tmp → fontFiles, ver nota no topo).
 const FONT_BUFFER = (() => {
   try {
     const buf = Buffer.from(OSWALD_BASE64, "base64");
     return buf.length > 0 ? buf : null;
   } catch {
-    console.warn("[shareCard] fonte Oswald indisponível — usando fontes do sistema.");
     return null;
   }
 })();
-
-// IMPORTANTE: o @resvg/resvg-js no Linux do Vercel IGNORA `fontBuffers` (texto não
-// renderiza), mas respeita `fontFiles` (caminho). Então escrevemos a fonte em /tmp
-// uma vez e usamos o caminho. (Confirmado por sonda em produção.)
 const FONT_FILE = (() => {
   if (!FONT_BUFFER) return null;
   try {
@@ -69,8 +57,7 @@ const FONT_FILE = (() => {
   }
 })();
 
-// Logo MOVT (lime, transparente). Compomos com sharp (não no SVG) — confiável no
-// Linux do Vercel. Posicionado onde ficava o texto "MOVT" em cada layout.
+// Logo MOVT (lime, transparente), composto com sharp no lugar do antigo texto.
 const LOGO_BUFFER = (() => {
   try {
     const b = Buffer.from(LOGO_BASE64, "base64");
@@ -79,17 +66,18 @@ const LOGO_BUFFER = (() => {
     return null;
   }
 })();
-const LOGO_RATIO = 386 / 75; // proporção do logo (largura/altura)
-// Por layout: altura do logo + onde sua borda direita e centro vertical ficam.
+const LOGO_RATIO = 386 / 75; // largura/altura
+// Por layout: altura do logo + borda direita + offset do centro vertical A PARTIR
+// DA BASE (centerY = H - centerBot).
 const LOGO_PLACEMENT = {
-  classic: { h: 46, rightX: OUT_W - 64, centerY: 1090 },
-  overlay: { h: 40, rightX: 44 + (OUT_W - 88) - 40, centerY: 1052 },
-  minimal: { h: 42, rightX: OUT_W - 64, centerY: 1100 },
+  classic: { h: 46, rightX: OUT_W - 64, centerBot: 260 },
+  overlay: { h: 40, rightX: 44 + (OUT_W - 88) - 40, centerBot: 298 },
+  minimal: { h: 42, rightX: OUT_W - 64, centerBot: 250 },
 };
 const logoCache = {};
 
-/** Camada (composite) do logo para um layout: redimensiona e posiciona à direita. */
-async function logoLayerFor(layout) {
+/** Camada (composite) do logo: redimensiona (cache por layout) e posiciona. */
+async function logoLayerFor(layout, H) {
   if (!LOGO_BUFFER) return null;
   const place = LOGO_PLACEMENT[layout] || LOGO_PLACEMENT.classic;
   if (!logoCache[layout]) {
@@ -98,7 +86,7 @@ async function logoLayerFor(layout) {
   const w = Math.round(place.h * LOGO_RATIO);
   return {
     input: logoCache[layout],
-    top: Math.round(place.centerY - place.h / 2),
+    top: Math.round(H - place.centerBot - place.h / 2),
     left: place.rightX - w,
   };
 }
@@ -121,11 +109,7 @@ function downsample(points, max) {
   return out;
 }
 
-/**
- * Codifica uma lista de pontos no formato "encoded polyline" (precisão 1e5),
- * o mesmo que a Mapbox aceita no overlay `path(...)`. Evita uma dependência só
- * para isto.
- */
+/** Codifica pontos no formato "encoded polyline" (precisão 1e5) p/ a Mapbox. */
 function encodePolyline(points) {
   let lastLat = 0;
   let lastLng = 0;
@@ -150,8 +134,8 @@ function encodePolyline(points) {
   return result;
 }
 
-/** Monta a URL da Mapbox Static Images com a rota (path) e pins de início/fim. */
-function buildMapUrl(points, routeColor) {
+/** URL da Mapbox Static Images com a rota (path) e pins, no tamanho do formato. */
+function buildMapUrl(points, routeColor, mapW, mapH) {
   const poly = encodePolyline(points);
   const start = points[0];
   const end = points[points.length - 1];
@@ -165,7 +149,7 @@ function buildMapUrl(points, routeColor) {
   // padding: topo,direita,baixo,esquerda — folga maior embaixo p/ a faixa de stats.
   return (
     `https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/${overlay}` +
-    `/auto/${MAP_W}x${MAP_H}@2x?padding=70,55,250,55&access_token=${MAPBOX_TOKEN}`
+    `/auto/${mapW}x${mapH}@2x?padding=70,55,250,55&access_token=${MAPBOX_TOKEN}`
   );
 }
 
@@ -187,84 +171,93 @@ const SCRIM_DEFS =
   `</linearGradient>` +
   `</defs>`;
 
-const svgWrap = (inner) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" width="${OUT_W}" height="${OUT_H}">${inner}</svg>`;
+const svgWrap = (inner, W, H) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${inner}</svg>`;
 
-/** Layout "classic": faixa inferior com título/data + 4 métricas + marca. */
-function overlayClassic({ title, subtitle, stats, accent }) {
+// As posições verticais são offsets A PARTIR DA BASE (y = H - off), p/ servir tanto
+// ao feed (H=1350) quanto ao stories (H=1920) com a faixa colada embaixo.
+
+/** Layout "classic": faixa inferior com título/data + métricas. */
+function overlayClassic({ title, subtitle, stats, accent }, W, H) {
   const padX = 64;
   const tiles = stats.slice(0, 4);
-  const colW = tiles.length > 0 ? (OUT_W - padX * 2) / tiles.length : 0;
+  const colW = tiles.length > 0 ? (W - padX * 2) / tiles.length : 0;
   const tilesSvg = tiles
     .map((t, i) => {
       const x = padX + i * colW;
       return (
-        `<text x="${x}" y="1235" font-family="Oswald" font-weight="700" font-size="74" fill="#FFFFFF">${esc(t.value)}</text>` +
-        `<text x="${x}" y="1282" font-family="Oswald" font-weight="500" font-size="29" letter-spacing="2" fill="#94A3B8">${esc(String(t.label).toUpperCase())}</text>`
+        `<text x="${x}" y="${H - 115}" font-family="Oswald" font-weight="700" font-size="74" fill="#FFFFFF">${esc(t.value)}</text>` +
+        `<text x="${x}" y="${H - 68}" font-family="Oswald" font-weight="500" font-size="29" letter-spacing="2" fill="#94A3B8">${esc(String(t.label).toUpperCase())}</text>`
       );
     })
     .join("");
   return svgWrap(
     SCRIM_DEFS +
-      `<rect x="0" y="880" width="${OUT_W}" height="${OUT_H - 880}" fill="url(#scrim)"/>` +
-      `<rect x="64" y="1038" width="54" height="6" rx="3" fill="${accent}"/>` +
-      `<text x="64" y="1108" font-family="Oswald" font-weight="700" font-size="58" letter-spacing="3" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
-      `<text x="64" y="1150" font-family="Oswald" font-weight="400" font-size="31" fill="#CBD5E1">${esc(subtitle)}</text>` +
-      tilesSvg
+      `<rect x="0" y="${H - 470}" width="${W}" height="470" fill="url(#scrim)"/>` +
+      `<rect x="64" y="${H - 312}" width="54" height="6" rx="3" fill="${accent}"/>` +
+      `<text x="64" y="${H - 242}" font-family="Oswald" font-weight="700" font-size="58" letter-spacing="3" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
+      `<text x="64" y="${H - 200}" font-family="Oswald" font-weight="400" font-size="31" fill="#CBD5E1">${esc(subtitle)}</text>` +
+      tilesSvg,
+    W,
+    H
   );
 }
 
-/** Layout "overlay": cartão flutuante semitransparente sobre o mapa (estilo Strava). */
-function overlayCard({ title, subtitle, stats, accent }) {
+/** Layout "overlay": cartão flutuante semitransparente sobre o mapa. */
+function overlayCard({ title, subtitle, stats, accent }, W, H) {
   const cardX = 44;
-  const cardY = 952;
-  const cardW = OUT_W - cardX * 2;
+  const cardW = W - cardX * 2;
   const cardH = 346;
-  const inX = cardX + 40; // padding interno
+  const cardY = H - 398;
+  const inX = cardX + 40;
   const tiles = stats.slice(0, 4);
   const colW = tiles.length > 0 ? (cardW - 80) / tiles.length : 0;
   const tilesSvg = tiles
     .map((t, i) => {
       const x = inX + i * colW;
       return (
-        `<text x="${x}" y="1212" font-family="Oswald" font-weight="700" font-size="66" fill="#FFFFFF">${esc(t.value)}</text>` +
-        `<text x="${x}" y="1256" font-family="Oswald" font-weight="500" font-size="27" letter-spacing="2" fill="#94A3B8">${esc(String(t.label).toUpperCase())}</text>`
+        `<text x="${x}" y="${H - 138}" font-family="Oswald" font-weight="700" font-size="66" fill="#FFFFFF">${esc(t.value)}</text>` +
+        `<text x="${x}" y="${H - 94}" font-family="Oswald" font-weight="500" font-size="27" letter-spacing="2" fill="#94A3B8">${esc(String(t.label).toUpperCase())}</text>`
       );
     })
     .join("");
   return svgWrap(
     SCRIM_DEFS +
-      `<rect x="0" y="980" width="${OUT_W}" height="${OUT_H - 980}" fill="url(#scrim)"/>` +
+      `<rect x="0" y="${H - 370}" width="${W}" height="370" fill="url(#scrim)"/>` +
       `<rect x="${cardX}" y="${cardY}" width="${cardW}" height="${cardH}" rx="30" fill="#020617" fill-opacity="0.8" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.5"/>` +
-      `<rect x="${inX}" y="1006" width="50" height="6" rx="3" fill="${accent}"/>` +
-      `<text x="${inX}" y="1068" font-family="Oswald" font-weight="700" font-size="50" letter-spacing="2" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
-      `<text x="${inX}" y="1106" font-family="Oswald" font-weight="400" font-size="28" fill="#CBD5E1">${esc(subtitle)}</text>` +
-      tilesSvg
+      `<rect x="${inX}" y="${H - 344}" width="50" height="6" rx="3" fill="${accent}"/>` +
+      `<text x="${inX}" y="${H - 282}" font-family="Oswald" font-weight="700" font-size="50" letter-spacing="2" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
+      `<text x="${inX}" y="${H - 244}" font-family="Oswald" font-weight="400" font-size="28" fill="#CBD5E1">${esc(subtitle)}</text>` +
+      tilesSvg,
+    W,
+    H
   );
 }
 
-/** Layout "minimal": distância em destaque + linha resumo + marca. */
-function overlayMinimal({ title, subtitle, stats, accent }) {
+/** Layout "minimal": distância em destaque + linha resumo. */
+function overlayMinimal({ title, subtitle, stats, accent }, W, H) {
   const hero = stats[0] || { value: "", label: "" };
   const rest = stats.slice(1).filter((s) => s && s.value);
   const summary = rest.map((s) => `${esc(s.value)} ${esc(String(s.label))}`).join("   ·   ");
   const eyebrow = `${esc(String(title).toUpperCase())}${subtitle ? `  ·  ${esc(subtitle)}` : ""}`;
   return svgWrap(
     SCRIM_DEFS +
-      `<rect x="0" y="900" width="${OUT_W}" height="${OUT_H - 900}" fill="url(#scrim)"/>` +
-      `<text x="64" y="1118" font-family="Oswald" font-weight="500" font-size="32" letter-spacing="2" fill="${accent}">${eyebrow}</text>` +
-      `<text x="60" y="1248" font-family="Oswald" font-weight="700" font-size="150" fill="#FFFFFF">${esc(hero.value)}` +
+      `<rect x="0" y="${H - 450}" width="${W}" height="450" fill="url(#scrim)"/>` +
+      `<text x="64" y="${H - 232}" font-family="Oswald" font-weight="500" font-size="32" letter-spacing="2" fill="${accent}">${eyebrow}</text>` +
+      `<text x="60" y="${H - 102}" font-family="Oswald" font-weight="700" font-size="150" fill="#FFFFFF">${esc(hero.value)}` +
       `<tspan font-size="50" letter-spacing="2" fill="${accent}" dx="16">${esc(String(hero.label).toUpperCase())}</tspan></text>` +
-      `<text x="64" y="1306" font-family="Oswald" font-weight="400" font-size="38" fill="#CBD5E1">${summary}</text>`
+      `<text x="64" y="${H - 44}" font-family="Oswald" font-weight="400" font-size="38" fill="#CBD5E1">${summary}</text>`,
+    W,
+    H
   );
 }
 
 /** Despacha para o layout escolhido (default: classic). */
-function buildOverlaySvg({ layout, title, subtitle, stats, accent }) {
+function buildOverlaySvg({ layout, title, subtitle, stats, accent }, W, H) {
   const args = { title, subtitle, stats: Array.isArray(stats) ? stats : [], accent };
-  if (layout === "overlay") return overlayCard(args);
-  if (layout === "minimal") return overlayMinimal(args);
-  return overlayClassic(args);
+  if (layout === "overlay") return overlayCard(args, W, H);
+  if (layout === "minimal") return overlayMinimal(args, W, H);
+  return overlayClassic(args, W, H);
 }
 
 /** Renderiza o overlay SVG em PNG (fundo transparente) usando a fonte Oswald. */
@@ -280,8 +273,8 @@ function renderOverlayPng(svg) {
 
 // ─── Núcleo: baixa o mapa uma vez, compõe cada card ──────────────────────────────
 
-/** Baixa o mapa da Mapbox (com a rota) uma única vez. Retorna o buffer + accent. */
-async function fetchRouteMap({ route, type }) {
+/** Baixa o mapa da Mapbox (com a rota) uma vez, no tamanho do formato. */
+async function fetchRouteMap({ route, type, dims }) {
   if (!MAPBOX_TOKEN) throw new Error("MAPBOX_TOKEN ausente no ambiente.");
 
   const clean = (Array.isArray(route) ? route : []).filter(isValidPoint);
@@ -290,55 +283,42 @@ async function fetchRouteMap({ route, type }) {
   const points = downsample(clean, MAX_PATH_POINTS);
   const accentHex = type === "Ciclismo" ? "3b82f6" : "10b981";
 
-  const url = buildMapUrl(points, accentHex);
+  const url = buildMapUrl(points, accentHex, dims.mapW, dims.mapH);
   const resp = await axios.get(url, { responseType: "arraybuffer", timeout: 12000 });
   return { mapBuffer: Buffer.from(resp.data), accentHex };
 }
 
 /** Compõe UM card (overlay + logo sobre o mapa já baixado). */
-async function composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }) {
+async function composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }, dims) {
   const overlayPng = renderOverlayPng(
-    buildOverlaySvg({ layout, title, subtitle, stats, accent: `#${accentHex}` })
+    buildOverlaySvg({ layout, title, subtitle, stats, accent: `#${accentHex}` }, dims.W, dims.H)
   );
   const composites = [{ input: overlayPng, top: 0, left: 0 }];
-  const logo = await logoLayerFor(layout);
+  const logo = await logoLayerFor(layout, dims.H);
   if (logo) composites.push(logo);
   return sharp(mapBuffer).composite(composites).png().toBuffer();
 }
 
 // ─── API pública ─────────────────────────────────────────────────────────────────
 
-/**
- * Gera UM PNG do card de compartilhamento.
- * @returns {Promise<Buffer>} PNG
- */
-async function buildShareCard({ route, type, title, subtitle, stats, layout }) {
-  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type });
-  return composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats });
+/** Gera UM PNG do card. `format` = "feed" (default) | "stories". */
+async function buildShareCard({ route, type, title, subtitle, stats, layout, format }) {
+  const dims = dimsFor(format);
+  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type, dims });
+  return composeCard(mapBuffer, accentHex, { layout, title, subtitle, stats }, dims);
 }
 
 /**
  * Gera VÁRIOS cards de uma vez (carrossel): baixa o mapa só uma vez e compõe
- * cada variante (layout + stats) sobre ele. title/subtitle são comuns.
- * @param {Object} input
- * @param {Array<{latitude:number,longitude:number}>} input.route
- * @param {"Corrida"|"Ciclismo"} input.type
- * @param {string} input.title
- * @param {string} input.subtitle
- * @param {Array<{layout?:string, stats:Array<{label:string,value:string}>}>} input.variants
- * @returns {Promise<Buffer[]>} PNGs na mesma ordem das variantes
+ * cada variante (layout + stats). title/subtitle/format são comuns.
  */
-async function buildShareCards({ route, type, title, subtitle, variants }) {
-  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type });
+async function buildShareCards({ route, type, title, subtitle, variants, format }) {
+  const dims = dimsFor(format);
+  const { mapBuffer, accentHex } = await fetchRouteMap({ route, type, dims });
   const list = Array.isArray(variants) ? variants : [];
   return Promise.all(
     list.map((v) =>
-      composeCard(mapBuffer, accentHex, {
-        layout: v.layout,
-        title,
-        subtitle,
-        stats: v.stats,
-      })
+      composeCard(mapBuffer, accentHex, { layout: v.layout, title, subtitle, stats: v.stats }, dims)
     )
   );
 }
