@@ -23,13 +23,18 @@ const LOGO_BASE64 = require("./logoBase64");
 
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
 
+// Base pública do backend — o Mapbox precisa baixar os marcadores custom daqui
+// (GET /api/route/marker). Em prod cai no alias fixo; sobrescrevível por env.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://movt-backend.vercel.app";
+
 const OUT_W = 1080; // largura fixa
 const FEED_H = 1350; // 4:5
 const STORIES_H = 1920; // 9:16
+const SQUARE_H = 1080; // 1:1 (feed interno do app, que exibe o post em quadrado)
 
 /** Dimensões por formato. O Mapbox renderiza em metade (@2x dobra). */
 function dimsFor(format) {
-  const H = format === "stories" ? STORIES_H : FEED_H;
+  const H = format === "stories" ? STORIES_H : format === "square" ? SQUARE_H : FEED_H;
   return { W: OUT_W, H, mapW: OUT_W / 2, mapH: Math.round(H / 2) };
 }
 
@@ -141,10 +146,14 @@ function buildMapUrl(points, routeColor, mapW, mapH) {
   const end = points[points.length - 1];
   const fix = (n) => n.toFixed(5);
 
-  // Pinos grandes e rotulados p/ identificar largada (A, verde) e chegada (B, vermelho).
+  // Marcadores custom: largada (badge verde "play") e chegada (bandeira
+  // quadriculada). O Mapbox baixa as imagens de /api/route/marker e centraliza
+  // no ponto. A ORDEM importa: chegada por último p/ ficar por cima se sobrepor.
   const pathLayer = `path-6+${routeColor}-1(${encodeURIComponent(poly)})`;
-  const startPin = `pin-l-a+16a34a(${fix(start.longitude)},${fix(start.latitude)})`;
-  const endPin = `pin-l-b+ef4444(${fix(end.longitude)},${fix(end.latitude)})`;
+  const startUrl = encodeURIComponent(`${PUBLIC_BASE_URL}/api/route/marker?type=start`);
+  const finishUrl = encodeURIComponent(`${PUBLIC_BASE_URL}/api/route/marker?type=finish`);
+  const startPin = `url-${startUrl}(${fix(start.longitude)},${fix(start.latitude)})`;
+  const endPin = `url-${finishUrl}(${fix(end.longitude)},${fix(end.latitude)})`;
   const overlay = `${pathLayer},${startPin},${endPin}`;
 
   // padding: topo,direita,baixo,esquerda — folga maior embaixo p/ a faixa de stats.
@@ -272,6 +281,59 @@ function renderOverlayPng(svg) {
   return resvg.render().asPng();
 }
 
+// ─── Marcadores de largada / chegada (ícones custom no mapa) ──────────────────
+// PNGs gerados sob demanda e servidos por GET /api/route/marker?type=… — o Mapbox
+// os baixa e centraliza no ponto (custom marker `url-`). Badges circulares com
+// sombra leve, pensados pra ficarem nítidos centrados sobre o mapa escuro.
+
+/** SVG do marcador. `start` = largada (verde + "play"); `finish` = bandeira quadriculada. */
+function buildMarkerSvg(type) {
+  // viewBox 84×84: círculo r=27 centrado em 42,42, com folga p/ a sombra.
+  const shadow =
+    `<defs><filter id="sh" x="-30%" y="-30%" width="160%" height="160%">` +
+    `<feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#000000" flood-opacity="0.45"/>` +
+    `</filter></defs>`;
+
+  if (type === "finish") {
+    // Badge branco com bandeira quadriculada (chegada).
+    return (
+      `<svg width="84" height="84" viewBox="0 0 84 84" xmlns="http://www.w3.org/2000/svg">` +
+      shadow +
+      `<circle cx="42" cy="42" r="27" fill="#FFFFFF" stroke="#0F172A" stroke-width="5" filter="url(#sh)"/>` +
+      `<defs><clipPath id="cc"><circle cx="42" cy="42" r="22"/></clipPath></defs>` +
+      `<g clip-path="url(#cc)">` +
+      `<rect x="20" y="20" width="44" height="44" fill="#FFFFFF"/>` +
+      `<g fill="#0F172A">` +
+      `<rect x="20" y="20" width="11" height="11"/>` +
+      `<rect x="42" y="20" width="11" height="11"/>` +
+      `<rect x="31" y="31" width="11" height="11"/>` +
+      `<rect x="53" y="31" width="11" height="11"/>` +
+      `<rect x="20" y="42" width="11" height="11"/>` +
+      `<rect x="42" y="42" width="11" height="11"/>` +
+      `<rect x="31" y="53" width="11" height="11"/>` +
+      `<rect x="53" y="53" width="11" height="11"/>` +
+      `</g></g></svg>`
+    );
+  }
+
+  // start: badge verde com triângulo "play" branco (largada).
+  return (
+    `<svg width="84" height="84" viewBox="0 0 84 84" xmlns="http://www.w3.org/2000/svg">` +
+    shadow +
+    `<circle cx="42" cy="42" r="27" fill="#16A34A" stroke="#FFFFFF" stroke-width="5" filter="url(#sh)"/>` +
+    `<polygon points="35,30 35,54 57,42" fill="#FFFFFF"/>` +
+    `</svg>`
+  );
+}
+
+/** Renderiza o marcador (start|finish) em PNG com fundo transparente. */
+function renderMarkerPng(type) {
+  const resvg = new Resvg(buildMarkerSvg(type === "finish" ? "finish" : "start"), {
+    background: "rgba(0,0,0,0)",
+  });
+  return resvg.render().asPng();
+}
+
 // ─── Núcleo: baixa o mapa uma vez, compõe cada card ──────────────────────────────
 
 /** Baixa o mapa da Mapbox (com a rota) uma vez, no tamanho do formato. */
@@ -324,4 +386,4 @@ async function buildShareCards({ route, type, title, subtitle, variants, format 
   );
 }
 
-module.exports = { buildShareCard, buildShareCards };
+module.exports = { buildShareCard, buildShareCards, renderMarkerPng };

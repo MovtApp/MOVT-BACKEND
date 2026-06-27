@@ -4297,6 +4297,23 @@ app.delete("/api/user/workouts/:id", verifyToken, async (req, res) => {
   }
 });
 
+// GET: ícone de largada/chegada usado como marcador custom no mapa do card
+// (Mapbox Static busca esta URL). PÚBLICO de propósito — é só um PNG estático,
+// sem dados sensíveis, e o Mapbox baixa sem credenciais. Cache longo (imutável).
+app.get("/api/route/marker", (req, res) => {
+  try {
+    const { renderMarkerPng } = require("./services/shareCardService");
+    const type = req.query.type === "finish" ? "finish" : "start";
+    const png = renderMarkerPng(type);
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=31536000, immutable");
+    return res.status(200).send(png);
+  } catch (error) {
+    console.error("Erro ao gerar marcador:", error.message);
+    return res.status(500).json({ error: "Falha ao gerar marcador." });
+  }
+});
+
 // POST: encaixa uma sequência de pontos GPS na malha viária real (map-matching
 // via Mapbox). Usado AO VIVO (janela incremental durante o treino) e no SAVE
 // (rota inteira). A chave da Mapbox fica só no servidor. Falha graciosa: em erro,
