@@ -1731,6 +1731,7 @@ app.post("/api/register", async (req, res) => {
     data_nascimento,
     telefone,
     tipo_documento,
+    cref,
   } = req.body;
 
   if (!nome || !email || !senha || !cpf_cnpj || !data_nascimento || !telefone) {
@@ -1751,12 +1752,29 @@ app.post("/api/register", async (req, res) => {
 
     let userCpf = null;
     let userCnpj = null;
+    let userCref = null;
+    // Personal = pessoa física (CPF) com registro profissional (CREF). É o tipo
+    // de cadastro de personal trainer no app (substituiu a antiga conta CNPJ).
+    const isPersonal = tipo_documento === "Personal";
 
-    if (tipo_documento === "CPF") {
-      userCpf = cpf_cnpj;
+    if (tipo_documento === "CPF" || isPersonal) {
+      // Defense-in-depth: revalida o CPF no servidor (11 dígitos), nunca confiar
+      // só na validação do app.
+      userCpf = (cpf_cnpj || "").replace(/\D/g, "");
+      if (userCpf.length !== 11) {
+        return res.status(400).json({ field: "cpf_cnpj", error: "CPF inválido (11 dígitos)." });
+      }
+      if (isPersonal) {
+        userCref = (cref || "").trim();
+        if (userCref.length < 4) {
+          return res
+            .status(400)
+            .json({ field: "cref", error: "CREF obrigatório para Personal." });
+        }
+      }
     } else if (tipo_documento === "CNPJ") {
-      // Defense-in-depth: revalida os dígitos verificadores no servidor; nunca
-      // confiar só na validação do app.
+      // Legado: o app não oferece mais cadastro por CNPJ. Mantido por compat para
+      // não quebrar integrações antigas; revalida os dígitos verificadores.
       if (!isValidCNPJ(cpf_cnpj)) {
         return res.status(400).json({ error: "CNPJ inválido (dígitos verificadores)." });
       }
@@ -1818,14 +1836,15 @@ app.post("/api/register", async (req, res) => {
     const formattedBirthDate = `${year}-${month}-${day} 00:00:00`;
 
     const [newUser] = await sql`
-      INSERT INTO usuarios (nome, username, email, senha, cpf, cnpj, data_nascimento, telefone, createdat, updated_at, session_id, verification_code, email_verified, verification_code_expires_at)
-      VALUES (${nome}, ${email}, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
+      INSERT INTO usuarios (nome, username, email, senha, cpf, cnpj, cref, data_nascimento, telefone, createdat, updated_at, session_id, verification_code, email_verified, verification_code_expires_at)
+      VALUES (${nome}, ${email}, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${userCref}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
       RETURNING id_us, nome, username, email, cpf, cnpj, data_nascimento, telefone, session_id;
     `;
 
-    // Conta com CNPJ é um personal trainer: marca o papel e inicia a verificação
-    // profissional pendente (CREF/CNPJ ainda não validados). Contas CPF não são tocadas.
-    if (userCnpj !== null) {
+    // Personal (CPF + CREF) ou conta CNPJ legada são personal trainers: marca o
+    // papel e inicia a verificação profissional pendente (CREF ainda não validado).
+    // Contas de Pessoa Física comuns (só CPF) não são tocadas.
+    if (userCnpj !== null || isPersonal) {
       await sql`
         UPDATE usuarios
         SET role = 'trainer', status_verificacao = 'pendente'
@@ -4321,7 +4340,8 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
   try {
     const { buildShareCard, buildShareCards } = require("./services/shareCardService");
     const kind = type === "Ciclismo" ? "Ciclismo" : "Corrida";
-    const safeFormat = format === "stories" ? "stories" : "feed";
+    const safeFormat =
+      format === "stories" ? "stories" : format === "square" ? "square" : "feed";
     const allowedLayouts = ["classic", "overlay", "minimal"];
     const safeTitle =
       typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind;
