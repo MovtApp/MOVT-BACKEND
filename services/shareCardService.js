@@ -123,12 +123,24 @@ function esc(s) {
     .replace(/>/g, "&gt;");
 }
 
-/** SVG do overlay (gradiente + título + data + métricas + marca), do tamanho do card. */
-function buildOverlaySvg({ title, subtitle, stats, accent }) {
-  const padX = 64;
-  const tiles = (Array.isArray(stats) ? stats : []).slice(0, 4);
-  const colW = tiles.length > 0 ? (OUT_W - padX * 2) / tiles.length : 0;
+/** <defs> com o gradiente de escurecimento (scrim) reutilizado pelos layouts. */
+const SCRIM_DEFS =
+  `<defs>` +
+  `<linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">` +
+  `<stop offset="0%" stop-color="#020617" stop-opacity="0"/>` +
+  `<stop offset="55%" stop-color="#020617" stop-opacity="0.55"/>` +
+  `<stop offset="100%" stop-color="#020617" stop-opacity="0.94"/>` +
+  `</linearGradient>` +
+  `</defs>`;
 
+const svgWrap = (inner) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${OUT_W}" height="${OUT_H}">${inner}</svg>`;
+
+/** Layout "classic": faixa inferior com título/data + 4 métricas + marca. */
+function overlayClassic({ title, subtitle, stats, accent }) {
+  const padX = 64;
+  const tiles = stats.slice(0, 4);
+  const colW = tiles.length > 0 ? (OUT_W - padX * 2) / tiles.length : 0;
   const tilesSvg = tiles
     .map((t, i) => {
       const x = padX + i * colW;
@@ -138,24 +150,70 @@ function buildOverlaySvg({ title, subtitle, stats, accent }) {
       );
     })
     .join("");
-
-  return (
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${OUT_W}" height="${OUT_H}">` +
-    `<defs>` +
-    `<linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">` +
-    `<stop offset="0%" stop-color="#020617" stop-opacity="0"/>` +
-    `<stop offset="55%" stop-color="#020617" stop-opacity="0.55"/>` +
-    `<stop offset="100%" stop-color="#020617" stop-opacity="0.94"/>` +
-    `</linearGradient>` +
-    `</defs>` +
-    `<rect x="0" y="880" width="${OUT_W}" height="${OUT_H - 880}" fill="url(#scrim)"/>` +
-    `<rect x="64" y="1038" width="54" height="6" rx="3" fill="${accent}"/>` +
-    `<text x="64" y="1108" font-family="Oswald" font-weight="700" font-size="58" letter-spacing="3" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
-    `<text x="64" y="1150" font-family="Oswald" font-weight="400" font-size="31" fill="#CBD5E1">${esc(subtitle)}</text>` +
-    `<text x="${OUT_W - 64}" y="1108" text-anchor="end" font-family="Oswald" font-weight="700" font-size="44" letter-spacing="4" fill="${accent}">MOVT</text>` +
-    tilesSvg +
-    `</svg>`
+  return svgWrap(
+    SCRIM_DEFS +
+      `<rect x="0" y="880" width="${OUT_W}" height="${OUT_H - 880}" fill="url(#scrim)"/>` +
+      `<rect x="64" y="1038" width="54" height="6" rx="3" fill="${accent}"/>` +
+      `<text x="64" y="1108" font-family="Oswald" font-weight="700" font-size="58" letter-spacing="3" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
+      `<text x="64" y="1150" font-family="Oswald" font-weight="400" font-size="31" fill="#CBD5E1">${esc(subtitle)}</text>` +
+      `<text x="${OUT_W - 64}" y="1108" text-anchor="end" font-family="Oswald" font-weight="700" font-size="44" letter-spacing="4" fill="${accent}">MOVT</text>` +
+      tilesSvg
   );
+}
+
+/** Layout "overlay": cartão flutuante semitransparente sobre o mapa (estilo Strava). */
+function overlayCard({ title, subtitle, stats, accent }) {
+  const cardX = 44;
+  const cardY = 952;
+  const cardW = OUT_W - cardX * 2;
+  const cardH = 346;
+  const inX = cardX + 40; // padding interno
+  const tiles = stats.slice(0, 4);
+  const colW = tiles.length > 0 ? (cardW - 80) / tiles.length : 0;
+  const tilesSvg = tiles
+    .map((t, i) => {
+      const x = inX + i * colW;
+      return (
+        `<text x="${x}" y="1212" font-family="Oswald" font-weight="700" font-size="66" fill="#FFFFFF">${esc(t.value)}</text>` +
+        `<text x="${x}" y="1256" font-family="Oswald" font-weight="500" font-size="27" letter-spacing="2" fill="#94A3B8">${esc(String(t.label).toUpperCase())}</text>`
+      );
+    })
+    .join("");
+  return svgWrap(
+    SCRIM_DEFS +
+      `<rect x="0" y="980" width="${OUT_W}" height="${OUT_H - 980}" fill="url(#scrim)"/>` +
+      `<rect x="${cardX}" y="${cardY}" width="${cardW}" height="${cardH}" rx="30" fill="#020617" fill-opacity="0.8" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.5"/>` +
+      `<rect x="${inX}" y="1006" width="50" height="6" rx="3" fill="${accent}"/>` +
+      `<text x="${inX}" y="1068" font-family="Oswald" font-weight="700" font-size="50" letter-spacing="2" fill="#FFFFFF">${esc(String(title).toUpperCase())}</text>` +
+      `<text x="${inX}" y="1106" font-family="Oswald" font-weight="400" font-size="28" fill="#CBD5E1">${esc(subtitle)}</text>` +
+      `<text x="${cardX + cardW - 40}" y="1068" text-anchor="end" font-family="Oswald" font-weight="700" font-size="38" letter-spacing="3" fill="${accent}">MOVT</text>` +
+      tilesSvg
+  );
+}
+
+/** Layout "minimal": distância em destaque + linha resumo + marca. */
+function overlayMinimal({ title, subtitle, stats, accent }) {
+  const hero = stats[0] || { value: "", label: "" };
+  const rest = stats.slice(1).filter((s) => s && s.value);
+  const summary = rest.map((s) => `${esc(s.value)} ${esc(String(s.label))}`).join("   ·   ");
+  const eyebrow = `${esc(String(title).toUpperCase())}${subtitle ? `  ·  ${esc(subtitle)}` : ""}`;
+  return svgWrap(
+    SCRIM_DEFS +
+      `<rect x="0" y="900" width="${OUT_W}" height="${OUT_H - 900}" fill="url(#scrim)"/>` +
+      `<text x="64" y="1118" font-family="Oswald" font-weight="500" font-size="32" letter-spacing="2" fill="${accent}">${eyebrow}</text>` +
+      `<text x="60" y="1248" font-family="Oswald" font-weight="700" font-size="150" fill="#FFFFFF">${esc(hero.value)}` +
+      `<tspan font-size="50" letter-spacing="2" fill="${accent}" dx="16">${esc(String(hero.label).toUpperCase())}</tspan></text>` +
+      `<text x="64" y="1306" font-family="Oswald" font-weight="400" font-size="38" fill="#CBD5E1">${summary}</text>` +
+      `<text x="${OUT_W - 64}" y="1118" text-anchor="end" font-family="Oswald" font-weight="700" font-size="40" letter-spacing="3" fill="${accent}">MOVT</text>`
+  );
+}
+
+/** Despacha para o layout escolhido (default: classic). */
+function buildOverlaySvg({ layout, title, subtitle, stats, accent }) {
+  const args = { title, subtitle, stats: Array.isArray(stats) ? stats : [], accent };
+  if (layout === "overlay") return overlayCard(args);
+  if (layout === "minimal") return overlayMinimal(args);
+  return overlayClassic(args);
 }
 
 /** Renderiza o overlay SVG em PNG (fundo transparente) usando a fonte Oswald. */
@@ -179,9 +237,10 @@ function renderOverlayPng(svg) {
  * @param {string} input.title
  * @param {string} input.subtitle
  * @param {Array<{label:string,value:string}>} input.stats
+ * @param {"classic"|"overlay"|"minimal"} [input.layout]
  * @returns {Promise<Buffer>} PNG
  */
-async function buildShareCard({ route, type, title, subtitle, stats }) {
+async function buildShareCard({ route, type, title, subtitle, stats, layout }) {
   if (!MAPBOX_TOKEN) throw new Error("MAPBOX_TOKEN ausente no ambiente.");
 
   const clean = (Array.isArray(route) ? route : []).filter(isValidPoint);
@@ -195,7 +254,7 @@ async function buildShareCard({ route, type, title, subtitle, stats }) {
   const mapBuffer = Buffer.from(resp.data);
 
   const overlayPng = renderOverlayPng(
-    buildOverlaySvg({ title, subtitle, stats, accent: `#${accentHex}` })
+    buildOverlaySvg({ layout, title, subtitle, stats, accent: `#${accentHex}` })
   );
 
   return sharp(mapBuffer)
