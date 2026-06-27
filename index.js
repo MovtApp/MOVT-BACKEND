@@ -4306,6 +4306,41 @@ app.post("/api/route/snap", verifyToken, async (req, res) => {
   }
 });
 
+// POST: gera o CARD compartilhável (estilo Strava) de um treino — mapa real
+// (Mapbox Static Images) com a rota desenhada + os números e a marca MOVT
+// "queimados" na imagem. O app baixa o PNG (base64) e abre o menu nativo de
+// compartilhamento. A chave da Mapbox fica só no servidor.
+app.post("/api/route/share-card", verifyToken, async (req, res) => {
+  const { route, type, title, subtitle, stats } = req.body || {};
+  if (!Array.isArray(route) || route.length < 2) {
+    return res.status(400).json({ error: "Rota insuficiente para gerar o card." });
+  }
+  if (route.length > 5000) {
+    return res.status(400).json({ error: "Rota muito grande para uma requisição." });
+  }
+  try {
+    const { buildShareCard } = require("./services/shareCardService");
+    const kind = type === "Ciclismo" ? "Ciclismo" : "Corrida";
+    // Sanitiza os textos (vão "queimados" na imagem): limita tamanho e tipo.
+    const png = await buildShareCard({
+      route,
+      type: kind,
+      title: typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind,
+      subtitle: typeof subtitle === "string" ? subtitle.slice(0, 60) : "",
+      stats: Array.isArray(stats)
+        ? stats.slice(0, 4).map((s) => ({
+            label: String(s?.label ?? "").slice(0, 16),
+            value: String(s?.value ?? "").slice(0, 16),
+          }))
+        : [],
+    });
+    return res.status(200).json({ ok: true, image: png.toString("base64") });
+  } catch (error) {
+    console.error("Erro ao gerar share-card:", error.message);
+    return res.status(502).json({ ok: false, error: "Falha ao gerar a imagem do treino." });
+  }
+});
+
 app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
   const followedUserId = await resolveUserId(req.params.id);
   const followerUserId = req.userId;

@@ -16,6 +16,7 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@resvg/resvg-js": "^2.6.2",
     "@sentry/node": "^10.56.0",
     "@supabase/supabase-js": "^2.58.0",
     "axios": "^1.13.5",
