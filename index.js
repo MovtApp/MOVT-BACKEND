@@ -121,6 +121,10 @@ async function initDb() {
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_back_url TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS document_cpf TEXT DEFAULT NULL`;
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_validade DATE DEFAULT NULL`;
+    // Data de registro no CONFEF/CREF (autodeclarada pelo personal, impressa na
+    // carteira). Fonte dos "anos de experiência" exibidos no perfil: experienceYears
+    // = ano_atual − ano(cref_data_registro). Sem IA/OCR.
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_data_registro DATE DEFAULT NULL`;
     // Motivo da reprovação manual do CREF (preenchido pelo admin) — exibido ao
     // personal na tela de status para que ele saiba o que corrigir ao reenviar.
     await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cref_rejeicao_motivo TEXT DEFAULT NULL`;
@@ -1253,12 +1257,25 @@ app.get("/api/verify/cnpj/:cnpj", verifyToken, async (req, res) => {
 // no próprio CNPJ. Se todos os provedores estiverem fora do ar, grava o que o
 // usuário declarou e marca 'pendente_revisao' para revisão manual no admin.
 app.put("/api/user/professional-data", verifyToken, async (req, res) => {
-  const { cnpj, cnae, cref, formacao } = req.body;
+  const { cnpj, cnae, cref, formacao, cref_data_registro } = req.body;
   const userId = req.userId;
 
   const cnpjDigits = (cnpj || "").replace(/\D/g, "");
   if (cnpj && !isValidCNPJ(cnpjDigits)) {
     return res.status(400).json({ error: "CNPJ inválido (dígitos verificadores)." });
+  }
+
+  // Data de registro do CREF (autodeclarada): aceita "YYYY-MM-DD" não-futura ou null.
+  // Quando não enviada, mantém o valor existente (não sobrescreve com null).
+  let crefDataRegistro = null;
+  if (cref_data_registro != null && cref_data_registro !== "") {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cref_data_registro)) {
+      return res.status(400).json({ error: "Data de registro do CREF inválida (use AAAA-MM-DD)." });
+    }
+    if (cref_data_registro > new Date().toISOString().slice(0, 10)) {
+      return res.status(400).json({ error: "A data de registro do CREF não pode ser no futuro." });
+    }
+    crefDataRegistro = cref_data_registro;
   }
 
   try {
@@ -1280,6 +1297,7 @@ app.put("/api/user/professional-data", verifyToken, async (req, res) => {
               cnpj_cnae = ${cnae ? String(cnae).replace(/\D/g, "").slice(0, 7) : null},
               cref = ${cref || null},
               formacao = ${formacao || null},
+              cref_data_registro = ${crefDataRegistro ? crefDataRegistro : sql`cref_data_registro`},
               cnpj_verified = FALSE,
               status_verificacao = 'pendente_revisao',
               updated_at = CURRENT_TIMESTAMP
@@ -1323,6 +1341,7 @@ app.put("/api/user/professional-data", verifyToken, async (req, res) => {
           cnpj_cnae = ${cnaeNorm},
           cref = ${cref || null},
           formacao = ${formacao || null},
+          cref_data_registro = ${crefDataRegistro ? crefDataRegistro : sql`cref_data_registro`},
           cnpj_verified = ${cnpj ? true : sql`cnpj_verified`},
           cnpj_verified_at = ${cnpj ? sql`NOW()` : sql`cnpj_verified_at`},
           cnpj_razao_social = ${cnpj ? empresa.razaoSocial : sql`cnpj_razao_social`},
@@ -3770,7 +3789,7 @@ app.get("/api/trainers/:id", async (req, res) => {
   try {
     // Busca dados básicos e de regularização do usuário
     const [user] = await sql`
-      SELECT id_us AS id, nome AS name, username, avatar_url, banner_url, cref, formacao, verificado, bio, location
+      SELECT id_us AS id, nome AS name, username, avatar_url, banner_url, cref, formacao, verificado, bio, location, cref_data_registro
       FROM usuarios
       WHERE id_us = ${id}
       LIMIT 1
@@ -3807,10 +3826,17 @@ app.get("/api/trainers/:id", async (req, res) => {
       LIMIT 1
     `;
 
+    // Anos de experiência derivados da data de registro do CREF (autodeclarada).
+    // Fallback p/ o valor legado em personal_profiles.experiencia_anos quando ainda
+    // não houver data informada. Sem IA/OCR.
+    const computedExperienceYears = user.cref_data_registro
+      ? Math.max(0, new Date().getFullYear() - new Date(user.cref_data_registro).getFullYear())
+      : (profile?.experienceYears || 0);
+
     const trainerData = {
       ...user,
       description: profile?.description || user.bio || "Personal Trainer",
-      experienceYears: profile?.experienceYears || 0,
+      experienceYears: computedExperienceYears,
       especialidades: profile?.especialidades || [],
       agendamentosCount: agendamentosCount || 0,
       avaliacoesCount: avaliacoesCount || 0,
