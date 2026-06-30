@@ -9549,6 +9549,13 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
       // Ignorar erro se a busca falhar
     }
 
+    const toMin = (hhmm) => {
+      const [h, m] = hhmm.split(':').map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+    const toHHMM = (mins) =>
+      `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+
     const availableSlots = [];
     dayAvailability.forEach(slot => {
       // Normalizar horários do banco (HH:mm:ss ou HH:mm) para HH:mm
@@ -9557,17 +9564,21 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
 
       if (!startTimeDb || !endTimeDb) return;
 
-      const startH = parseInt(startTimeDb.split(':')[0]);
-      const endH = parseInt(endTimeDb.split(':')[0]);
+      // Fatia a faixa em blocos da duração configurada (default 60min), respeitando
+      // os minutos. A sobra menor que um bloco no fim da faixa é descartada.
+      const dur = Number(slot.duracao_min) > 0 ? Number(slot.duracao_min) : 60;
+      const startMin = toMin(startTimeDb);
+      const endMin = toMin(endTimeDb);
 
-      for (let h = startH; h < endH; h++) {
-        const startStr = `${h.toString().padStart(2, '0')}:00`;
-        const endStr = `${(h + 1).toString().padStart(2, '0')}:00`;
+      for (let s = startMin; s + dur <= endMin; s += dur) {
+        const startStr = toHHMM(s);
+        const endStr = toHHMM(s + dur);
 
+        // Conflito = sobreposição real de intervalos com agendamentos existentes
         const conflict = bookedSlots.some(b => {
-          const bStart = (b.hora_inicio || "").substring(0, 5);
-          const bEnd = (b.hora_fim || "").substring(0, 5);
-          return startStr >= bStart && startStr < bEnd;
+          const bStart = toMin((b.hora_inicio || "").substring(0, 5));
+          const bEnd = toMin((b.hora_fim || "").substring(0, 5));
+          return s < bEnd && (s + dur) > bStart;
         });
 
         if (!conflict) {
@@ -9591,6 +9602,153 @@ app.get("/api/appointments/availability/:trainerId", async (req, res) => {
   } catch (err) {
     console.error(`[GET Availability] Erro:`, err);
     return res.status(500).json({ error: "Erro interno ao buscar disponibilidade." });
+  }
+});
+
+// ─── Gerenciamento da disponibilidade pelo próprio personal ────────────────────
+
+// Garante a existência da tabela (hoje criada manualmente no Supabase)
+async function ensureDisponibilidadeTable() {
+  await sql`
+    CREATE TABLE IF NOT EXISTS disponibilidade_trainer (
+      id SERIAL PRIMARY KEY,
+      id_trainer INTEGER NOT NULL,
+      dia_semana INTEGER NOT NULL,
+      hora_inicio TIME NOT NULL,
+      hora_fim TIME NOT NULL,
+      ativo BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `;
+  // Duração da sessão em minutos (auto-heal p/ tabelas criadas antes da migration 010)
+  await sql`ALTER TABLE disponibilidade_trainer ADD COLUMN IF NOT EXISTS duracao_min INTEGER NOT NULL DEFAULT 60`;
+}
+
+// GET: disponibilidade semanal do personal logado (7 dias, faixas por dia)
+app.get("/api/personal/availability", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  try {
+    const [trainerCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${userId}`;
+    const validRoles = ['personal', 'trainer', 'pj', 'admin'];
+    if (!trainerCheck || !validRoles.includes((trainerCheck.role || '').toLowerCase())) {
+      return res.status(403).json({ error: "Acesso negado. Apenas personais podem acessar esta rota." });
+    }
+
+    await ensureDisponibilidadeTable();
+
+    const rows = await sql`
+      SELECT dia_semana, hora_inicio, hora_fim, ativo, duracao_min
+      FROM disponibilidade_trainer
+      WHERE id_trainer = ${userId}
+      ORDER BY dia_semana ASC, hora_inicio ASC
+    `;
+
+    // Estrutura fixa de 7 dias (0=Dom ... 6=Sáb)
+    const week = Array.from({ length: 7 }, (_, dia) => ({
+      dia_semana: dia,
+      ativo: false,
+      faixas: [],
+      duracao_min: 60,
+    }));
+
+    rows.forEach((r) => {
+      const d = week[r.dia_semana];
+      if (!d) return;
+      const inicio = (r.hora_inicio || "").substring(0, 5);
+      const fim = (r.hora_fim || "").substring(0, 5);
+      if (inicio && fim) {
+        d.faixas.push({ hora_inicio: inicio, hora_fim: fim });
+        // duracao_min é por dia (mesma em todas as faixas); usa a do registro.
+        if (Number(r.duracao_min) > 0) d.duracao_min = Number(r.duracao_min);
+        if (r.ativo) d.ativo = true;
+      }
+    });
+
+    return res.status(200).json({ success: true, week });
+  } catch (err) {
+    console.error("Erro em GET /api/personal/availability", err);
+    return res.status(500).json({ error: "Erro interno ao buscar disponibilidade." });
+  }
+});
+
+// PUT: substitui a disponibilidade do personal logado (replace completo)
+app.put("/api/personal/availability", verifyToken, async (req, res) => {
+  const userId = req.userId;
+  const { week } = req.body || {};
+
+  try {
+    const [trainerCheck] = await sql`SELECT role FROM usuarios WHERE id_us = ${userId}`;
+    const validRoles = ['personal', 'trainer', 'pj', 'admin'];
+    if (!trainerCheck || !validRoles.includes((trainerCheck.role || '').toLowerCase())) {
+      return res.status(403).json({ error: "Acesso negado. Apenas personais podem acessar esta rota." });
+    }
+
+    if (!Array.isArray(week)) {
+      return res.status(400).json({ error: "Formato inválido: 'week' deve ser um array." });
+    }
+
+    // Validar e normalizar antes de tocar no banco
+    const rowsToInsert = [];
+    for (const dia of week) {
+      const diaSemana = Number(dia?.dia_semana);
+      if (!Number.isInteger(diaSemana) || diaSemana < 0 || diaSemana > 6) {
+        return res.status(400).json({ error: `dia_semana inválido: ${dia?.dia_semana}` });
+      }
+      if (!dia?.ativo) continue;
+
+      // Duração da sessão em minutos (por dia). Aceita 30/45/60; default 60.
+      const duracaoMin = [30, 45, 60].includes(Number(dia?.duracao_min))
+        ? Number(dia.duracao_min)
+        : 60;
+
+      const faixas = Array.isArray(dia.faixas) ? dia.faixas : [];
+      const normalizadas = [];
+      for (const f of faixas) {
+        const inicio = (f?.hora_inicio || "").substring(0, 5);
+        const fim = (f?.hora_fim || "").substring(0, 5);
+        if (!/^\d{2}:\d{2}$/.test(inicio) || !/^\d{2}:\d{2}$/.test(fim)) {
+          return res.status(400).json({ error: `Horário inválido no dia ${diaSemana}.` });
+        }
+        if (inicio >= fim) {
+          return res.status(400).json({ error: `Hora de início deve ser menor que a de fim (dia ${diaSemana}: ${inicio}-${fim}).` });
+        }
+        normalizadas.push({ inicio, fim });
+      }
+
+      // Ordenar e checar sobreposição entre faixas do mesmo dia
+      normalizadas.sort((a, b) => a.inicio.localeCompare(b.inicio));
+      for (let i = 1; i < normalizadas.length; i++) {
+        if (normalizadas[i].inicio < normalizadas[i - 1].fim) {
+          return res.status(400).json({ error: `Faixas de horário sobrepostas no dia ${diaSemana}.` });
+        }
+      }
+
+      normalizadas.forEach((n) => {
+        rowsToInsert.push({
+          dia_semana: diaSemana,
+          hora_inicio: n.inicio,
+          hora_fim: n.fim,
+          duracao_min: duracaoMin,
+        });
+      });
+    }
+
+    await ensureDisponibilidadeTable();
+
+    await sql.begin(async (sql) => {
+      await sql`DELETE FROM disponibilidade_trainer WHERE id_trainer = ${userId}`;
+      for (const r of rowsToInsert) {
+        await sql`
+          INSERT INTO disponibilidade_trainer (id_trainer, dia_semana, hora_inicio, hora_fim, ativo, duracao_min)
+          VALUES (${userId}, ${r.dia_semana}, ${r.hora_inicio}, ${r.hora_fim}, TRUE, ${r.duracao_min})
+        `;
+      }
+    });
+
+    return res.status(200).json({ success: true, message: "Disponibilidade atualizada com sucesso." });
+  } catch (err) {
+    console.error("Erro em PUT /api/personal/availability", err);
+    return res.status(500).json({ error: "Erro interno ao salvar disponibilidade." });
   }
 });
 
