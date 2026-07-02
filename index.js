@@ -1545,21 +1545,16 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
     throw { code: 422, message: "Formato de imagem não suportado." };
   }
 
-  // Checa dimensões máximas (2k x 2k)
-  let image;
+  // Valida que o buffer é uma imagem legível (não rejeita por tamanho:
+  // fotos de câmera/galeria são grandes e serão reduzidas no resize abaixo)
   try {
-    image = sharp(fileBuffer);
-    const metadata = await image.metadata();
-    if (
-      metadata.width > 2000 ||
-      metadata.height > 2000
-    ) {
-      throw { code: 422, message: "A imagem deve ter no máximo 2000x2000 px." };
-    }
+    await sharp(fileBuffer).metadata();
   } catch (err) {
-    if (err.code) throw err;
     throw { code: 400, message: "Arquivo de imagem inválido." };
   }
+
+  // A partir daqui todas as versões usam .rotate() para respeitar a
+  // orientação EXIF (evita foto salva deitada) e limitam a resolução.
 
   // Paths/nomes no Supabase Storage
   const uuid = uuidv4();
@@ -1568,10 +1563,14 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
 
   // Processa as versões redimensionadas
   const [originalBuffer, thumb96Buffer, thumb192Buffer, thumb512Buffer] = await Promise.all([
-    sharp(fileBuffer).toFormat(ext, { quality: 95 }).toBuffer(),
-    sharp(fileBuffer).resize(96, 96).toFormat(ext, { quality: 80 }).toBuffer(),
-    sharp(fileBuffer).resize(192, 192).toFormat(ext, { quality: 80 }).toBuffer(),
-    sharp(fileBuffer).resize(512, 512).toFormat(ext, { quality: 90 }).toBuffer(),
+    sharp(fileBuffer)
+      .rotate()
+      .resize(2000, 2000, { fit: "inside", withoutEnlargement: true })
+      .toFormat(ext, { quality: 95 })
+      .toBuffer(),
+    sharp(fileBuffer).rotate().resize(96, 96).toFormat(ext, { quality: 80 }).toBuffer(),
+    sharp(fileBuffer).rotate().resize(192, 192).toFormat(ext, { quality: 80 }).toBuffer(),
+    sharp(fileBuffer).rotate().resize(512, 512).toFormat(ext, { quality: 90 }).toBuffer(),
   ]);
 
   // Define os caminhos no bucket
@@ -3458,7 +3457,10 @@ app.put("/api/user/avatar-base64", verifyToken, async (req, res) => {
     return res.status(200).json({ success: true, data: { photo: urls.original } });
   } catch (err) {
     console.error("Erro no upload base64 avatar:", err);
-    return res.status(500).json({ error: "Erro interno no processamento via base64." });
+    const status = err?.code >= 400 && err?.code <= 599 ? err.code : 500;
+    return res.status(status).json({
+      error: err?.message || "Erro interno no processamento via base64.",
+    });
   }
 });
 
@@ -3488,7 +3490,10 @@ app.put("/api/user/banner-base64", verifyToken, async (req, res) => {
     return res.status(200).json({ success: true, data: { banner: urls.original } });
   } catch (err) {
     console.error("Erro no upload base64 banner:", err);
-    return res.status(500).json({ error: "Erro interno no processamento de banner." });
+    const status = err?.code >= 400 && err?.code <= 599 ? err.code : 500;
+    return res.status(status).json({
+      error: err?.message || "Erro interno no processamento de banner.",
+    });
   }
 });
 
