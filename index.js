@@ -1358,6 +1358,42 @@ app.put("/api/user/professional-data", verifyToken, async (req, res) => {
   }
 });
 
+// Grava só as especialidades do profissional. Endpoint dedicado de propósito: o
+// PUT /professional-data acima faz UPDATE de cnpj/cref/formacao com ${valor || null},
+// então enviar { especialidades } por lá zeraria esses campos. Aqui a única coluna
+// tocada é usuarios.especialidades (TEXT[], canônica — as leituras usam u.especialidades).
+app.put("/api/user/especialidades", verifyToken, async (req, res) => {
+  const userId = req.userId;
+
+  // Aceita array de strings; normaliza (trim, remove vazias, dedupe, cap 20).
+  const raw = Array.isArray(req.body?.especialidades) ? req.body.especialidades : null;
+  if (!raw) {
+    return res.status(400).json({ error: "Envie 'especialidades' como uma lista." });
+  }
+  const especialidades = [
+    ...new Set(
+      raw
+        .filter((s) => typeof s === "string")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0 && s.length <= 60)
+    ),
+  ].slice(0, 20);
+
+  try {
+    await sql`
+      UPDATE usuarios
+      SET especialidades = ${especialidades},
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id_us = ${userId}
+    `;
+    res.json({ success: true, especialidades, message: "Especialidades atualizadas com sucesso." });
+  } catch (error) {
+    console.error("Erro ao atualizar especialidades:", error);
+    Sentry.captureException(error, { tags: { route: "PUT /api/user/especialidades" } });
+    res.status(500).json({ error: "Erro ao salvar especialidades." });
+  }
+});
+
 // Busca de CNAE por número ou nome. Proxy da base oficial do IBGE (subclasses),
 // cacheada em memória por deploy (a lista é estável). Cada resultado vem com a
 // flag `permitido` (se está na allowlist de educação física aceita na validação).
@@ -3794,7 +3830,7 @@ app.get("/api/trainers/:id", async (req, res) => {
   try {
     // Busca dados básicos e de regularização do usuário
     const [user] = await sql`
-      SELECT id_us AS id, nome AS name, username, avatar_url, banner_url, cref, formacao, verificado, bio, location, cref_data_registro
+      SELECT id_us AS id, nome AS name, username, avatar_url, banner_url, cref, formacao, verificado, bio, location, cref_data_registro, especialidades
       FROM usuarios
       WHERE id_us = ${id}
       LIMIT 1
@@ -3804,7 +3840,7 @@ app.get("/api/trainers/:id", async (req, res) => {
 
     // Busca perfil profissional
     const [profile] = await sql`
-      SELECT descricao AS description, experiencia_anos AS "experienceYears", especialidades
+      SELECT descricao AS description, experiencia_anos AS "experienceYears"
       FROM personal_profiles
       WHERE id_trainer = ${id}
       LIMIT 1
@@ -3842,7 +3878,7 @@ app.get("/api/trainers/:id", async (req, res) => {
       ...user,
       description: profile?.description || user.bio || "Personal Trainer",
       experienceYears: computedExperienceYears,
-      especialidades: profile?.especialidades || [],
+      especialidades: user.especialidades || [],
       agendamentosCount: agendamentosCount || 0,
       avaliacoesCount: avaliacoesCount || 0,
       verificado: user.verificado || false,
@@ -3918,7 +3954,7 @@ app.get("/api/personals", async (req, res) => {
             u.telefone,
             pp.descricao AS description,
             pp.experiencia_anos AS "experienceYears",
-            pp.especialidades,
+            u.especialidades,
             pp.rating,
             pp.total_avaliacoes AS "totalRatings",
             pp.createdat,
@@ -3954,7 +3990,7 @@ app.get("/api/personals", async (req, res) => {
             u.telefone,
             pp.descricao AS description,
             pp.experiencia_anos AS "experienceYears",
-            pp.especialidades,
+            u.especialidades,
             pp.rating,
             pp.total_avaliacoes AS "totalRatings",
             pp.createdat,
@@ -3992,7 +4028,7 @@ app.get("/api/personals", async (req, res) => {
             u.telefone,
             pp.descricao AS description,
             pp.experiencia_anos AS "experienceYears",
-            pp.especialidades,
+            u.especialidades,
             pp.rating,
             pp.total_avaliacoes AS "totalRatings",
             pp.createdat,
@@ -4018,7 +4054,7 @@ app.get("/api/personals", async (req, res) => {
             u.telefone,
             pp.descricao AS description,
             pp.experiencia_anos AS "experienceYears",
-            pp.especialidades,
+            u.especialidades,
             pp.rating,
             pp.total_avaliacoes AS "totalRatings",
             pp.createdat,
