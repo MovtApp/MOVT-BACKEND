@@ -128,6 +128,8 @@ function categoryForType(type) {
     case "follow_request":
     case "follow_accepted":
       return "follows";
+    case "new_post":
+      return "posts";
     default:
       return null;
   }
@@ -138,6 +140,7 @@ const CATEGORY_COLUMN = {
   likes: "push_likes",
   comments: "push_comments",
   follows: "push_follows",
+  posts: "push_posts",
 };
 
 /**
@@ -147,7 +150,7 @@ const CATEGORY_COLUMN = {
 async function getNotificationPrefs(sql, userId) {
   try {
     const [row] = await sql`
-      SELECT push_chat, push_likes, push_comments, push_follows,
+      SELECT push_chat, push_likes, push_comments, push_follows, push_posts,
              hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
       FROM notification_prefs WHERE user_id = ${userId}
     `;
@@ -256,10 +259,106 @@ async function notifySocialPush(sql, { recipientId, senderId, type, message, ref
   }
 }
 
+/**
+ * Push de NOVO POST para todos os seguidores aceitos do autor (fan-out).
+ *
+ * Diferente de `notifySocialPush` (1 destinatário), aqui o N pode ser grande, e
+ * na Vercel o processo congela após o `res` — então o caller precisa aguardar.
+ * Para não pagar N×queries, tudo é resolvido em **3 queries**, independente do
+ * número de seguidores:
+ *   1. seguidores + preferências (LEFT JOIN — quem nunca abriu as prefs vem com
+ *      null, que a política opt-out trata como "liberado");
+ *   2. o autor (nome/avatar para o título e o deep-link);
+ *   3. todos os tokens de uma vez.
+ * O `postToExpo` já fatia o envio em lotes de 100 (limite da API da Expo).
+ *
+ * NÃO grava linha em `notifications`: o sino/Atividade é para interações *com
+ * você* (curtida, comentário, seguidor). "Fulano publicou" pertence ao feed, e
+ * gravar N linhas por post faria a tabela crescer sem leitor. Mesmo padrão do
+ * `follow_request`, que também é só push.
+ *
+ * Silencioso por design (nunca lança) — publicar o post não pode falhar por push.
+ *
+ * @param {object} sql
+ * @param {object} args
+ * @param {number} args.authorId  id_us de quem publicou
+ * @param {number|string} args.postId  id do post (deep-link)
+ * @param {string} [args.caption]  legenda, usada como corpo quando houver
+ */
+async function notifyNewPostToFollowers(sql, { authorId, postId, caption }) {
+  try {
+    if (!authorId || !postId) return;
+
+    const rows = await sql`
+      SELECT f.follower_user_id AS user_id,
+             p.push_posts, p.quiet_hours_enabled, p.quiet_start, p.quiet_end, p.timezone
+      FROM follows f
+      LEFT JOIN notification_prefs p ON p.user_id = f.follower_user_id
+      WHERE f.followed_user_id = ${authorId} AND f.status = 'accepted'
+    `;
+
+    const recipients = rows
+      .filter((row) => isCategoryAllowed(row, "posts") && !isQuietNow(row))
+      .map((row) => row.user_id);
+    if (recipients.length === 0) return;
+
+    const [author] = await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${authorId}`;
+    const authorName = (author && author.username) || "MOVT";
+
+    const tokenRows = await sql`SELECT token FROM push_tokens WHERE user_id = ANY(${recipients})`;
+    const tokens = tokenRows.map((r) => r.token).filter(isExpoToken);
+    if (tokens.length === 0) return;
+
+    const trimmed = typeof caption === "string" ? caption.trim() : "";
+    const body = trimmed
+      ? trimmed.length > 120
+        ? trimmed.slice(0, 119) + "…"
+        : trimmed
+      : "fez uma nova publicação.";
+
+    const data = {
+      type: "new_post",
+      reference_id: String(postId),
+      senderId: String(authorId),
+      senderName: authorName,
+      senderAvatar: (author && author.avatar_url) || null,
+    };
+
+    const messages = tokens.map((to) => ({
+      to,
+      title: authorName,
+      body,
+      sound: "default",
+      data,
+      channelId: "social",
+      threadId: "social",
+    }));
+
+    const tickets = await postToExpo(messages);
+
+    const dead = [];
+    tickets.forEach((ticket, idx) => {
+      if (
+        ticket &&
+        ticket.status === "error" &&
+        ticket.details &&
+        ticket.details.error === "DeviceNotRegistered" &&
+        messages[idx]
+      ) {
+        dead.push(messages[idx].to);
+      }
+    });
+    await removeTokens(sql, dead);
+  } catch (err) {
+    console.error("[pushService] notifyNewPostToFollowers falhou:", err?.message || err);
+  }
+}
+
 module.exports = {
   sendPushToUser,
   getNotificationPrefs,
   isCategoryAllowed,
   isQuietNow,
   notifySocialPush,
+  notifyNewPostToFollowers,
 };

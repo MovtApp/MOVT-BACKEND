@@ -26,6 +26,7 @@ const {
   isCategoryAllowed,
   isQuietNow,
   notifySocialPush,
+  notifyNewPostToFollowers,
 } = require("./services/pushService");
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? Stripe(stripeSecretKey) : null;
@@ -4530,7 +4531,16 @@ app.post("/api/user/:id/follow", verifyToken, async (req, res) => {
     `;
 
     // REMOVIDO: Não inserir notificação em atividade para o pedido enviado (ficará apenas na aba solicitações)
-    
+    // O push, porém, é enviado: sem ele o destinatário não fica sabendo do pedido
+    // até abrir o app por conta própria. A aba "solicitações" segue sendo a
+    // fonte da verdade (por isso não há linha em `notifications`).
+    await notifySocialPush(sql, {
+      recipientId: followedUserId,
+      senderId: followerUserId,
+      type: "follow_request",
+      message: "quer te seguir.",
+    });
+
     return res.status(200).json({ success: true, isFollowing: false, status });
   } catch (err) {
     console.error("Erro ao seguir usuário:", err);
@@ -5259,6 +5269,16 @@ app.post("/api/user/posts", verifyToken, async (req, res) => {
       RETURNING *
     `;
 
+    // Avisa os seguidores. Precisa ser aguardado: na Vercel o processo congela
+    // após o `res`, então um fire-and-forget aqui simplesmente não entregaria.
+    // O custo é fixo (3 queries + lotes de 100 na Expo), mas cresce com o número
+    // de seguidores — se o endpoint ficar lento, é aqui que se mexe.
+    await notifyNewPostToFollowers(sql, {
+      authorId: userId,
+      postId: newPost.id,
+      caption: legenda,
+    });
+
     return res.status(201).json({ success: true, message: "Post criado com sucesso!", data: newPost });
   } catch (err) {
     console.error("Erro em POST /api/user/posts", err);
@@ -5769,7 +5789,7 @@ app.get("/api/notifications/preferences", verifyToken, async (req, res) => {
   const userId = req.userId;
   try {
     let [prefs] = await sql`
-      SELECT push_chat, push_likes, push_comments, push_follows,
+      SELECT push_chat, push_likes, push_comments, push_follows, push_posts,
              hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
       FROM notification_prefs WHERE user_id = ${userId}
     `;
@@ -5777,7 +5797,7 @@ app.get("/api/notifications/preferences", verifyToken, async (req, res) => {
       [prefs] = await sql`
         INSERT INTO notification_prefs (user_id) VALUES (${userId})
         ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
-        RETURNING push_chat, push_likes, push_comments, push_follows,
+        RETURNING push_chat, push_likes, push_comments, push_follows, push_posts,
                   hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
       `;
     }
@@ -5800,6 +5820,7 @@ app.put("/api/notifications/preferences", verifyToken, async (req, res) => {
   const likes = asBool(b.push_likes);
   const comments = asBool(b.push_comments);
   const follows = asBool(b.push_follows);
+  const posts = asBool(b.push_posts);
   const hidePreview = asBool(b.hide_message_preview);
   const quietEnabled = asBool(b.quiet_hours_enabled);
   const quietStart = asTime(b.quiet_start);
@@ -5809,12 +5830,12 @@ app.put("/api/notifications/preferences", verifyToken, async (req, res) => {
   try {
     const [prefs] = await sql`
       INSERT INTO notification_prefs (
-        user_id, push_chat, push_likes, push_comments, push_follows,
+        user_id, push_chat, push_likes, push_comments, push_follows, push_posts,
         hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone, updated_at
       )
       VALUES (
         ${userId},
-        ${chat ?? true}, ${likes ?? true}, ${comments ?? true}, ${follows ?? true},
+        ${chat ?? true}, ${likes ?? true}, ${comments ?? true}, ${follows ?? true}, ${posts ?? true},
         ${hidePreview ?? false}, ${quietEnabled ?? false}, ${quietStart}, ${quietEnd}, ${timezone},
         NOW()
       )
@@ -5823,13 +5844,14 @@ app.put("/api/notifications/preferences", verifyToken, async (req, res) => {
         push_likes           = COALESCE(${likes}, notification_prefs.push_likes),
         push_comments        = COALESCE(${comments}, notification_prefs.push_comments),
         push_follows         = COALESCE(${follows}, notification_prefs.push_follows),
+        push_posts           = COALESCE(${posts}, notification_prefs.push_posts),
         hide_message_preview = COALESCE(${hidePreview}, notification_prefs.hide_message_preview),
         quiet_hours_enabled  = COALESCE(${quietEnabled}, notification_prefs.quiet_hours_enabled),
         quiet_start          = COALESCE(${quietStart}, notification_prefs.quiet_start),
         quiet_end            = COALESCE(${quietEnd}, notification_prefs.quiet_end),
         timezone             = COALESCE(${timezone}, notification_prefs.timezone),
         updated_at           = NOW()
-      RETURNING push_chat, push_likes, push_comments, push_follows,
+      RETURNING push_chat, push_likes, push_comments, push_follows, push_posts,
                 hide_message_preview, quiet_hours_enabled, quiet_start, quiet_end, timezone
     `;
     return res.status(200).json({ success: true, data: prefs });
