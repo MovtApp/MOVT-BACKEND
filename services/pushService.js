@@ -58,6 +58,38 @@ async function postToExpo(messages) {
 }
 
 /**
+ * Monta o corpo de UMA mensagem do Expo Push. Centralizado para que `image` e
+ * `categoryId` valham igual no chat e no social, sem duplicar regra.
+ *
+ * Sobre `richContent.image` (doc do Expo): no **Android funciona out of the box**
+ * — e, lendo o fonte do expo-notifications (`ExpoNotificationBuilder.kt:152`),
+ * ele vira **`setLargeIcon`**, a miniatura ao lado do texto (é ali que o
+ * Instagram põe a foto), não uma imagem gigante. No **iOS exige um Notification
+ * Service Extension** + `mutableContent: true` — por isso mandamos o flag desde
+ * já: sem a extensão ele é inofensivo, e quando ela existir passa a valer sem
+ * mexer no backend.
+ */
+function buildExpoMessage(to, { title, body, data, channelId, threadId, badge, image, categoryId }) {
+  return {
+    to,
+    title,
+    body,
+    sound: "default",
+    data: data || {},
+    ...(channelId ? { channelId } : {}),
+    // threadId agrupa as notificações por conversa/categoria (iOS thread; no
+    // Android o agrupamento é por canal).
+    ...(threadId ? { threadId } : {}),
+    ...(typeof badge === "number" ? { badge } : {}),
+    // Foto (avatar de quem interagiu / imagem do post).
+    ...(image ? { richContent: { image }, mutableContent: true } : {}),
+    // Botões de ação (Responder, Aceitar/Recusar, Curtir). A categoria em si é
+    // registrada no app (setNotificationCategoryAsync); aqui só referenciamos.
+    ...(categoryId ? { categoryId } : {}),
+  };
+}
+
+/**
  * Envia um push para TODOS os dispositivos de um usuário.
  *
  * @param {object} sql  cliente postgres injetado
@@ -68,25 +100,16 @@ async function postToExpo(messages) {
  * @param {object} [payload.data] dados para o deep-link no app (ex.: { type, chatId })
  * @param {string} [payload.channelId]  canal Android ('messages' | 'social' | 'reminders')
  * @param {number} [payload.badge]  contador do ícone (iOS)
+ * @param {string} [payload.image]  URL da foto (largeIcon no Android; iOS exige NSE)
+ * @param {string} [payload.categoryId]  categoria de ações registrada no app
  */
-async function sendPushToUser(sql, userId, { title, body, data, channelId, threadId, badge } = {}) {
+async function sendPushToUser(sql, userId, payload = {}) {
   try {
     if (!userId) return;
     const tokens = await getUserTokens(sql, userId);
     if (tokens.length === 0) return;
 
-    const messages = tokens.map((to) => ({
-      to,
-      title,
-      body,
-      sound: "default",
-      data: data || {},
-      ...(channelId ? { channelId } : {}),
-      // threadId agrupa as notificações por conversa/categoria (iOS thread; no
-      // Android o agrupamento é por canal).
-      ...(threadId ? { threadId } : {}),
-      ...(typeof badge === "number" ? { badge } : {}),
-    }));
+    const messages = tokens.map((to) => buildExpoMessage(to, payload));
 
     const tickets = await postToExpo(messages);
 
@@ -141,6 +164,23 @@ const CATEGORY_COLUMN = {
   comments: "push_comments",
   follows: "push_follows",
   posts: "push_posts",
+};
+
+/**
+ * Categorias de AÇÃO (botões na notificação) por tipo. Os identificadores têm de
+ * bater EXATAMENTE com os registrados no app via `setNotificationCategoryAsync`
+ * (src/services/pushNotificationService.ts) — se divergirem, o SO simplesmente
+ * não desenha botão nenhum, silenciosamente.
+ *
+ * Só tipos com ação ÚTIL entram. `like`/`follow_accepted` ficam de fora de
+ * propósito: não há o que fazer além de abrir, e o toque já faz isso.
+ */
+const ACTION_CATEGORY_FOR_TYPE = {
+  chat: "movt_chat",           // Responder (campo de texto)
+  comment: "movt_comment",     // Responder (campo de texto)
+  comment_diet: "movt_comment",
+  follow_request: "movt_follow_request", // Aceitar / Recusar
+  new_post: "movt_new_post",   // Curtir
 };
 
 /**
@@ -240,18 +280,23 @@ async function notifySocialPush(sql, { recipientId, senderId, type, message, ref
 
     const [sender] = await sql`SELECT username, avatar_url FROM usuarios WHERE id_us = ${senderId}`;
     const senderName = (sender && sender.username) || "MOVT";
+    const senderAvatar = (sender && sender.avatar_url) || null;
 
     await sendPushToUser(sql, recipientId, {
       title: senderName,
       body: message,
       channelId: "social",
       threadId: "social",
+      // A foto de QUEM interagiu — é o que o Instagram mostra na miniatura de
+      // curtida/comentário/seguidor (o post em si o usuário já conhece).
+      image: senderAvatar || undefined,
+      categoryId: ACTION_CATEGORY_FOR_TYPE[type] || undefined,
       data: {
         type,
         reference_id: referenceId != null ? String(referenceId) : null,
         senderId: String(senderId),
         senderName,
-        senderAvatar: (sender && sender.avatar_url) || null,
+        senderAvatar,
       },
     });
   } catch (err) {
@@ -285,7 +330,7 @@ async function notifySocialPush(sql, { recipientId, senderId, type, message, ref
  * @param {number|string} args.postId  id do post (deep-link)
  * @param {string} [args.caption]  legenda, usada como corpo quando houver
  */
-async function notifyNewPostToFollowers(sql, { authorId, postId, caption }) {
+async function notifyNewPostToFollowers(sql, { authorId, postId, caption, imageUrl }) {
   try {
     if (!authorId || !postId) return;
 
@@ -322,17 +367,24 @@ async function notifyNewPostToFollowers(sql, { authorId, postId, caption }) {
       senderId: String(authorId),
       senderName: authorName,
       senderAvatar: (author && author.avatar_url) || null,
+      // Vai no `data` além do richContent porque o banner IN-APP (app aberto)
+      // não enxerga o richContent — ele monta o card a partir daqui.
+      image: imageUrl || null,
     };
 
-    const messages = tokens.map((to) => ({
-      to,
-      title: authorName,
-      body,
-      sound: "default",
-      data,
-      channelId: "social",
-      threadId: "social",
-    }));
+    const messages = tokens.map((to) =>
+      buildExpoMessage(to, {
+        title: authorName,
+        body,
+        data,
+        channelId: "social",
+        threadId: "social",
+        // Aqui a miniatura certa é a IMAGEM DO POST, não o avatar: é o conteúdo
+        // que está sendo anunciado (o autor já vai no título).
+        image: imageUrl || undefined,
+        categoryId: ACTION_CATEGORY_FOR_TYPE.new_post,
+      })
+    );
 
     const tickets = await postToExpo(messages);
 

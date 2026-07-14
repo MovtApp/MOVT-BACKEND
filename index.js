@@ -5277,6 +5277,7 @@ app.post("/api/user/posts", verifyToken, async (req, res) => {
       authorId: userId,
       postId: newPost.id,
       caption: legenda,
+      imageUrl: finalUrl,
     });
 
     return res.status(201).json({ success: true, message: "Post criado com sucesso!", data: newPost });
@@ -7076,6 +7077,12 @@ app.post("/api/chat/:id_chat/messages", verifyToken, async (req, res) => {
             body,
             channelId: "messages",
             threadId: "chat-" + String(id_chat),
+            // Foto de quem mandou (miniatura, estilo WhatsApp/Instagram).
+            // Com "ocultar prévia" ligado a foto NÃO vai: quem pediu menos
+            // exposição na tela de bloqueio não quer o rosto do contato lá,
+            // mesmo que o nome continue (decisão anterior, mantida).
+            image: hidePreview ? undefined : (sender && sender.avatar_url) || undefined,
+            categoryId: "movt_chat", // botão "Responder" (campo de texto)
             data: {
               type: "chat",
               chatId: String(id_chat),
