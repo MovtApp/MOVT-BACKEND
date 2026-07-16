@@ -903,9 +903,19 @@ async function sendPasswordResetEmail(toEmail, resetCode) {
 }
 
 // Encryption/Decryption functions for message content
-let ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '6f9a2b8c4d7e1f3a5b0c9d8e7f6a5b4c'; // 32 bytes fallback
-if (typeof ENCRYPTION_KEY === 'string' && ENCRYPTION_KEY.length !== 32) {
-  // Ajustar para 32 bytes se necessário (pad ou truncate)
+// C2 (fail-closed): sem ENCRYPTION_KEY o boot aborta — nunca cai numa chave
+// conhecida no fonte (o fallback anterior tornava TODO o chat decifrável por
+// qualquer um com o código). A normalização de 32 bytes é preservada para não
+// quebrar a decifra das mensagens já gravadas com uma chave já configurada.
+if (!process.env.ENCRYPTION_KEY) {
+  throw new Error(
+    "ENCRYPTION_KEY não configurada. Defina-a no ambiente (Vercel) antes de subir. " +
+    "Para preservar o histórico de chat, use a MESMA chave que já cifrou as mensagens."
+  );
+}
+let ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (ENCRYPTION_KEY.length !== 32) {
+  // Mantém a derivação legada (pad/truncate) para chaves != 32 bytes já em uso.
   ENCRYPTION_KEY = ENCRYPTION_KEY.padEnd(32, '0').substring(0, 32);
 }
 const IV_LENGTH = 16; // For AES-256-CBC, this is always 16
@@ -1975,10 +1985,45 @@ app.post("/api/register", async (req, res) => {
 
 // Endpoint de Sincronização de Login Social (Supabase -> Vercel)
 app.post("/api/auth/social-sync", async (req, res) => {
-  const { email, nome, supabase_uid, photo } = req.body;
+  const { email, nome, supabase_uid, photo, access_token } = req.body;
 
   if (!email || !supabase_uid) {
     return res.status(400).json({ error: "E-mail e Supabase UID são obrigatórios para sincronização." });
+  }
+
+  // ── C1: validar a identidade ANTES de confiar em email/supabase_uid ──────────
+  // Sem esta checagem, qualquer um fazia POST { email: "vitima@x", supabase_uid }
+  // e recebia de volta um sessionId válido + o registro completo da vítima
+  // (account takeover). Exigimos o access_token do Supabase e confirmamos, no
+  // servidor de auth, que ele pertence de fato ao email/uid reivindicados.
+  if (!access_token) {
+    return res.status(401).json({ error: "Token de autenticação ausente." });
+  }
+  if (!supabase) {
+    // fail-closed: sem cliente Supabase não há como validar o token.
+    console.error("[SocialSync] Cliente Supabase indisponível — não é possível validar o token.");
+    return res.status(503).json({ error: "Serviço de autenticação indisponível." });
+  }
+  try {
+    const { data: authData, error: authError } = await supabase.auth.getUser(access_token);
+    const verified = authData?.user;
+    if (authError || !verified) {
+      return res.status(401).json({ error: "Token de autenticação inválido." });
+    }
+    const emailMatches =
+      String(verified.email || "").toLowerCase() === String(email).toLowerCase();
+    if (verified.id !== supabase_uid || !emailMatches) {
+      console.warn(
+        `[SocialSync] Divergência token x corpo: token=${verified.id}/${verified.email} corpo=${supabase_uid}/${email}`
+      );
+      return res.status(401).json({ error: "Token não corresponde ao usuário informado." });
+    }
+  } catch (validationError) {
+    console.error("[SocialSync] Falha ao validar token:", validationError);
+    Sentry.captureException(validationError, {
+      tags: { route: "POST /api/auth/social-sync", flow: "token-validation" },
+    });
+    return res.status(401).json({ error: "Falha ao validar token de autenticação." });
   }
 
   try {

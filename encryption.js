@@ -1,8 +1,15 @@
 const crypto = require("crypto");
 
 const algorithm = "aes-256-cbc";
-// Use a 32 byte key. If JWT_SECRET is shorter/longer, we derive it.
-const secretKey = crypto.createHash('sha256').update(String(process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || 'movt-fallback-secret')).digest();
+// Use a 32 byte key derived via sha256. C2 (fail-closed): sem chave configurada
+// o módulo aborta em vez de cair num segredo conhecido no fonte. Preserva a
+// ordem de origem (ENCRYPTION_KEY -> JWT_SECRET) e a derivação sha256 para não
+// quebrar dados já cifrados por este módulo.
+const _rawEncKey = process.env.ENCRYPTION_KEY || process.env.JWT_SECRET;
+if (!_rawEncKey) {
+  throw new Error("ENCRYPTION_KEY/JWT_SECRET não configurada — abortando (fail-closed).");
+}
+const secretKey = crypto.createHash('sha256').update(String(_rawEncKey)).digest();
 const ivSize = 16;
 
 function encrypt(text) {
