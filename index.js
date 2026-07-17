@@ -2060,7 +2060,18 @@ app.post("/api/auth/social-sync", async (req, res) => {
       });
     }
 
-    // 3. Se não existe, criamos um registro básico (Onboarding Pending)
+    // DESATIVADO: não criamos mais conta automaticamente (regra de produto —
+    // "nunca auto-criar"). O fluxo correto é POST /api/auth/social-login, que
+    // devolve 404 SOCIAL_NOT_LINKED e faz o app pedir pra criar conta + vincular.
+    // Mantido só por segurança de rollout; o código abaixo fica inacessível.
+    return res.status(404).json({
+      error: "SOCIAL_NOT_LINKED",
+      message:
+        "Não encontramos uma conta MOVT com este e-mail. Crie sua conta e depois vincule o Google.",
+      email,
+    });
+
+    // 3. (legado/inacessível) Se não existe, criamos um registro básico (Onboarding Pending)
     console.log(`[SocialSync] Criando novo registro básico para: ${email}`);
     
     // Senha aleatória para usuários sociais (eles não usarão senha para logar)
@@ -2093,6 +2104,205 @@ app.post("/api/auth/social-sync", async (req, res) => {
       extra: { pgCode: error.code, pgDetail: error.detail },
     });
     res.status(500).json({ error: "Erro interno na sincronização social.", details: error.message });
+  }
+});
+
+// ==================== LOGIN / VÍNCULO SOCIAL (Google) ==================== //
+// Regra de produto: NUNCA criar conta automaticamente pelo login social. Se o
+// e-mail do Google não tiver conta MOVT, devolvemos 404 SOCIAL_NOT_LINKED e o
+// app manda o usuário criar conta e depois vincular.
+
+// Valida o access_token do Supabase e confirma que ele pertence ao uid/e-mail
+// reivindicados. Retorna { ok:true, verified } ou { ok:false, status, error }.
+async function validateSupabaseToken(access_token, { expectedUid, expectedEmail } = {}) {
+  if (!access_token) return { ok: false, status: 401, error: "Token de autenticação ausente." };
+  if (!supabase) {
+    // fail-closed: sem cliente Supabase não há como validar o token.
+    console.error("[Social] Cliente Supabase indisponível — não é possível validar o token.");
+    return { ok: false, status: 503, error: "Serviço de autenticação indisponível." };
+  }
+  try {
+    const { data: authData, error: authError } = await supabase.auth.getUser(access_token);
+    const verified = authData?.user;
+    if (authError || !verified) return { ok: false, status: 401, error: "Token de autenticação inválido." };
+    if (expectedUid && verified.id !== expectedUid) {
+      return { ok: false, status: 401, error: "Token não corresponde ao usuário informado." };
+    }
+    if (
+      expectedEmail &&
+      String(verified.email || "").toLowerCase() !== String(expectedEmail).toLowerCase()
+    ) {
+      return { ok: false, status: 401, error: "Token não corresponde ao e-mail informado." };
+    }
+    return { ok: true, verified };
+  } catch (err) {
+    Sentry.captureException(err, { tags: { flow: "supabase-token-validation" } });
+    return { ok: false, status: 401, error: "Falha ao validar token de autenticação." };
+  }
+}
+
+// Grava o vínculo Supabase↔conta nos DOIS stores que o backend lê, evitando
+// divergência de identidade: as colunas de 'usuarios' (usadas pelo fluxo social)
+// E a tabela user_id_mapping (usada por /api/login e /api/user/session-status).
+async function linkSupabaseIdentity(id_us, supabase_uid) {
+  await sql`
+    UPDATE usuarios
+    SET supabase_uid = ${supabase_uid}, auth_user_id = ${supabase_uid}, updated_at = NOW()
+    WHERE id_us = ${id_us}
+  `;
+  const [existing] = await sql`SELECT 1 AS x FROM user_id_mapping WHERE id_us = ${id_us}`;
+  if (existing) {
+    await sql`UPDATE user_id_mapping SET auth_user_id = ${supabase_uid} WHERE id_us = ${id_us}`;
+  } else {
+    await sql`INSERT INTO user_id_mapping (id_us, auth_user_id) VALUES (${id_us}, ${supabase_uid})`;
+  }
+}
+
+// Monta o objeto 'user' no mesmo formato que /api/login devolve.
+function buildUserPayload(u, supabase_uid) {
+  return {
+    id: u.id_us,
+    nome: u.nome,
+    username: u.username,
+    email: u.email,
+    isVerified: u.email_verified,
+    supabase_uid: supabase_uid,
+    role: u.role,
+    documentType: u.cnpj ? "CNPJ" : "CPF",
+    cref_verified: u.cref_verified,
+    cnpj_verified: u.cnpj_verified,
+    status_verificacao: u.status_verificacao,
+    cref_submitted: !!u.document_url,
+    cref_rejeicao_motivo: u.cref_rejeicao_motivo || null,
+    phone_verified: u.phone_verified,
+    onboarding_completed: u.onboarding_completed,
+  };
+}
+
+// Login social. Encontra a conta pelo supabase_uid ou pelo e-mail (auto-vínculo
+// por e-mail — seguro, pois o access_token já provou que o e-mail é do
+// requisitante). NUNCA cria conta.
+async function handleSocialLogin(req, res) {
+  const { email, supabase_uid, photo, access_token } = req.body;
+
+  if (!email || !supabase_uid) {
+    return res.status(400).json({ error: "E-mail e Supabase UID são obrigatórios." });
+  }
+
+  const check = await validateSupabaseToken(access_token, {
+    expectedUid: supabase_uid,
+    expectedEmail: email,
+  });
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+
+  try {
+    const [existingUser] = await sql`
+      SELECT * FROM usuarios
+      WHERE supabase_uid = ${supabase_uid} OR LOWER(email) = LOWER(${email})
+      LIMIT 1
+    `;
+
+    if (!existingUser) {
+      // Sem conta MOVT vinculável → o app manda criar conta e vincular.
+      return res.status(404).json({
+        error: "SOCIAL_NOT_LINKED",
+        message:
+          "Não encontramos uma conta MOVT com este e-mail. Crie sua conta e depois vincule o Google nas configurações.",
+        email,
+      });
+    }
+
+    const newSessionId = uuidv4();
+    await linkSupabaseIdentity(existingUser.id_us, supabase_uid);
+    const [u] = await sql`
+      UPDATE usuarios
+      SET session_id = ${newSessionId},
+          avatar_url = COALESCE(avatar_url, ${photo || null}),
+          updated_at = NOW()
+      WHERE id_us = ${existingUser.id_us}
+      RETURNING *
+    `;
+
+    return res.json({
+      message: "Login social realizado com sucesso.",
+      user: buildUserPayload(u, supabase_uid),
+      sessionId: newSessionId,
+      isNewUser: false,
+    });
+  } catch (error) {
+    console.error("[SocialLogin] Erro crítico:", error);
+    Sentry.captureException(error, {
+      tags: { route: "POST /api/auth/social-login", flow: "social-login" },
+      extra: { pgCode: error.code, pgDetail: error.detail },
+    });
+    res.status(500).json({ error: "Erro interno no login social.", details: error.message });
+  }
+}
+
+// Novo endpoint canônico do login social (sem auto-criação).
+app.post("/api/auth/social-login", handleSocialLogin);
+
+// Vincula uma conta Google à conta MOVT já logada. Exige que o e-mail do Google
+// seja o MESMO da conta (decisão de produto).
+app.post("/api/auth/social-link", verifyToken, async (req, res) => {
+  const { access_token, supabase_uid, email } = req.body;
+  if (!supabase_uid) return res.status(400).json({ error: "Supabase UID é obrigatório." });
+
+  const check = await validateSupabaseToken(access_token, {
+    expectedUid: supabase_uid,
+    expectedEmail: email,
+  });
+  if (!check.ok) return res.status(check.status).json({ error: check.error });
+
+  try {
+    const [account] = await sql`SELECT id_us, email FROM usuarios WHERE id_us = ${req.userId}`;
+    if (!account) return res.status(404).json({ error: "Conta não encontrada." });
+
+    // Decisão 2: o e-mail do Google TEM que ser igual ao e-mail da conta.
+    const googleEmail = String(check.verified.email || "").toLowerCase();
+    if (googleEmail !== String(account.email || "").toLowerCase()) {
+      return res.status(409).json({
+        error: "EMAIL_MISMATCH",
+        message: `O e-mail do Google (${check.verified.email}) é diferente do e-mail da sua conta (${account.email}). Entre com a conta Google que usa o mesmo e-mail.`,
+      });
+    }
+
+    // Este supabase_uid já pertence a OUTRA conta MOVT?
+    const [other] = await sql`
+      SELECT id_us FROM usuarios
+      WHERE supabase_uid = ${supabase_uid} AND id_us <> ${req.userId}
+      LIMIT 1
+    `;
+    if (other) {
+      return res.status(409).json({
+        error: "ALREADY_LINKED_OTHER",
+        message: "Esta conta Google já está vinculada a outro usuário MOVT.",
+      });
+    }
+
+    await linkSupabaseIdentity(req.userId, supabase_uid);
+    return res.json({ message: "Conta Google vinculada com sucesso.", supabase_uid, linked: true });
+  } catch (error) {
+    console.error("[SocialLink] Erro:", error);
+    Sentry.captureException(error, { tags: { route: "POST /api/auth/social-link" } });
+    res.status(500).json({ error: "Erro interno ao vincular conta Google.", details: error.message });
+  }
+});
+
+// Desvincula a conta Google da conta MOVT logada (some dos dois stores).
+app.post("/api/auth/social-unlink", verifyToken, async (req, res) => {
+  try {
+    await sql`
+      UPDATE usuarios
+      SET supabase_uid = NULL, auth_user_id = NULL, updated_at = NOW()
+      WHERE id_us = ${req.userId}
+    `;
+    await sql`DELETE FROM user_id_mapping WHERE id_us = ${req.userId}`;
+    return res.json({ message: "Conta Google desvinculada.", linked: false });
+  } catch (error) {
+    console.error("[SocialUnlink] Erro:", error);
+    Sentry.captureException(error, { tags: { route: "POST /api/auth/social-unlink" } });
+    res.status(500).json({ error: "Erro interno ao desvincular conta Google.", details: error.message });
   }
 });
 
