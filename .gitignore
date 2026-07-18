@@ -47,3 +47,6 @@ temp/
 
 .vercel
 .env*.local
+
+# backups de migração (dados de usuário) — nunca versionar
+scripts/_backup_*.json
