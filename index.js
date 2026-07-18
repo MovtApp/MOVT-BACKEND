@@ -2145,6 +2145,16 @@ async function validateSupabaseToken(access_token, { expectedUid, expectedEmail 
 // divergência de identidade: as colunas de 'usuarios' (usadas pelo fluxo social)
 // E a tabela user_id_mapping (usada por /api/login e /api/user/session-status).
 async function linkSupabaseIdentity(id_us, supabase_uid) {
+  // Exclusividade 1:1 — este supabase_uid não pode permanecer vinculado a nenhum
+  // outro usuário. Rede de segurança contra corrida/dados corrompidos (Bug 1):
+  // solta o vínculo em AMBOS os stores antes de gravar o novo dono.
+  await sql`
+    UPDATE usuarios
+    SET supabase_uid = NULL, auth_user_id = NULL, updated_at = NOW()
+    WHERE auth_user_id = ${supabase_uid} AND id_us <> ${id_us}
+  `;
+  await sql`DELETE FROM user_id_mapping WHERE auth_user_id = ${supabase_uid} AND id_us <> ${id_us}`;
+
   await sql`
     UPDATE usuarios
     SET supabase_uid = ${supabase_uid}, auth_user_id = ${supabase_uid}, updated_at = NOW()
