@@ -1,0 +1,83 @@
+{
+  "gerado_em": "2026-07-20T22:03:55.098Z",
+  "grupos": [
+    {
+      "chave": "uid:a041554a-cb8c-423d-8983-14224f9ca414",
+      "canonical": null,
+      "duplicates": [
+        14,
+        56
+      ],
+      "tables": [
+        {
+          "table": "activities",
+          "column": "id_us"
+        },
+        {
+          "table": "agendamentos",
+          "column": "id_usuario"
+        },
+        {
+          "table": "community_members",
+          "column": "id_us"
+        },
+        {
+          "table": "dados_saude",
+          "column": "id_us"
+        },
+        {
+          "table": "desafio_participacoes",
+          "column": "id_us"
+        },
+        {
+          "table": "dietas",
+          "column": "id_us"
+        },
+        {
+          "table": "follows",
+          "column": "followed_user_id"
+        },
+        {
+          "table": "follows",
+          "column": "follower_user_id"
+        },
+        {
+          "table": "notifications",
+          "column": "sender_id"
+        },
+        {
+          "table": "notifications",
+          "column": "user_id"
+        },
+        {
+          "table": "post_comments",
+          "column": "id_us"
+        },
+        {
+          "table": "post_likes",
+          "column": "id_us"
+        },
+        {
+          "table": "post_saves",
+          "column": "id_us"
+        },
+        {
+          "table": "posts",
+          "column": "id_us"
+        },
+        {
+          "table": "push_tokens",
+          "column": "user_id"
+        },
+        {
+          "table": "user_mission",
+          "column": "id_us"
+        },
+        {
+          "table": "user_workouts",
+          "column": "id_us"
+        }
+      ]
+    }
+  ]
+}
