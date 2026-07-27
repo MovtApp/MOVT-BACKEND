@@ -424,6 +424,9 @@ async function initDb() {
     await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS water_intake_ml INTEGER DEFAULT NULL`;
     await sql`ALTER TABLE dados_saude ADD COLUMN IF NOT EXISTS sleep_hours DECIMAL(4,2) DEFAULT NULL`;
 
+    // Cache de cards de share (Mapbox Static) por treino — evita regenerar a cada compartilhar.
+    // JSON: { updatedAt, cards: { "feed|classic|0": "https://...", ... } }
+    await sql`ALTER TABLE user_workouts ADD COLUMN IF NOT EXISTS share_cards JSONB DEFAULT NULL`;
 
     console.log("✅ Banco de dados sincronizado.");
   } catch (err) {
@@ -1586,9 +1589,15 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
     throw { code: 500, message: "Supabase Storage não configurado. Verifique as variáveis de ambiente." };
   }
 
+  // iOS/Expo frequentemente enviam `image/jpg` (extensão .jpg) — normaliza antes de validar.
+  const normalizedMime =
+    mimetype === "image/jpg" || mimetype === "image/pjpeg"
+      ? "image/jpeg"
+      : mimetype;
+
   // Validação extra: tipos válidos
   const validMimeTypes = ["image/jpeg", "image/png", "image/webp"];
-  if (!validMimeTypes.includes(mimetype)) {
+  if (!validMimeTypes.includes(normalizedMime)) {
     throw { code: 422, message: "Formato de imagem não suportado." };
   }
 
@@ -1606,7 +1615,7 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
   // Paths/nomes no Supabase Storage
   const uuid = uuidv4();
   const base = `avatar_${userId}_${uuid}`;
-  const ext = mimetype === "image/png" ? "png" : mimetype === "image/webp" ? "webp" : "jpg";
+  const ext = normalizedMime === "image/png" ? "png" : normalizedMime === "image/webp" ? "webp" : "jpg";
 
   // Processa as versões redimensionadas
   const [originalBuffer, thumb96Buffer, thumb192Buffer, thumb512Buffer] = await Promise.all([
@@ -1631,25 +1640,25 @@ async function processAndSaveAvatar(userId, fileBuffer, mimetype) {
     supabase.storage
       .from(AVATAR_BUCKET)
       .upload(originalPath, originalBuffer, {
-        contentType: mimetype,
+        contentType: normalizedMime,
         upsert: true,
       }),
     supabase.storage
       .from(AVATAR_BUCKET)
       .upload(thumb96Path, thumb96Buffer, {
-        contentType: mimetype,
+        contentType: normalizedMime,
         upsert: true,
       }),
     supabase.storage
       .from(AVATAR_BUCKET)
       .upload(thumb192Path, thumb192Buffer, {
-        contentType: mimetype,
+        contentType: normalizedMime,
         upsert: true,
       }),
     supabase.storage
       .from(AVATAR_BUCKET)
       .upload(thumb512Path, thumb512Buffer, {
-        contentType: mimetype,
+        contentType: normalizedMime,
         upsert: true,
       }),
   ]);
@@ -4681,10 +4690,21 @@ app.post("/api/route/snap", verifyToken, async (req, res) => {
 
 // POST: gera o CARD compartilhável (estilo Strava) de um treino — mapa real
 // (Mapbox Static Images) com a rota desenhada + os números e a marca MOVT
-// "queimados" na imagem. O app baixa o PNG (base64) e abre o menu nativo de
-// compartilhamento. A chave da Mapbox fica só no servidor.
+// "queimados" na imagem. Com `workoutId`, persiste PNGs no Storage e reusa
+// nas próximas vezes (sem novo hit Mapbox). Ver ADR-0042.
 app.post("/api/route/share-card", verifyToken, async (req, res) => {
-  const { route, type, title, subtitle, stats, layout, variants, format } = req.body || {};
+  const {
+    route,
+    type,
+    title,
+    subtitle,
+    stats,
+    layout,
+    variants,
+    format,
+    workoutId,
+    variantIndex,
+  } = req.body || {};
   if (!Array.isArray(route) || route.length < 2) {
     return res.status(400).json({ error: "Rota insuficiente para gerar o card." });
   }
@@ -4700,7 +4720,6 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
     const safeTitle =
       typeof title === "string" && title.trim() ? title.trim().slice(0, 40) : kind;
     const safeSubtitle = typeof subtitle === "string" ? subtitle.slice(0, 60) : "";
-    // Sanitiza um array de stats (textos "queimados" na imagem).
     const sanitizeStats = (arr) =>
       Array.isArray(arr)
         ? arr.slice(0, 4).map((s) => ({
@@ -4709,12 +4728,71 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
           }))
         : [];
 
-    // Modo carrossel: várias variantes (layout + stats) num único request.
+    const cacheKey = (fmt, lay, idx) => `${fmt}|${lay || "classic"}|${idx}`;
+
+    let wid = null;
+    let shareCardsDoc = { updatedAt: null, cards: {} };
+    if (workoutId != null && workoutId !== "" && !Number.isNaN(Number(workoutId))) {
+      wid = Number(workoutId);
+      const [row] = await sql`
+        SELECT id, share_cards FROM user_workouts
+        WHERE id = ${wid} AND id_us = ${req.userId}
+      `;
+      if (!row) {
+        return res.status(404).json({ error: "Treino não encontrado." });
+      }
+      if (row.share_cards && typeof row.share_cards === "object") {
+        shareCardsDoc = {
+          updatedAt: row.share_cards.updatedAt || null,
+          cards:
+            row.share_cards.cards && typeof row.share_cards.cards === "object"
+              ? { ...row.share_cards.cards }
+              : {},
+        };
+      }
+    }
+
+    const persistShareCards = async () => {
+      if (wid == null) return;
+      shareCardsDoc.updatedAt = new Date().toISOString();
+      await sql`
+        UPDATE user_workouts
+        SET share_cards = ${sql.json(shareCardsDoc)}
+        WHERE id = ${wid} AND id_us = ${req.userId}
+      `;
+    };
+
+    const uploadPng = async (key, pngBuffer) => {
+      if (!supabase) throw new Error("Storage indisponível no servidor.");
+      const path =
+        wid != null
+          ? `workout-cards/${req.userId}/${wid}/${key.replace(/\|/g, "_")}.png`
+          : `workout-cards/${req.userId}/${Date.now()}.png`;
+      const { error: upErr } = await supabase.storage
+        .from(POST_BUCKET)
+        .upload(path, pngBuffer, { contentType: "image/png", upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      return supabase.storage.from(POST_BUCKET).getPublicUrl(path).data.publicUrl;
+    };
+
     if (Array.isArray(variants) && variants.length > 0) {
       const safeVariants = variants.slice(0, 6).map((v) => ({
         layout: allowedLayouts.includes(v?.layout) ? v.layout : "classic",
         stats: sanitizeStats(v?.stats),
       }));
+      const keys = safeVariants.map((v, i) => cacheKey(safeFormat, v.layout, i));
+      const allCached =
+        wid != null && keys.every((k) => typeof shareCardsDoc.cards[k] === "string");
+
+      if (allCached) {
+        return res.status(200).json({
+          ok: true,
+          cached: true,
+          urls: keys.map((k) => shareCardsDoc.cards[k]),
+          shareCards: shareCardsDoc,
+        });
+      }
+
       const pngs = await buildShareCards({
         route,
         type: kind,
@@ -4723,40 +4801,80 @@ app.post("/api/route/share-card", verifyToken, async (req, res) => {
         variants: safeVariants,
         format: safeFormat,
       });
-      return res.status(200).json({ ok: true, images: pngs.map((p) => p.toString("base64")) });
+
+      const urls = [];
+      if (wid != null && supabase) {
+        for (let i = 0; i < pngs.length; i++) {
+          const url = await uploadPng(keys[i], pngs[i]);
+          shareCardsDoc.cards[keys[i]] = url;
+          urls.push(url);
+        }
+        await persistShareCards();
+      }
+
+      return res.status(200).json({
+        ok: true,
+        cached: false,
+        images: pngs.map((p) => p.toString("base64")),
+        urls: urls.length ? urls : undefined,
+        shareCards: wid != null ? shareCardsDoc : undefined,
+      });
     }
 
-    // Modo único (retrocompatível).
+    const safeLayout = allowedLayouts.includes(layout) ? layout : "classic";
+    const idx =
+      typeof variantIndex === "number" && variantIndex >= 0 ? Math.floor(variantIndex) : 0;
+    const singleKey = cacheKey(safeFormat, safeLayout, idx);
+
+    if (wid != null && shareCardsDoc.cards[singleKey]) {
+      const url = shareCardsDoc.cards[singleKey];
+      return res.status(200).json({
+        ok: true,
+        cached: true,
+        url,
+        shareCards: shareCardsDoc,
+      });
+    }
+
     const png = await buildShareCard({
       route,
       type: kind,
-      layout: allowedLayouts.includes(layout) ? layout : "classic",
+      layout: safeLayout,
       title: safeTitle,
       subtitle: safeSubtitle,
       stats: sanitizeStats(stats),
       format: safeFormat,
     });
 
-    // Modo publicar no feed: sobe a imagem pelo servidor (service_role contorna a
-    // RLS do Storage) e devolve a URL pública, em vez do base64. O app passa essa
-    // URL direto pro POST /user/posts (sem upload client-side, que era barrado).
-    if (req.body?.upload) {
+    const shouldUpload = !!req.body?.upload || (wid != null && !!supabase);
+    let publicUrl = null;
+    if (shouldUpload) {
       if (!supabase) {
         return res.status(500).json({ ok: false, error: "Storage indisponível no servidor." });
       }
-      const path = `workout-cards/${req.userId}/${Date.now()}.png`;
-      const { error: upErr } = await supabase.storage
-        .from(POST_BUCKET)
-        .upload(path, png, { contentType: "image/png", upsert: true });
-      if (upErr) {
-        console.error("Erro ao subir card pro storage:", upErr.message);
-        return res.status(502).json({ ok: false, error: "Falha ao salvar a imagem do treino." });
+      publicUrl = await uploadPng(singleKey, png);
+      if (wid != null) {
+        shareCardsDoc.cards[singleKey] = publicUrl;
+        await persistShareCards();
       }
-      const url = supabase.storage.from(POST_BUCKET).getPublicUrl(path).data.publicUrl;
-      return res.status(200).json({ ok: true, url });
     }
 
-    return res.status(200).json({ ok: true, image: png.toString("base64") });
+    if (req.body?.upload) {
+      return res.status(200).json({
+        ok: true,
+        cached: false,
+        url: publicUrl,
+        shareCards: wid != null ? shareCardsDoc : undefined,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      cached: false,
+      image: png.toString("base64"),
+      url: publicUrl || undefined,
+      shareCards: wid != null ? shareCardsDoc : undefined,
+    });
   } catch (error) {
     console.error("Erro ao gerar share-card:", error.message);
     return res.status(502).json({ ok: false, error: "Falha ao gerar a imagem do treino." });
@@ -8296,7 +8414,10 @@ app.get("/api/dados/:metric", verifyToken, async (req, res) => {
   console.log(`[DEBUG] Fetching ${metric} for user ${userId}, date=${date}, timeframe=${timeframe}`);
 
   try {
-    const isCumulative = ['calories', 'steps', 'water'].includes(metric);
+    const isCumulative = ["calories", "steps"].includes(metric);
+    // Água: o app grava o total absoluto do dia (inclui reset para 0). Usar MAX
+    // impediria zerar após bater a meta (Math.max(2000, 0) === 2000).
+    const useLatestAbsolute = metric === "water";
     let healthData = [];
 
     if (date) {
@@ -8373,7 +8494,10 @@ app.get("/api/dados/:metric", verifyToken, async (req, res) => {
           timestamp: item.period.toISOString(),
         };
       } else {
-        if (isCumulative) {
+        if (useLatestAbsolute) {
+          // ORDER BY timestamp ASC → última leitura do período prevalece (inclui 0).
+          groupedData[key].value = val;
+        } else if (isCumulative) {
           // Para métricas acumulativas, pegamos o maior valor do período (ex: última leitura da hora)
           groupedData[key].value = Math.max(groupedData[key].value, val);
         } else {
@@ -8386,13 +8510,19 @@ app.get("/api/dados/:metric", verifyToken, async (req, res) => {
 
     let processedData = Object.values(groupedData).map((item) => ({
       date: item.date,
-      value: isCumulative ? Math.round(item.value) : Math.round(item.value / item.count),
+      value:
+        isCumulative || useLatestAbsolute
+          ? Math.round(item.value)
+          : Math.round(item.value / item.count),
       timestamp: item.timestamp,
     }));
 
     let totalValue = 0;
-    if (isCumulative) {
-      totalValue = processedData.length > 0 ? Math.max(...processedData.map(d => d.value)) : 0;
+    if (useLatestAbsolute) {
+      totalValue =
+        healthData.length > 0 ? Number(healthData[healthData.length - 1].value) || 0 : 0;
+    } else if (isCumulative) {
+      totalValue = processedData.length > 0 ? Math.max(...processedData.map((d) => d.value)) : 0;
     } else {
       totalValue = processedData.length > 0 ? processedData[processedData.length - 1].value : 0;
     }
