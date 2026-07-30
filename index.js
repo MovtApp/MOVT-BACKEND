@@ -428,6 +428,13 @@ async function initDb() {
     // JSON: { updatedAt, cards: { "feed|classic|0": "https://...", ... } }
     await sql`ALTER TABLE user_workouts ADD COLUMN IF NOT EXISTS share_cards JSONB DEFAULT NULL`;
 
+    // Fase 3 — Unicidade robusta no banco (ADR-0043)
+    await sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS usuarios_username_unique
+      ON usuarios (lower(trim(username)))
+      WHERE username IS NOT NULL AND username NOT LIKE 'user\_%';
+    `;
+
     console.log("✅ Banco de dados sincronizado.");
   } catch (err) {
     console.error("❌ Erro ao sincronizar banco de dados:", err);
@@ -497,6 +504,20 @@ function maskPhoneE164(e164) {
   if (!e164) return "";
   const tail = e164.slice(-4);
   return `${e164.slice(0, 5)} *****-${tail}`;
+}
+
+// Validação de username (ADR-0043)
+function validateUsername(username) {
+  if (!username) return { valid: false, error: "Username é obrigatório." };
+  const normalized = username.trim().toLowerCase();
+  const regex = /^[a-z0-9_.]+$/;
+  if (normalized.length < 3 || normalized.length > 30) {
+    return { valid: false, error: "O username deve ter entre 3 e 30 caracteres." };
+  }
+  if (!regex.test(normalized)) {
+    return { valid: false, error: "O username só pode conter letras minúsculas, números, sublinhados e pontos." };
+  }
+  return { valid: true, normalized };
 }
 
 // Analisa um lado da carteira do CREF via Gemini.
@@ -1913,11 +1934,20 @@ app.post("/api/register", async (req, res) => {
     const [day, month, year] = data_nascimento.split("/");
     const formattedBirthDate = `${year}-${month}-${day} 00:00:00`;
 
+    // No cadastro, o username nasce como NULL (ou placeholder).
+    // O usuário escolherá o handle real na UsernameScreen durante o onboarding.
     const [newUser] = await sql`
       INSERT INTO usuarios (nome, username, email, senha, cpf, cnpj, cref, data_nascimento, telefone, createdat, updated_at, session_id, verification_code, email_verified, verification_code_expires_at)
-      VALUES (${nome}, ${email}, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${userCref}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
+      VALUES (${nome}, NULL, ${email}, ${hashedPassword}, ${userCpf}, ${userCnpj}, ${userCref}, ${formattedBirthDate}, ${telefone}, NOW(), NOW(), ${newSessionId}, ${verificationCode}, FALSE, ${verificationCodeExpiresAt})
       RETURNING id_us, nome, username, email, cpf, cnpj, data_nascimento, telefone, session_id;
     `;
+
+    // Criar um placeholder user_id para evitar problemas com campos obrigatórios no app
+    // enquanto o usuário não chega na tela de username.
+    await sql`
+      UPDATE usuarios SET username = ${'user_' + newUser.id_us} WHERE id_us = ${newUser.id_us}
+    `;
+    newUser.username = 'user_' + newUser.id_us;
 
     // Personal (CPF + CREF) ou conta CNPJ legada são personal trainers: marca o
     // papel e inicia a verificação profissional pendente (CREF ainda não validado).
@@ -2327,17 +2357,42 @@ app.post("/api/auth/social-unlink", verifyToken, async (req, res) => {
 
 // Endpoint para finalizar o onboarding (Atualiza dados biométricos)
 app.post("/api/user/complete-onboarding", async (req, res) => {
-  const { email, genero, idade, altura, peso, objetivo, nivel, nome } = req.body;
+  const { email, genero, idade, altura, peso, objetivo, nivel, nome, username } = req.body;
 
   if (!email) {
     return res.status(400).json({ error: "Email é obrigatório." });
   }
 
   try {
+    // Validação de username se fornecido (obrigatório para completar onboarding)
+    let normalizedUsername = null;
+    if (username) {
+      const validation = validateUsername(username);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+      }
+      normalizedUsername = validation.normalized;
+
+      // Garantir que não é igual ao email
+      if (normalizedUsername === email.toLowerCase()) {
+        return res.status(400).json({ error: "O username não pode ser igual ao e-mail." });
+      }
+
+      // Checar unicidade
+      const existing = await sql`
+        SELECT id_us FROM usuarios 
+        WHERE lower(trim(username)) = ${normalizedUsername} AND email != ${email}
+      `;
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Username já está em uso." });
+      }
+    }
+
     const [updatedUser] = await sql`
       UPDATE usuarios 
       SET 
         nome = COALESCE(${nome || null}, nome),
+        username = COALESCE(${normalizedUsername || null}, username),
         genero = ${genero || 'Não informado'},
         idade = ${Number(idade) || 25},
         altura = ${Number(altura) || 170},
@@ -3613,6 +3668,26 @@ app.post("/api/user/verify-phone-firebase", verifyToken, async (req, res) => {
 // Listagem de academias
     // Nota: Rota administrativa de academias deve ser centralizada no adminGyms.js
 
+// Endpoint para checar disponibilidade de username (ADR-0043)
+app.get("/api/user/check-username", async (req, res) => {
+  const { username } = req.query;
+  const validation = validateUsername(username);
+  if (!validation.valid) {
+    return res.status(400).json({ available: false, error: validation.error });
+  }
+
+  try {
+    const existing = await sql`
+      SELECT id_us FROM usuarios 
+      WHERE lower(trim(username)) = ${validation.normalized}
+    `;
+    res.json({ available: existing.length === 0 });
+  } catch (error) {
+    console.error("[CheckUsername] Erro:", error);
+    res.status(500).json({ error: "Erro ao verificar disponibilidade do username." });
+  }
+});
+
 app.get("/api/user/session-status", verifyToken, async (req, res) => {
 
   const userId = req.userId;
@@ -3949,15 +4024,23 @@ app.put("/api/user/update-field", verifyToken, async (req, res) => {
 
     // Verificações de unicidade + atualização (somente do campo solicitado)
     if (field === "username") {
-      const existing = await sql`SELECT id_us FROM usuarios WHERE username = ${value} AND id_us != ${userId}`;
+      const validation = validateUsername(value);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+      }
+
+      const existing = await sql`
+        SELECT id_us FROM usuarios 
+        WHERE lower(trim(username)) = ${validation.normalized} AND id_us != ${userId}
+      `;
       if (existing.length > 0) {
         return res.status(409).json({ error: "Username já está em uso por outro usuário." });
       }
 
-      // Atualiza somente o username; NáƒO altera/zera a coluna email
+      // Atualiza somente o username; NÃO altera/zera a coluna email
       await sql`
         UPDATE usuarios
-        SET username = ${value}, updated_at = ${now}
+        SET username = ${validation.normalized}, updated_at = ${now}
         WHERE id_us = ${userId}
       `;
     }
