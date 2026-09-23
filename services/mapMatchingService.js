@@ -27,7 +27,7 @@ const BASE_URL = "https://api.mapbox.com/matching/v5/mapbox";
 
 // Limites da Mapbox / parâmetros de qualidade.
 const MAX_COORDS = 100; // máximo de coordenadas por requisição de matching
-const OVERLAP = 4; // pontos de sobreposição entre janelas (continuidade nas bordas)
+const OVERLAP = 1; // a única âncora compartilhada evita repetir trechos para trás
 const MIN_RADIUS_M = 4; // raio de busca mínimo por ponto
 const MAX_RADIUS_M = 25; // não cruza para vias paralelas quando o GPS está limpo
 const TARGET_SAMPLE_MS = 5000; // cadência recomendada pela Mapbox para matching
@@ -98,6 +98,11 @@ async function matchWindow(points, profile) {
 
   const data = res.data;
   if (!data || data.code !== "Ok" || !Array.isArray(data.matchings)) return null;
+  // A single confident submatch does not account for rejected/off-road points.
+  // Keep the original sequence unless EVERY observation belongs to this match.
+  if (data.matchings.length !== 1 || !Array.isArray(data.tracepoints)
+    || data.tracepoints.length !== points.length
+    || data.tracepoints.some((point) => !point || point.matchings_index !== 0)) return null;
   const matches = data.matchings.filter(
     (match) =>
       typeof match?.confidence === "number" &&
@@ -123,6 +128,25 @@ function appendGeometry(out, coordinates) {
     if (previous && previous.latitude === latitude && previous.longitude === longitude) continue;
     out.push({ latitude, longitude });
   }
+}
+
+function distance(a, b) {
+  const rad = Math.PI / 180;
+  const lat = (b.latitude - a.latitude) * rad, lng = (b.longitude - a.longitude) * rad;
+  const h = Math.sin(lat / 2) ** 2 + Math.cos(a.latitude * rad) * Math.cos(b.latitude * rad) * Math.sin(lng / 2) ** 2;
+  return 6371000 * 2 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function safeGeometry(points, coordinates) {
+  if (coordinates.some((p) => !Array.isArray(p) || !Number.isFinite(p[0]) || !Number.isFinite(p[1])
+    || Math.abs(p[0]) > 180 || Math.abs(p[1]) > 90)) return false;
+  const geometry = coordinates.map(([longitude, latitude]) => ({ latitude, longitude }));
+  if (distance(points[0], geometry[0]) > 25 || distance(points.at(-1), geometry.at(-1)) > 25) return false;
+  const length = (route) => route.slice(1).reduce((sum, p, i) => sum + distance(route[i], p), 0);
+  const rawLength = length(points), matchedLength = length(geometry);
+  // Bound both detours and shortcuts. Endpoints alone cannot detect a wrong road.
+  if (matchedLength > rawLength * 1.6 + 20 || matchedLength < rawLength * 0.6 - 10) return false;
+  return geometry.every((p) => points.some((q) => distance(p, q) <= 35));
 }
 
 function appendRawPoints(out, points) {
@@ -164,29 +188,34 @@ async function snapContinuousRoute(points, kind) {
   // Janela única quando cabe no limite da Mapbox.
   if (sampled.length <= MAX_COORDS) {
     const match = await matchWindow(sampled, profile);
-    if (match) {
+    if (match && safeGeometry(clean, match.coordinates)) {
+      appendRawPoints(out, clean.slice(0, 1));
       appendGeometry(out, match.coordinates);
+      appendRawPoints(out, clean.slice(-1));
       confidenceSum += match.confidence;
       matchCount++;
     } else {
       // Parque, viela ou trilha não mapeada: mantém a sequência GPS em vez de
       // deslocar o atleta para a rua mais próxima.
-      appendRawPoints(out, sampled);
+      appendRawPoints(out, clean);
     }
   } else {
     // Janelas com sobreposição para preservar continuidade nas bordas.
     let i = 0;
     while (i < sampled.length) {
       const chunk = sampled.slice(i, i + MAX_COORDS);
-      const match = await matchWindow(chunk, profile);
-      if (match) {
+      const original = clean.slice(clean.indexOf(chunk[0]), clean.indexOf(chunk[chunk.length - 1]) + 1);
+      const match = await matchWindow(chunk, profile).catch(() => null);
+      if (match && safeGeometry(original, match.coordinates)) {
+        appendRawPoints(out, original.slice(0, 1));
         appendGeometry(out, match.coordinates);
+        appendRawPoints(out, original.slice(-1));
         confidenceSum += match.confidence;
         matchCount++;
       } else {
         // Só este chunk cai para GPS; os chunks de rua continuam respeitando a
         // geometria real. Não abortamos a rota inteira por uma trilha ambígua.
-        appendRawPoints(out, chunk);
+        appendRawPoints(out, original);
       }
       if (i + MAX_COORDS >= sampled.length) break;
       i += MAX_COORDS - OVERLAP;

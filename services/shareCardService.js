@@ -114,6 +114,15 @@ function downsample(points, max) {
   return out;
 }
 
+function splitSegments(points) {
+  const segments = [[]];
+  for (const point of points) {
+    if (point.gap && segments[segments.length - 1].length) segments.push([]);
+    segments[segments.length - 1].push(point);
+  }
+  return segments.filter((part) => part.length);
+}
+
 /** Codifica pontos no formato "encoded polyline" (precisão 1e5) p/ a Mapbox. */
 function encodePolyline(points) {
   let lastLat = 0;
@@ -141,7 +150,6 @@ function encodePolyline(points) {
 
 /** URL da Mapbox Static Images com a rota (path) e pins, no tamanho do formato. */
 function buildMapUrl(points, routeColor, mapW, mapH) {
-  const poly = encodePolyline(points);
   const start = points[0];
   const end = points[points.length - 1];
   const fix = (n) => n.toFixed(5);
@@ -149,12 +157,13 @@ function buildMapUrl(points, routeColor, mapW, mapH) {
   // Marcadores custom: largada (badge verde "play") e chegada (bandeira
   // quadriculada). O Mapbox baixa as imagens de /api/route/marker e centraliza
   // no ponto. A ORDEM importa: chegada por último p/ ficar por cima se sobrepor.
-  const pathLayer = `path-6+${routeColor}-1(${encodeURIComponent(poly)})`;
+  const pathLayers = splitSegments(points).filter((part) => part.length > 1)
+    .map((part) => `path-6+${routeColor}-1(${encodeURIComponent(encodePolyline(part))})`);
   const startUrl = encodeURIComponent(`${PUBLIC_BASE_URL}/api/route/marker?type=start`);
   const finishUrl = encodeURIComponent(`${PUBLIC_BASE_URL}/api/route/marker?type=finish`);
   const startPin = `url-${startUrl}(${fix(start.longitude)},${fix(start.latitude)})`;
   const endPin = `url-${finishUrl}(${fix(end.longitude)},${fix(end.latitude)})`;
-  const overlay = `${pathLayer},${startPin},${endPin}`;
+  const overlay = [...pathLayers, startPin, endPin].join(",");
 
   // padding: topo,direita,baixo,esquerda — folga maior embaixo p/ a faixa de stats.
   return (
@@ -343,7 +352,11 @@ async function fetchRouteMap({ route, type, dims }) {
   const clean = (Array.isArray(route) ? route : []).filter(isValidPoint);
   if (clean.length < 2) throw new Error("Rota insuficiente para gerar o card.");
 
-  const points = downsample(clean, MAX_PATH_POINTS);
+  // Keep interruption boundaries even when reducing a long route for the URL.
+  const points = splitSegments(clean).flatMap((part, index) => {
+    const chosen = downsample(part, Math.max(2, Math.floor(MAX_PATH_POINTS * part.length / clean.length)));
+    return chosen.map((p, i) => ({ ...p, gap: index > 0 && i === 0 }));
+  });
   const accentHex = type === "Ciclismo" ? "3b82f6" : "10b981";
 
   const url = buildMapUrl(points, accentHex, dims.mapW, dims.mapH);
